@@ -1,0 +1,7 @@
+out/
+simfab_traces/
+__pycache__/
+
+sim_stats.json
+sim.log
+simconfig.json
