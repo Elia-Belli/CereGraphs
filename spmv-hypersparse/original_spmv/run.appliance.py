@@ -1,5 +1,3 @@
-#!/usr/bin/env cs_python
-# pylint: disable=too-many-function-args
 """ test sparse matrix-vector multiplication
 
   This example aims at a hypersparse matrix with almost uniform distribution.
@@ -8,7 +6,7 @@
   memory capacity (48KB) of the PE.
 
   To obtain the best performance, the user may need to reorder the matrix such
-  that the variatoin of the nonzeros of each parition is small.
+  that the variation of the nonzeros of each parition is small.
 
   To run this example, the user has to provide a file of Matrix Market File
   format with 1-based index. For example, the user can reorder the matrix A by
@@ -61,26 +59,24 @@
            --is_weight_one --run-only --infile_mtx=<path to mtx file>
 """
 
+import json
 import math
-import shutil
-import subprocess
+import os
 import time
-from pathlib import Path
 from typing import Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from cmd_parser import parse_args
 from memory_usage import memory_per_pe
 from preprocess import preprocess
 from scipy import sparse
 from scipy.io import mmread
 
-from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
-    MemcpyDataType, MemcpyOrder, SdkRuntime,
-)
+from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder # pylint: disable=import-error,no-name-in-module
+from cerebras.sdk.client import SdkCompiler, SdkRuntime # pylint: disable=import-error,no-name-in-module
 
-# from cerebras.sdk.debug.debug_util import debug_util
+hash_filename = "hash.json"
 
 
 def make_u48(words):
@@ -379,14 +375,13 @@ def timing_analysis(height, width, nnz, time_memcpy_hwl, time_ref_hwl):
 
 
 def csl_compile_core(
-    cslc: str,
+    csl_path: str,  # path to CSL files
     file_config: str,
     elf_dir: str,
     fabric_width: int,
     fabric_height: int,
     core_fabric_offset_x: int,  # fabric-offsets of the core
     core_fabric_offset_y: int,
-    use_precompile: bool,
     arch: Optional[str],
     ncols: int,
     nrows: int,
@@ -402,12 +397,8 @@ def csl_compile_core(
     width_west_buf: int,
     width_east_buf: int,
 ):
-  comp_dir = elf_dir
-
-  if not use_precompile:
+  with SdkCompiler() as compiler:
     args = []
-    args.append(cslc)  # command
-    args.append(file_config)  # options
     args.append(f"--fabric-dims={fabric_width},{fabric_height}")  # options
     args.append(f"--fabric-offsets={core_fabric_offset_x},{core_fabric_offset_y}")  # options
     args.append(f"--params=ncols:{ncols}")  # options
@@ -421,7 +412,7 @@ def csl_compile_core(
     args.append(f"--params=local_out_vec_sz:{local_out_vec_sz}")  # options
     args.append(f"--params=y_pad_start_row_idx:{out_pad_start_idx}")  # options
 
-    args.append(f"-o={comp_dir}")
+    args.append(f"-o={elf_dir}")
     if arch is not None:
       args.append(f"--arch={arch}")
     args.append("--memcpy")
@@ -429,21 +420,26 @@ def csl_compile_core(
     args.append(f"--width-west-buf={width_west_buf}")
     args.append(f"--width-east-buf={width_east_buf}")
 
-    print(f"subprocess.check_call(args = {args}")
-    subprocess.check_call(args)
-  else:
-    print("[csl_compile_core] use pre-compile ELFs")
+    args_str = " ".join(args)
+    hashstr = compiler.compile(csl_path, file_config, args_str)
+    print("compile artifact (csl_hash/oname):", hashstr)
+    return hashstr
 
 
+# How to compile:
+#  python run.py --arch=wse2 --num_pe_cols=4 --num_pe_rows=4 --channels=1 \
+#    --width-west-buf=0 --width-east-buf=0 --is_weight_one --compile-only \
+#    --infile_mtx=data/rmat4.4x4.lb.mtx
+#
+# How to run:
+#  python run.py --arch=wse2 --num_pe_cols=4 --num_pe_rows=4 --channels=1 \
+#    --width-west-buf=0 --width-east-buf=0 --is_weight_one --run-only \
+#    --infile_mtx=data/rmat4.4x4.lb.mtx
+#
 def main():
   """Main method to run the example code."""
 
   args = parse_args()
-
-  cslc = "cslc"
-  if args.driver is not None:
-    cslc = args.driver
-  print(f"cslc = {cslc}")
 
   width_west_buf = args.width_west_buf
   width_east_buf = args.width_east_buf
@@ -599,306 +595,318 @@ def main():
   print("store ELFs and log files in the folder ", dirname)
 
   # layout of a rectangle
-  code_csl = "src/layout.csl"
+  code_csl = "layout.csl"
 
   ## calculate the output vector padding info
   out_vec_len_per_pe_row = math.ceil(nrows / np_rows)
   out_pad_start_idx = out_vec_len_per_pe_row
 
-  start = time.time()
-  csl_compile_core(
-      cslc,
-      code_csl,
-      dirname,
-      fabric_width,
-      fabric_height,
-      core_fabric_offset_x,  # fabric-offsets of the core
-      core_fabric_offset_y,
-      args.run_only,
-      args.arch,
-      ncols,  # m, number of rows of the matrix
-      nrows,  # n, number of columns of the matrix
-      np_cols,  # width
-      np_rows,  # height
-      max_local_nnz,
-      max_local_nnz_cols,
-      max_local_nnz_rows,
-      local_vec_sz,
-      local_out_vec_sz,
-      out_pad_start_idx,
-      channels,
-      width_west_buf,
-      width_east_buf,
-  )
-  end = time.time()
-  print(f"Compilation done in {end-start}s", flush=True)
+  # NOTE: absolute, anchored to this file's own location -- see the matching
+  # comment in run.py for why (container bind-mount only covers the
+  # invocation cwd).
+  csl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 
   if args.compile_only:
+    print(
+        "WARNING: compile the code, don't run SdkRuntime because "
+        "the server is down after the compilation"
+    )
+    start = time.time()
+    hashstr = csl_compile_core(
+        csl_path,
+        code_csl,
+        dirname,
+        fabric_width,
+        fabric_height,
+        core_fabric_offset_x,  # fabric-offsets of the core
+        core_fabric_offset_y,
+        args.arch,
+        ncols,  # m, number of rows of the matrix
+        nrows,  # n, number of columns of the matrix
+        np_cols,  # width
+        np_rows,  # height
+        max_local_nnz,
+        max_local_nnz_cols,
+        max_local_nnz_rows,
+        local_vec_sz,
+        local_out_vec_sz,
+        out_pad_start_idx,
+        channels,
+        width_west_buf,
+        width_east_buf,
+    )
+    end = time.time()
+    print(f"Compilation done in {end-start}s", flush=True)
+    print(f"dump artifact name to file {hash_filename}")
+    with open(hash_filename, "w", encoding="utf-8") as write_file:
+      json.dump(hashstr, write_file)
     print("COMPILE ONLY: EXIT")
     return
 
-  runner = SdkRuntime(dirname, cmaddr=args.cmaddr)
-
-  sym_mat_vals_buf = runner.get_id("mat_vals_buf")
-  sym_x_tx_buf = runner.get_id("x_tx_buf")
-  sym_y_local_buf = runner.get_id("y_local_buf")
-
-  sym_mat_rows_buf = runner.get_id("mat_rows_buf")
-  sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
-  sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
-  sym_mat_col_len_buf = runner.get_id("mat_col_len_buf")
-  sym_y_rows_init_buf = runner.get_id("y_rows_init_buf")
-  sym_local_nnz = runner.get_id("local_nnz")
-  sym_local_nnz_cols = runner.get_id("local_nnz_cols")
-  sym_local_nnz_rows = runner.get_id("local_nnz_rows")
-  sym_time_buf_u16 = runner.get_id("time_buf_u16")
-  sym_time_ref_u16 = runner.get_id("time_ref_u16")
+  print(f"load artifact name from file {hash_filename}")
+  with open(hash_filename, "r", encoding="utf-8") as f:
+    hashstr = json.load(f)
 
   start = time.time()
-  runner.load()
-  end = time.time()
-  print(f"*** Load done in {end-start}s")
+  with SdkRuntime(hashstr, simulator=args.simulator) as runner:
 
-  start = time.time()
-  runner.run()
+    sym_mat_vals_buf = runner.get_id("mat_vals_buf")
+    sym_x_tx_buf = runner.get_id("x_tx_buf")
+    sym_y_local_buf = runner.get_id("y_local_buf")
 
-  print("step 1: enable tsc counter to sample the clock")
-  runner.launch("f_enable_tsc", nonblock=True)
+    sym_mat_rows_buf = runner.get_id("mat_rows_buf")
+    sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
+    sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
+    sym_mat_col_len_buf = runner.get_id("mat_col_len_buf")
+    sym_y_rows_init_buf = runner.get_id("y_rows_init_buf")
+    sym_local_nnz = runner.get_id("local_nnz")
+    sym_local_nnz_cols = runner.get_id("local_nnz_cols")
+    sym_local_nnz_rows = runner.get_id("local_nnz_rows")
+    sym_time_buf_u16 = runner.get_id("time_buf_u16")
+    sym_time_ref_u16 = runner.get_id("time_ref_u16")
 
-  print("step 2: copy the structure of A and vector x to the device")
-  # 1. mat_vals_buf[max_local_nnz], type = f32
-  mat_vals_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz, mat_vals_buf, np.float32)
-  runner.memcpy_h2d(
-      sym_mat_vals_buf,
-      mat_vals_buf_1d,
-      0,
-      0,
-      width,
-      height,
-      max_local_nnz,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_32BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    # load() and run() are called by client.Sdkruntime.__enter__
+    # runner.load()
+    # runner.run()
 
-  # 2: x_tx_buf[local_vec_sz], type = f32
-  x_tx_buf_1d = hwl_to_oned_colmajor(height, width, local_vec_sz, x_tx_buf, np.float32)
-  runner.memcpy_h2d(
-      sym_x_tx_buf,
-      x_tx_buf_1d,
-      0,
-      0,
-      width,
-      height,
-      local_vec_sz,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_32BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    print("step 1: enable tsc counter to sample the clock")
+    runner.launch("f_enable_tsc", nonblock=True)
 
-  # 3: mat_rows_buf[max_local_nnz], type = u16
-  mat_rows_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz, mat_rows_buf, np.uint32)
-  runner.memcpy_h2d(
-      sym_mat_rows_buf,
-      mat_rows_buf_1d,
-      0,
-      0,
-      width,
-      height,
-      max_local_nnz,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    print("step 2: copy the structure of A and vector x to the device")
+    # 1. mat_vals_buf[max_local_nnz], type = f32
+    mat_vals_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz, mat_vals_buf, np.float32)
+    runner.memcpy_h2d(
+        sym_mat_vals_buf,
+        mat_vals_buf_1d,
+        0,
+        0,
+        width,
+        height,
+        max_local_nnz,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  # 4: mat_col_idx_buf[max_local_nnz_cols], type = u16
-  mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
-                                            np.uint32)
-  runner.memcpy_h2d(
-      sym_mat_col_idx_buf,
-      mat_col_idx_buf_1d,
-      0,
-      0,
-      width,
-      height,
-      max_local_nnz_cols,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    # 2: x_tx_buf[local_vec_sz], type = f32
+    x_tx_buf_1d = hwl_to_oned_colmajor(height, width, local_vec_sz, x_tx_buf, np.float32)
+    runner.memcpy_h2d(
+        sym_x_tx_buf,
+        x_tx_buf_1d,
+        0,
+        0,
+        width,
+        height,
+        local_vec_sz,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  # 5: mat_col_loc_buf[max_local_nnz_cols], type = u16
-  mat_col_loc_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_loc_buf,
-                                            np.uint32)
-  runner.memcpy_h2d(
-      sym_mat_col_loc_buf,
-      mat_col_loc_buf_1d,
-      0,
-      0,
-      width,
-      height,
-      max_local_nnz_cols,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    # 3: mat_rows_buf[max_local_nnz], type = u16
+    mat_rows_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz, mat_rows_buf, np.uint32)
+    runner.memcpy_h2d(
+        sym_mat_rows_buf,
+        mat_rows_buf_1d,
+        0,
+        0,
+        width,
+        height,
+        max_local_nnz,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  # 6: mat_col_len_buf[max_local_nnz_cols], type = u16
-  mat_col_len_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_len_buf,
-                                            np.uint32)
-  runner.memcpy_h2d(
-      sym_mat_col_len_buf,
-      mat_col_len_buf_1d,
-      0,
-      0,
-      width,
-      height,
-      max_local_nnz_cols,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    # 4: mat_col_idx_buf[max_local_nnz_cols], type = u16
+    mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
+                                              np.uint32)
+    runner.memcpy_h2d(
+        sym_mat_col_idx_buf,
+        mat_col_idx_buf_1d,
+        0,
+        0,
+        width,
+        height,
+        max_local_nnz_cols,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  # 7: y_rows_init_buf[max_local_nnz_rows], type = u16
-  y_rows_init_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_rows, y_rows_init_buf,
-                                            np.uint32)
-  runner.memcpy_h2d(
-      sym_y_rows_init_buf,
-      y_rows_init_buf_1d,
-      0,
-      0,
-      width,
-      height,
-      max_local_nnz_rows,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    # 5: mat_col_loc_buf[max_local_nnz_cols], type = u16
+    mat_col_loc_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_loc_buf,
+                                              np.uint32)
+    runner.memcpy_h2d(
+        sym_mat_col_loc_buf,
+        mat_col_loc_buf_1d,
+        0,
+        0,
+        width,
+        height,
+        max_local_nnz_cols,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  # 8: local_nnz, type = u16
-  local_nnz_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz, np.uint32)
-  runner.memcpy_h2d(
-      sym_local_nnz,
-      local_nnz_1d,
-      0,
-      0,
-      width,
-      height,
-      1,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    # 6: mat_col_len_buf[max_local_nnz_cols], type = u16
+    mat_col_len_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_len_buf,
+                                              np.uint32)
+    runner.memcpy_h2d(
+        sym_mat_col_len_buf,
+        mat_col_len_buf_1d,
+        0,
+        0,
+        width,
+        height,
+        max_local_nnz_cols,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  # 9: local_nnz_cols, type = u16
-  local_nnz_cols_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz_cols, np.uint32)
-  runner.memcpy_h2d(
-      sym_local_nnz_cols,
-      local_nnz_cols_1d,
-      0,
-      0,
-      width,
-      height,
-      1,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    # 7: y_rows_init_buf[max_local_nnz_rows], type = u16
+    y_rows_init_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_rows, y_rows_init_buf,
+                                              np.uint32)
+    runner.memcpy_h2d(
+        sym_y_rows_init_buf,
+        y_rows_init_buf_1d,
+        0,
+        0,
+        width,
+        height,
+        max_local_nnz_rows,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  # 10: local_nnz_rows, type = u16
-  local_nnz_rows_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz_rows, np.uint32)
-  runner.memcpy_h2d(
-      sym_local_nnz_rows,
-      local_nnz_rows_1d,
-      0,
-      0,
-      width,
-      height,
-      1,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=True,
-  )
+    # 8: local_nnz, type = u16
+    local_nnz_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz, np.uint32)
+    runner.memcpy_h2d(
+        sym_local_nnz,
+        local_nnz_1d,
+        0,
+        0,
+        width,
+        height,
+        1,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  print("step 3: sync all PEs to sample the reference clock")
-  runner.launch("f_sync", np.int16(1), nonblock=False)
+    # 9: local_nnz_cols, type = u16
+    local_nnz_cols_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz_cols, np.uint32)
+    runner.memcpy_h2d(
+        sym_local_nnz_cols,
+        local_nnz_cols_1d,
+        0,
+        0,
+        width,
+        height,
+        1,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  print("step 4: tic() records time_start")
-  runner.launch("f_tic", nonblock=True)
+    # 10: local_nnz_rows, type = u16
+    local_nnz_rows_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz_rows, np.uint32)
+    runner.memcpy_h2d(
+        sym_local_nnz_rows,
+        local_nnz_rows_1d,
+        0,
+        0,
+        width,
+        height,
+        1,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=True,
+    )
 
-  print("step 5: spmv")
-  runner.launch("f_spmv", nonblock=False)
+    print("step 3: sync all PEs to sample the reference clock")
+    runner.launch("f_sync", np.int16(1), nonblock=False)
 
-  print("step 5: toc() records time_end")
-  runner.launch("f_toc", nonblock=False)
+    print("step 4: tic() records time_start")
+    runner.launch("f_tic", nonblock=True)
 
-  print("step 6: prepare (time_start, time_end)")
-  runner.launch("f_memcpy_timestamps", nonblock=False)
+    print("step 5: spmv")
+    runner.launch("f_spmv", nonblock=False)
 
-  print("step 7: fetch the timing time_buf_u16[6] = (time_start, time_end), type = u16")
-  time_memcpy_hwl_1d = np.zeros(height * width * 6, np.uint32)
-  runner.memcpy_d2h(
-      time_memcpy_hwl_1d,
-      sym_time_buf_u16,
-      0,
-      0,
-      width,
-      height,
-      6,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=False,
-  )
-  time_memcpy_hwl = oned_to_hwl_colmajor(height, width, 6, time_memcpy_hwl_1d, np.uint16)
+    print("step 5: toc() records time_end")
+    runner.launch("f_toc", nonblock=False)
 
-  print("step 8: fetch the output vector y of type f32")
-  y_1d = np.zeros(height * width * local_out_vec_sz, np.float32)
-  runner.memcpy_d2h(
-      y_1d,
-      sym_y_local_buf,
-      0,
-      0,
-      width,
-      height,
-      local_out_vec_sz,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_32BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=False,
-  )
+    print("step 6: prepare (time_start, time_end)")
+    runner.launch("f_memcpy_timestamps", nonblock=False)
 
-  print("step 9: prepare reference clock")
-  runner.launch("f_reference_timestamps", nonblock=False)
+    print("step 7: fetch the timing time_buf_u16[6] = (time_start, time_end), type = u16")
+    time_memcpy_hwl_1d = np.zeros(height * width * 6, np.uint32)
+    runner.memcpy_d2h(
+        time_memcpy_hwl_1d,
+        sym_time_buf_u16,
+        0,
+        0,
+        width,
+        height,
+        6,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=False,
+    )
+    time_memcpy_hwl = oned_to_hwl_colmajor(height, width, 6, time_memcpy_hwl_1d, np.uint16)
 
-  print("step 10: D2H reference clock")
-  time_ref_1d = np.zeros(height * width * 3, np.uint32)
-  runner.memcpy_d2h(
-      time_ref_1d,
-      sym_time_ref_u16,
-      0,
-      0,
-      width,
-      height,
-      3,
-      streaming=False,
-      data_type=MemcpyDataType.MEMCPY_16BIT,
-      order=MemcpyOrder.COL_MAJOR,
-      nonblock=False,
-  )
-  time_ref_hwl = oned_to_hwl_colmajor(height, width, 3, time_ref_1d, np.uint16)
+    print("step 8: fetch the output vector y of type f32")
+    y_1d = np.zeros(height * width * local_out_vec_sz, np.float32)
+    runner.memcpy_d2h(
+        y_1d,
+        sym_y_local_buf,
+        0,
+        0,
+        width,
+        height,
+        local_out_vec_sz,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=False,
+    )
 
-  runner.stop()
+    print("step 9: prepare reference clock")
+    runner.launch("f_reference_timestamps", nonblock=False)
+
+    print("step 10: D2H reference clock")
+    time_ref_1d = np.zeros(height * width * 3, np.uint32)
+    runner.memcpy_d2h(
+        time_ref_1d,
+        sym_time_ref_u16,
+        0,
+        0,
+        width,
+        height,
+        3,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_16BIT,
+        order=MemcpyOrder.COL_MAJOR,
+        nonblock=False,
+    )
+    time_ref_hwl = oned_to_hwl_colmajor(height, width, 3, time_ref_1d, np.uint16)
+
+    # stop() is called by client.Sdkruntime.__exit__
+    # runner.stop()
 
   end = time.time()
   print(f"*** Run done in {end-start}s")
@@ -912,34 +920,9 @@ def main():
   # remove padding of y_wse because y_ref has no padding
   verify_result(y_ref, y_wse[0:nrows])
 
-  if args.simulator:
-    # move simulation log and core dump to the given folder
-    dst_log = Path(f"{dirname}/sim.log")
-    src_log = Path("sim.log")
-    if src_log.exists():
-      shutil.move(src_log, dst_log)
-
-    dst_trace = Path(f"{dirname}/simfab_traces")
-    src_trace = Path("simfab_traces")
-    if dst_trace.exists():
-      shutil.rmtree(dst_trace)
-    if src_trace.exists():
-      shutil.move(src_trace, dst_trace)
-
   # dump the device memory via debug tool
   if args.simulator:
     print(f"time_ref_hwl = \n{time_ref_hwl}")
-    #debug_mod = debug_util(dirname, cmaddr=args.cmaddr)
-    #for py in range(height):
-    #  for px in range(width):
-    #    t = debug_mod.get_symbol(
-    #        core_fabric_offset_x + px,
-    #        core_fabric_offset_y + py,
-    #        "time_ref_u16",
-    #        np.uint16,
-    #    )
-    #    print(f"(py, px) = {py, px}, time_ref_u16_ij = {t}")
-
 
 if __name__ == "__main__":
   main()

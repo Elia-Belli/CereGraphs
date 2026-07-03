@@ -1,0 +1,204 @@
+// Boolean-semiring SpMV, one iteration, using the <collectives_2d> stdlib
+// instead of hand-rolled fabric routing (see gemv-collectives_2d/pe.csl for
+// the reference pattern this follows).
+//
+// The matrix A (n-by-n, boolean) is partitioned into a P-by-P grid of PEs
+// using the SAME hypersparse compressed-column format as hypersparse_spmv
+// (mat_col_idx/loc/len_buf, mat_rows_buf, y_rows_init_buf) -- just without
+// mat_vals_buf, since boolean semiring never uses edge weights.
+//
+// Communication is targeted at the grid diagonal (pcol_id == prow_id) rather
+// than a fixed corner:
+//   - phase 1: mpi_y.broadcast(root=pcol_id, x_buf, ...) -- every PE in a
+//     column receives the SAME x-block, sourced from that column's diagonal
+//     PE (row == pcol_id). Only the diagonal PE's x_buf is seeded with real
+//     data (host memcpy); everyone else's is overwritten by the broadcast.
+//   - phase 2: mpi_x.reduce_fadds(root=prow_id, y_local_buf, y_buf, ...) --
+//     every PE in a row sends its local boolean contribution toward that
+//     row's diagonal column (== prow_id), which ends up holding the final
+//     result. Boolean OR is implemented as add-then-nonzero, since values
+//     are 0.0/1.0: sum > 0 <=> OR.
+//
+// This choice of diagonal target (instead of a scattered or corner-gathered
+// result) is what lets a later BFS loop reuse phase 1 unmodified: the PE
+// that produces row py's final result (the diagonal PE of that row) is
+// exactly the PE that needs to source the next iteration's broadcast down
+// its own column.
+
+param memcpy_params;
+param c2d_params;
+
+param blk: u16;                 // per-PE dense vector chunk size = ceil(n/P)
+param max_local_nnz: u16;       // max local number of nonzeros (matrix structure only, no vals)
+param max_local_nnz_cols: u16;  // max local number of nonzero columns
+param max_local_nnz_rows: u16;  // max local number of nonzero rows
+
+const compute_task_id: local_task_id = @get_local_task_id(10);
+const reduce_done_task_id: local_task_id = @get_local_task_id(11);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// tsc timing, bracketing just broadcast+compute+reduce (memcpy happens
+// before f_tic is launched). No cross-PE clock-skew correction (unlike
+// hypersparse_spmv's allreduce2R1E-based f_sync) -- for a quick relative
+// comparison this is run with the same simplified methodology on both
+// kernels, so the raw min/max is treated as directly comparable rather than
+// as an absolute hardware-calibrated figure.
+const timestamp = @import_module("<time>");
+var tsc_start_buffer = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
+
+// queues/dsr_ids mirror gemm-collectives_2d/pe.csl -- they don't conflict
+// with memcpy's queue 0.
+const mpi_x = @import_module("<collectives_2d/pe>", .{
+    .dim_params = c2d_params.x,
+    .queues = [2]u16{2, 4},
+    .dest_dsr_ids = [1]u16{1},
+    .src0_dsr_ids = [1]u16{1},
+    .src1_dsr_ids = [1]u16{1},
+    });
+const mpi_y = @import_module("<collectives_2d/pe>", .{
+    .dim_params = c2d_params.y,
+    .queues = [2]u16{3, 5},
+    .dest_dsr_ids = [1]u16{2},
+    .src0_dsr_ids = [1]u16{2},
+    .src1_dsr_ids = [1]u16{2},
+    });
+
+// matrix structure, populated per-PE by run_bool.py via memcpy (hypersparse
+// compressed-column format, identical to hypersparse_spmv minus mat_vals_buf)
+var mat_rows_buf = @zeros([max_local_nnz]u16);
+var mat_col_idx_buf = @zeros([max_local_nnz_cols]u16);
+var mat_col_loc_buf = @zeros([max_local_nnz_cols]u16);
+var mat_col_len_buf = @zeros([max_local_nnz_cols]u16);
+var y_rows_init_buf = @zeros([max_local_nnz_rows]u16);
+
+var local_nnz = @zeros([1]u16);
+var local_nnz_cols = @zeros([1]u16);
+var local_nnz_rows = @zeros([1]u16);
+
+// x_buf: this PE's dense column-block of x (booleans as 0.0/1.0 f32, so it
+// can be reduced with mpi_x.reduce_fadds). Host memcpy seeds real data only
+// at the diagonal PE (pcol_id == prow_id); everyone else starts at zero and
+// gets the broadcast result.
+var x_buf = @zeros([blk]f32);
+
+// y_local_buf: this PE's own local boolean contribution (dense over the
+// row-block), computed by compute() before the phase-2 reduce.
+var y_local_buf = @zeros([blk]f32);
+
+// y_buf: final row-block result after reduce_fadds. Meaningful only at the
+// diagonal PE (pcol_id == prow_id) -- the host reads back the full
+// rectangle and keeps only the diagonal entries.
+var y_buf = @zeros([blk]f32);
+
+// scratch: compact per-PE flags over the local distinct-row list
+// (y_rows_init_buf), set true by the local multiply before being expanded
+// into the dense y_local_buf.
+var y_flags = @zeros([max_local_nnz_rows]u16);
+
+var ptr_x_buf: [*]f32 = &x_buf;
+var ptr_y_buf: [*]f32 = &y_buf;
+var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
+var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
+var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
+var ptr_mat_col_len_buf: [*]u16 = &mat_col_len_buf;
+var ptr_y_rows_init_buf: [*]u16 = &y_rows_init_buf;
+var ptr_local_nnz: [*]u16 = &local_nnz;
+var ptr_local_nnz_cols: [*]u16 = &local_nnz_cols;
+var ptr_local_nnz_rows: [*]u16 = &local_nnz_rows;
+
+var ptr_tsc_start_buffer: [*]u16 = &tsc_start_buffer;
+var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
+
+var pcol_id: u16;
+var prow_id: u16;
+
+fn f_enable_tsc() void {
+    timestamp.enable_tsc();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_tic() void {
+    timestamp.get_timestamp(&tsc_start_buffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_toc() void {
+    timestamp.get_timestamp(&tsc_end_buffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+// compute y = A*x, one iteration, boolean semiring, reduce to the diagonal
+fn f_spmv() void {
+    mpi_x.init();
+    mpi_y.init();
+    pcol_id = mpi_x.pe_id;
+    prow_id = mpi_y.pe_id;
+
+    // phase 1: broadcast this column's x-block down from its diagonal PE
+    // (row == pcol_id). Every PE in the column calls this identically.
+    mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+}
+
+task compute() void {
+    // local boolean multiply: for every locally-nonzero column c with
+    // x_buf[c] set, mark every local row it touches (via the compact
+    // y_rows_init_buf list, exactly as hypersparse_spmv does).
+    var i: u16 = 0;
+    while (i < local_nnz_cols[0]) : (i += 1) {
+        const c = mat_col_idx_buf[i];
+        if (x_buf[c] != 0.0) {
+            const loc = mat_col_loc_buf[i];
+            const len = mat_col_len_buf[i];
+            var j: u16 = 0;
+            while (j < len) : (j += 1) {
+                const k = mat_rows_buf[loc + j];
+                y_flags[k] = 1;
+            }
+        }
+    }
+
+    i = 0;
+    while (i < local_nnz_rows[0]) : (i += 1) {
+        if (y_flags[i] != 0) {
+            y_local_buf[y_rows_init_buf[i]] = 1.0;
+        }
+    }
+
+    // phase 2: reduce this row's local contributions toward its diagonal
+    // column (== prow_id). Boolean OR via add-then-nonzero (values are
+    // 0.0/1.0, so sum > 0 <=> OR); the host treats y_buf as boolean on
+    // readback.
+    mpi_x.reduce_fadds(prow_id, @ptrcast([*]f32, &y_local_buf), @ptrcast([*]f32, &y_buf),
+                        blk, reduce_done_task_id);
+}
+
+task reduce_done() void {
+    // every PE must unblock the command stream once its part is done, not
+    // just the diagonal PEs holding the meaningful final result.
+    sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+    @bind_local_task(compute, compute_task_id);
+    @bind_local_task(reduce_done, reduce_done_task_id);
+
+    @export_symbol(ptr_x_buf, "x_buf");
+    @export_symbol(ptr_y_buf, "y_buf");
+    @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
+    @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
+    @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");
+    @export_symbol(ptr_mat_col_len_buf, "mat_col_len_buf");
+    @export_symbol(ptr_y_rows_init_buf, "y_rows_init_buf");
+    @export_symbol(ptr_local_nnz, "local_nnz");
+    @export_symbol(ptr_local_nnz_cols, "local_nnz_cols");
+    @export_symbol(ptr_local_nnz_rows, "local_nnz_rows");
+    @export_symbol(ptr_tsc_start_buffer, "tsc_start_buffer");
+    @export_symbol(ptr_tsc_end_buffer, "tsc_end_buffer");
+
+    @export_symbol(f_spmv);
+    @export_symbol(f_enable_tsc);
+    @export_symbol(f_tic);
+    @export_symbol(f_toc);
+}
