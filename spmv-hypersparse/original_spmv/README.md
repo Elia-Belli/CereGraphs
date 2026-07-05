@@ -8,19 +8,62 @@ This is the original Cerebras SDK `spmv-hypersparse` example, computing
 
 - `src/layout.csl`, `src/kernel.csl` — top-level glue: sets up `memcpy`,
   imports `hypersparse_spmv` and `allreduce2R1E`, exports host-callable
-  functions.
-- `src/hypersparse_spmv/{layout,pe}.csl` — the actual SpMV kernel.
+  functions. **WSE-2 only** — see "WSE-3 support" below.
+- `src/hypersparse_spmv/{layout,pe}.csl` — the actual SpMV kernel (WSE-2).
 - `src/allreduce2R1E/{layout,pe}.csl` — cross-PE clock synchronization, used
   only for accurate timing measurement (`f_sync`), not part of the SpMV math.
+- `src_wse3/` — WSE-3 port of the three files above (same filenames, same
+  `hypersparse_spmv/layout.csl`, no `allreduce2R1E/`) — see "WSE-3 support".
 - `preprocess.py` — partitions `A` (given as CSR+CSC) into the per-PE
   hypersparse compressed-column format (`mat_col_idx/loc/len_buf`,
   `mat_rows_buf`, `y_rows_init_buf`, plus `mat_vals_buf` for the real values).
+  Shared by both architectures — matrix partitioning doesn't depend on arch.
 - `run.py` — host driver: compiles, distributes `x`/`A`, launches, times, and
-  verifies against a dense scipy reference.
+  verifies against a dense scipy reference. Picks `src/` or `src_wse3/` based
+  on `--arch`.
 - `memory_usage.py` — per-PE memory footprint estimate, used to assert the
   chosen grid fits in 48KB SRAM before compiling.
-- `commands_wse2.sh` — one-shot compile+run smoke test on
-  `../data/rmat4.4x4.lb.mtx` at a 4x4 grid.
+- `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test
+  on `../data/rmat4.4x4.lb.mtx` at a 4x4 grid, one per architecture.
+
+## WSE-3 support
+
+`src_wse3/` ports the WSE-2 kernel to WSE-3 by applying
+[Cerebras/sdk-examples#23](https://github.com/Cerebras/sdk-examples/pull/23)
+(originally written against the SDK's own bundled `spmv-hypersparse`
+example, which this directory forked from) to this repo's copy. It is **not**
+a drop-in replacement for `src/` — the changes are architecturally
+WSE-3-specific and don't compile as WSE-2:
+
+- **Queue remapping.** WSE-3's `memcpy` module reserves input queue 1 for
+  its own command stream, which the WSE-2 kernel's `input_queues={4,1,6,7}`
+  collides with (confirmed locally: compiling `src/` unmodified with
+  `--arch wse3` fails with "initialization for this queue has already been
+  set" at exactly that queue). `src_wse3/kernel.csl` remaps to
+  `input_queues={2,3,4,5}`.
+- **4 distinct output queues instead of 2 reused ones.** WSE-2's kernel
+  reuses the same 2 output queues for both the north-south phase and the
+  west-east phase (safe because the two phases never run concurrently, and
+  WSE-2 lets each DSD carry its own `.fabric_color` regardless of which
+  queue it's on). WSE-3 binds a fixed color to a queue at
+  `@initialize_queue` time instead of per-DSD, so reusing one queue for two
+  differently-colored trains is no longer possible — `output_queues` grows
+  from `[2]u16` to `[4]u16` and `.fabric_color` is dropped from every
+  `fabout_dsd` in `hypersparse_spmv/pe.csl` in favor of a
+  `@get_output_queue(...)` + `@initialize_queue(..., .{.color = ...})` pair,
+  gated behind `if (@is_arch("wse3"))`.
+- **No `allreduce2R1E`-based `f_sync`.** `kernel.csl` drops the
+  `allreduce2R1E` import and cross-PE reduction entirely; `f_sync` instead
+  busy-waits on each PE's own tsc until a fixed threshold, then records that
+  as the reference clock. Timing numbers from the two architectures aren't
+  necessarily calibrated the same way as a result — see "Timing methodology"
+  below, which still describes `src/`'s (WSE-2's) approach.
+
+Verified end-to-end against the same scipy dense reference `run.py` already
+checks WSE-2 against: `./commands_wse3.sh` reports `PASS` and
+~141.8 MB/s on the 16x16/4x4 smoke test (vs. `commands_wse2.sh`'s
+~118.6 MB/s) — both figures match the PR's own reported before/after numbers
+almost exactly, which is a good sign this port is faithful to the original.
 
 ## How it works
 

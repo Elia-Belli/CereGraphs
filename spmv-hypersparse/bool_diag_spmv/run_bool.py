@@ -2,17 +2,17 @@
 # pylint: disable=too-many-function-args
 """ test boolean-semiring sparse matrix-vector multiplication, one iteration
 
-  Forked from run.py for the boolean/diagonal-reduce variant (see
-  src/bool_pe.csl / src/layout_bool.csl): A is a square boolean adjacency
-  matrix, y = OR_j (A[i,j] AND x[j]), and the PE grid must be square so every
-  row/column has a diagonal PE.
+  Forked from run.py for the boolean/diagonal-reduce variant (see src/bool_pe.csl / src/layout_bool.csl): 
+    - A is a square boolean adjacency matrix, 
+    - y = OR_j (A[i,j] AND x[j]),
+    - the PE grid must be square so every row/column has a diagonal PE.
 
-  The input vector x is seeded only at the diagonal PEs (host memcpy); phase 1
-  (<collectives_2d> mpi_y.broadcast) distributes each column's x-block from
-  its diagonal PE to the rest of the column. Phase 2 (mpi_x.reduce_fadds)
-  reduces every row's local boolean contributions to that row's diagonal PE,
-  which ends up holding the row's final result. The host reads back the full
-  PE rectangle and keeps only the diagonal entries.
+  The input vector x is seeded only at the diagonal PEs (host memcpy); 
+  1. Phase 1: (<collectives_2d> mpi_y.broadcast) distributes each column's x-block from
+    its diagonal PE to the rest of the column. 
+  2. Phase 2: (mpi_x.reduce_fadds) reduces every row's local boolean contributions to that row's diagonal PE,
+    which ends up holding the row's final result. 
+  The host reads back the full PE rectangle and keeps only the diagonal entries.
 
   How to compile and run
      python run_bool.py --arch=wse2 --num_pe_cols=4 --num_pe_rows=4 --channels=1
@@ -284,8 +284,7 @@ def main():
   print("store ELFs and log files in the folder ", dirname)
 
   # NOTE: absolute, anchored to this file's own location -- see the matching
-  # comment in original_spmv/run.py for why (container bind-mount only
-  # covers the invocation cwd).
+  # comment in original_spmv/run.py for why (container bind-mount only overs the invocation cwd).
   code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "layout_bool.csl")
 
   start = time.time()

@@ -1,0 +1,49 @@
+
+param colors: [2]color;
+param entrypoints: [1]local_task_id;
+param width: i16 ;   // width of the core
+param height: i16 ;  // height of the core
+
+
+const C0: color = colors[0];
+const C1: color = colors[1];
+
+// entrypoints of allreduce module
+// LOCK runs only if teardown is received and the operation is done
+// LOCK performs the state transition
+// teardown handler activates LOCK
+// the operation blocks LOCK in the beginning and unblocks it when it finishes
+const C_LOCK: local_task_id = entrypoints[0];
+
+const Params = struct {
+    first_px: bool,
+    last_px: bool,
+    first_py: bool,
+    last_py: bool,
+    C_ROUTE: color,
+    C_DISPATCH: color,
+    C_LOCK: local_task_id,
+    width: i16,
+    height: i16,
+};
+
+fn get_params(px:i16, py:i16) Params {
+
+    var first_py: bool = (0 == py);
+    var last_py: bool = ((height-1) == py);
+
+    var first_px: bool = (0 == px);
+    var last_px: bool = ((width-1) == px);
+
+    return Params{
+        .first_px = first_px,
+        .last_px = last_px,
+        .first_py = first_py,
+        .last_py = last_py,
+        .C_ROUTE = C0,
+        .C_DISPATCH = C1,
+        .C_LOCK = C_LOCK,
+        .width = width,
+        .height = height
+    };
+}

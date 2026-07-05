@@ -606,7 +606,13 @@ def main():
   # anywhere other than its own directory. An absolute path under this
   # file's own directory resolves correctly as long as the invocation cwd is
   # this directory or an ancestor of it (e.g. the repo root).
-  code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "layout.csl")
+  #
+  # src_wse3/ carries WSE-3-specific kernel changes (queue remapping, no
+  # allreduce2R1E-based sync -- see PR github.com/Cerebras/sdk-examples/pull/23)
+  # that are NOT backwards compatible with WSE-2, so it's a separate source
+  # tree rather than a conditional inside src/.
+  src_dir = "src_wse3" if args.arch == "wse3" else "src"
+  code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)), src_dir, "layout.csl")
 
   ## calculate the output vector padding info
   out_vec_len_per_pe_row = math.ceil(nrows / np_rows)

@@ -1,4 +1,5 @@
 out/
+out_wse3/
 simfab_traces/
 wio_flows*
 __pycache__/

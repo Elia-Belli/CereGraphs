@@ -12,13 +12,22 @@ harness.
 - **`original_spmv/`** — the original SDK `hypersparse_spmv` example:
   real-valued (f32), general (possibly weighted, rectangular) matrix, fully
   `P^2`-distributed vectors so it composes with dense-vector solver
-  operations (dot products, AXPY) in a larger iterative solver. See
-  `original_spmv/README.md`.
+  operations (dot products, AXPY) in a larger iterative solver. Supports
+  both WSE-2 (`src/`) and WSE-3 (`src_wse3/`, ported from
+  [Cerebras/sdk-examples#23](https://github.com/Cerebras/sdk-examples/pull/23)).
+  See `original_spmv/README.md`.
 - **`bool_diag_spmv/`** — boolean-semiring redesign targeting a future BFS
   workload: square matrix, diagonal-targeted broadcast/reduce via the SDK's
   `<collectives_2d>` stdlib, concentrated (not fully distributed) vectors.
   One SpMV iteration only — BFS looping isn't built yet. See
   `bool_diag_spmv/README.md`.
+- **`bfs_spmv/`** — host-orchestrated BFS built on the unmodified
+  `original_spmv` kernel: one `f_spmv` launch per hop, with the visited set,
+  parent pointers, frontier masking, and termination all kept on the host.
+  Directed and undirected graphs both work (via a free CSR/CSC transpose
+  swap). Built deliberately naive, to make the per-hop host round-trip
+  overhead visible before a fabric-resident version is attempted. Supports
+  both WSE-2 and WSE-3, same as `original_spmv/`. See `bfs_spmv/README.md`.
 - **`data/`** — input matrices (Matrix Market format, 1-based), shared across
   versions and benchmarks: the repo's original small test matrix
   (`rmat4.4x4.lb.mtx`) plus synthetic RMAT/GRAPH500-style and uniform-random
@@ -47,6 +56,9 @@ before doing anything, so it's safe to run from anywhere:
 ```
 cd original_spmv && ./commands_wse2.sh    # or: cd bool_diag_spmv && ./commands_wse2.sh
 ```
+
+`original_spmv/` and `bfs_spmv/` also have a `commands_wse3.sh` for WSE-3
+(`bool_diag_spmv/` is WSE-2 only, unchanged by the WSE-3 work).
 
 The benchmark scripts do **not** self-relocate — invoke them from *this*
 repo root (not from inside `benchmarks/`), with matrix paths relative to
