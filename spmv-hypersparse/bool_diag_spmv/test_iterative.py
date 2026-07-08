@@ -4,18 +4,24 @@
   the same number of sequential single-shot f_spmv launches, host-driven.
 
   bool_pe.csl's f_spmv_iter runs MAX_ITERS rounds of
-  (broadcast -> local boolean multiply -> reduce-to-diagonal) on-device,
-  copying each round's y back into x (at the diagonal PEs) before
-  broadcasting again -- see the TODOs in bool_pe.csl's reduce_done() task:
-  there is no masking yet (no visited-bitmap) and no real "y is globally
-  empty" termination check, just a fixed MAX_ITERS loop.
+  (broadcast -> local boolean multiply -> reduce-to-diagonal) on-device. At
+  the diagonal PEs, reduce_done() masks each round's raw result against a
+  cumulative visited_buf before feeding it back as the next round's x -- only
+  genuinely new discoveries propagate, same as this file's own
+  host-recursive baseline below and bfs_spmv/run_bfs.py's host-side
+  `new_mask = candidate & ~visited`. See the TODOs in bool_pe.csl's
+  reduce_done() for what's still missing: a real "y is globally empty"
+  termination check (still a fixed MAX_ITERS loop) and parent tracking
+  (deliberately not attempted -- reduce_fadds can't do witness-selection,
+  see the module docstring in bool_pe.csl).
 
-  This script checks that the loop actually computes what it's supposed to:
-  running f_spmv_iter once should give bit-identical results to calling the
-  single-shot f_spmv MAX_ITERS times from the host, manually feeding each
-  round's y back in as the next round's x -- exactly what the device does
-  internally. Both entrypoints are exported from the SAME compiled kernel,
-  so this only needs one compile + one SdkRuntime session.
+  This script checks that the on-device loop actually computes what it's
+  supposed to: running f_spmv_iter once should give bit-identical results
+  (both visited_buf and the final round's new-discoveries in x_buf) to
+  calling the single-shot f_spmv MAX_ITERS times from the host, with the
+  host applying the identical visited-mask between launches -- exactly what
+  the device does internally. Both entrypoints are exported from the SAME
+  compiled kernel, so this only needs one compile + one SdkRuntime session.
 
   How to compile and run
      python test_iterative.py --arch=wse3 --num_pe_cols=4 --num_pe_rows=4
@@ -200,6 +206,7 @@ def main():
 
   sym_x_buf = runner.get_id("x_buf")
   sym_y_buf = runner.get_id("y_buf")
+  sym_visited_buf = runner.get_id("visited_buf")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
   sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
   sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
@@ -268,49 +275,61 @@ def main():
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
-  def read_y():
-    y_1d = np.zeros(height * width * blk, np.float32)
-    runner.memcpy_d2h(y_1d, sym_y_buf, 0, 0, width, height, blk,
+  def read_buf(sym):
+    buf_1d = np.zeros(height * width * blk, np.float32)
+    runner.memcpy_d2h(buf_1d, sym, 0, 0, width, height, blk,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
-    return oned_to_hwl_colmajor(height, width, blk, y_1d, np.float32)
+    return oned_to_hwl_colmajor(height, width, blk, buf_1d, np.float32)
 
   print(f"step 2: on-device iterative -- one f_spmv_iter launch, {MAX_ITERS} internal rounds")
   t0 = time.time()
   seed_x(x_hwl0)
   runner.launch("f_spmv_iter", nonblock=False)
-  y_device_iter = extract_diag_result(n, blk, P, read_y())
+  # x_buf ends the call holding the LAST round's masked new-discoveries (see
+  # reduce_done() in bool_pe.csl -- it runs the mask/visited update on every
+  # round, including the last, so x_buf is never stale); visited_buf holds
+  # everything discovered across all MAX_ITERS rounds.
+  device_new_last = extract_diag_result(n, blk, P, read_buf(sym_x_buf))
+  device_visited = extract_diag_result(n, blk, P, read_buf(sym_visited_buf))
   t_iter = time.time() - t0
 
   print(f"step 3: host-recursive baseline -- {MAX_ITERS}x sequential f_spmv launches, "
-        "host copies y back into x between rounds")
+        "host applies the same visited-mask between launches")
   t0 = time.time()
   x_hwl = x_hwl0
-  y_host_recursive = None
+  visited = x_bool0.copy()  # f_spmv_iter seeds visited_buf from the initial x_buf too
+  host_new_last = None
   per_round_popcount = []
   for _ in range(MAX_ITERS):
     seed_x(x_hwl)
     runner.launch("f_spmv", nonblock=False)
-    y_host_recursive = extract_diag_result(n, blk, P, read_y())
-    per_round_popcount.append(int(np.sum(y_host_recursive)))
-    x_hwl = dist_x_to_diag_hwl(n, y_host_recursive, blk, P)
+    candidate = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
+    host_new_last = candidate & ~visited
+    visited |= host_new_last
+    per_round_popcount.append(int(np.sum(host_new_last)))
+    x_hwl = dist_x_to_diag_hwl(n, host_new_last.astype(np.float32), blk, P)
   t_recursive = time.time() - t0
 
   runner.stop()
 
-  print(f"on-device f_spmv_iter:  {int(np.sum(y_device_iter))}/{n} reachable, "
-        f"{t_iter*1e3:.2f} ms")
-  print(f"host-recursive f_spmv:  {int(np.sum(y_host_recursive))}/{n} reachable, "
-        f"{t_recursive*1e3:.2f} ms, per-round popcount {per_round_popcount}")
+  print(f"on-device f_spmv_iter:  visited {int(np.sum(device_visited))}/{n}, "
+        f"last-round new {int(np.sum(device_new_last))}, {t_iter*1e3:.2f} ms")
+  print(f"host-recursive f_spmv:  visited {int(np.sum(visited))}/{n}, "
+        f"last-round new {int(np.sum(host_new_last))}, {t_recursive*1e3:.2f} ms, "
+        f"per-round popcount {per_round_popcount}")
 
-  n_mismatch = int(np.sum(y_device_iter != y_host_recursive))
-  passed = n_mismatch == 0
-  print(f"[[ mismatches between on-device iterative and host-recursive: {n_mismatch} / {n} ]]")
+  n_mismatch_visited = int(np.sum(device_visited != visited))
+  n_mismatch_last = int(np.sum(device_new_last != host_new_last))
+  passed = (n_mismatch_visited == 0) and (n_mismatch_last == 0)
+  print(f"[[ visited mismatches: {n_mismatch_visited} / {n} ]]")
+  print(f"[[ last-round new-discovery mismatches: {n_mismatch_last} / {n} ]]")
   print(f"[[ Result: {'PASS' if passed else 'FAIL'} ]]")
   if not passed:
-    idx = np.where(y_device_iter != y_host_recursive)[0]
-    shown = idx[:20].tolist()
-    print(f"mismatched indices: {shown}{' ...' if len(idx) > 20 else ''}")
+    idx = np.where(device_visited != visited)[0]
+    print(f"visited mismatch indices: {idx[:20].tolist()}{' ...' if len(idx) > 20 else ''}")
+    idx = np.where(device_new_last != host_new_last)[0]
+    print(f"last-round mismatch indices: {idx[:20].tolist()}{' ...' if len(idx) > 20 else ''}")
 
   log_run({
       "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -324,7 +343,8 @@ def main():
       "host_recursive_s": round(t_recursive, 6),
       "per_round_popcount": per_round_popcount,
       "verify_pass": passed,
-      "mismatches": n_mismatch,
+      "mismatches_visited": n_mismatch_visited,
+      "mismatches_last_round": n_mismatch_last,
   })
 
 

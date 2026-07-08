@@ -24,6 +24,18 @@
 // that produces row py's final result (the diagonal PE of that row) is
 // exactly the PE that needs to source the next iteration's broadcast down
 // its own column.
+//
+// f_spmv_iter runs this for MAX_ITERS rounds without a host round trip,
+// masking each round's raw result against a cumulative visited_buf (see
+// reduce_done()) before feeding it back as the next round's x -- i.e. only
+// genuinely new discoveries propagate, same as bfs_spmv/run_bfs.py's
+// host-side `new_mask = candidate & ~visited`. Parent tracking (which
+// frontier member discovered a node) is deliberately not attempted here:
+// reduce_fadds is a sum, not a selection, so it can't answer "which PE
+// contributed" once more than one predecessor fires in the same round --
+// see bfs_spmv/run_bfs.py's own docstring point 3 for the same limitation
+// on the host-orchestrated version, which resorts to a separate host-side
+// scan against the original CSC structure instead.
 
 param memcpy_params;
 param c2d_params;
@@ -92,6 +104,13 @@ var y_local_buf = @zeros([blk]f32);
 // rectangle and keeps only the diagonal entries.
 var y_buf = @zeros([blk]f32);
 
+// visited_buf: cumulative "ever discovered" bitmap for f_spmv_iter, indexed
+// identically to x_buf/y_buf (same row/column block, meaningful only at the
+// diagonal PE). Seeded from the initial x_buf in start_spmv() and OR'd with
+// every round's genuinely-new discoveries in reduce_done() -- never used or
+// touched by plain f_spmv (see the iter_count > 1 guards below).
+var visited_buf = @zeros([blk]f32);
+
 // scratch: compact per-PE flags over the local distinct-row list
 // (y_rows_init_buf), set true by the local multiply before being expanded
 // into the dense y_local_buf.
@@ -99,6 +118,7 @@ var y_flags = @zeros([max_local_nnz_rows]u16);
 
 var ptr_x_buf: [*]f32 = &x_buf;
 var ptr_y_buf: [*]f32 = &y_buf;
+var ptr_visited_buf: [*]f32 = &visited_buf;
 var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
 var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
 var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
@@ -159,6 +179,18 @@ fn start_spmv() void {
     pcol_id = mpi_x.pe_id;
     prow_id = mpi_y.pe_id;
     iter_counter = iter_count;
+
+    if (iter_count > 1 and pcol_id == prow_id) {
+        // f_spmv_iter only: seed visited with the initial frontier (the
+        // host-provided x_buf) so the BFS source set never gets
+        // "rediscovered" as a false new-node on a later round. Overwriting
+        // (not OR-ing) here also means visited_buf self-resets correctly
+        // if f_spmv_iter is launched more than once in the same session.
+        var i: u16 = 0;
+        while (i < blk) : (i += 1) {
+            visited_buf[i] = x_buf[i];
+        }
+    }
 
     // phase 1: broadcast this column's x-block down from its diagonal PE
     // (row == pcol_id). Every PE in the column calls this identically.
@@ -229,21 +261,40 @@ task compute() void {
 
 task reduce_done() void {
     iter_counter -= 1;
-    if (iter_counter > 0) {
-        if (pcol_id == prow_id) {
-            // this is a diagonal PE: its y_buf is this round's real result
-            // for row prow_id, which is also the source column (pcol_id ==
-            // prow_id) for the next round's broadcast -- feed it back as x.
-            //
-            // TODO: BFS will need to mask y_buf against a visited-bitmap
-            // here before copying it into x_buf (see README "Status") --
-            // right now the frontier never shrinks, it just keeps
-            // OR-accumulating reachability with no pruning.
-            var i: u16 = 0;
-            while (i < blk) : (i += 1) {
-                x_buf[i] = y_buf[i];
+
+    if (iter_count > 1 and pcol_id == prow_id) {
+        // f_spmv_iter only (plain f_spmv leaves visited_buf/x_buf alone
+        // entirely -- see the matching guard in start_spmv()). This is a
+        // diagonal PE: its y_buf is this round's raw (unmasked) result for
+        // row prow_id, which is also the source column (pcol_id ==
+        // prow_id) for the next round's broadcast.
+        //
+        // Runs on EVERY round, including the last: if this only ran when
+        // there's a next round to feed (like the old unconditional copy
+        // did), the final round's discoveries would never make it into
+        // visited_buf, and x_buf would end the call holding stale data
+        // from the second-to-last round instead of this round's actual
+        // new nodes.
+        //
+        // TODO: mask against a real visited set now happens -- what's
+        // still missing is a real "y is globally empty" termination check
+        // (see MAX_ITERS above); we still always run MAX_ITERS rounds
+        // regardless of whether new_mask went empty early.
+        var i: u16 = 0;
+        while (i < blk) : (i += 1) {
+            var newly: f32 = y_buf[i];
+            if (visited_buf[i] != 0.0) {
+                // already visited -- not a new discovery this round
+                newly = 0.0;
             }
+            if (newly != 0.0) {
+                visited_buf[i] = 1.0;
+            }
+            x_buf[i] = newly;
         }
+    }
+
+    if (iter_counter > 0) {
         // phase 1 of the next round: every PE in the column (diagonal or
         // not) calls this identically, same as start_spmv().
         mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
@@ -260,6 +311,7 @@ comptime {
 
     @export_symbol(ptr_x_buf, "x_buf");
     @export_symbol(ptr_y_buf, "y_buf");
+    @export_symbol(ptr_visited_buf, "visited_buf");
     @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
     @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
     @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");

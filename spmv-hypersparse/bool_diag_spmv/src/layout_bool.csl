@@ -62,6 +62,7 @@ layout {
 
     @export_name("x_buf", [*]f32, true);
     @export_name("y_buf", [*]f32, true);
+    @export_name("visited_buf", [*]f32, true);
 
     @export_name("mat_rows_buf", [*]u16, true);
     @export_name("mat_col_idx_buf", [*]u16, true);

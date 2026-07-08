@@ -162,11 +162,14 @@ Two entrypoints, both exported from the same compiled kernel:
 - `f_spmv` — the original one-shot SpMV: bootstrap `x` at the diagonal via
   host memcpy, broadcast, local boolean multiply, reduce back to the
   diagonal, read back and verify (`run_bool.py`).
-- `f_spmv_iter` — on-device iterative version: at the diagonal PEs, `y` from
-  each round is copied straight back into `x` before broadcasting again
-  (`reduce_done()` in `bool_pe.csl`), for a fixed `MAX_ITERS = 5` rounds, no
-  host round trip in between. Verified against 5 sequential host-driven
-  `f_spmv` launches (`test_iterative.py`) — bit-identical, 0 mismatches.
+- `f_spmv_iter` — on-device iterative version: at the diagonal PEs, each
+  round's raw result is masked against a cumulative `visited_buf` before
+  being fed back as the next round's `x` (`reduce_done()` in `bool_pe.csl`)
+  — only genuinely new discoveries propagate — for a fixed `MAX_ITERS = 5`
+  rounds, no host round trip in between. Verified against 5 sequential
+  host-driven `f_spmv` launches with the identical mask applied host-side
+  (`test_iterative.py`) — both `visited_buf` and the last round's
+  new-discoveries are bit-identical, 0 mismatches.
 
 What's still a stub, not yet real (see the `TODO`s in `bool_pe.csl`):
 
@@ -174,11 +177,17 @@ What's still a stub, not yet real (see the `TODO`s in `bool_pe.csl`):
   real "is `y` globally empty" check. `<collectives_2d>` only exposes
   broadcast/scatter/gather/`reduce_fadds` — no ready-made global AND/OR
   reduce — so a real check needs either an extra `reduce_fadds` pass over a
-  single global flag or a small hand-rolled tree.
-- **No masking.** The diagonal's `y` is fed back as `x` unmodified, so the
-  frontier only ever grows (it's computing exact-`k`-hop reachability, not
-  cumulative BFS reachability). A real BFS loop needs a per-diagonal-PE
-  visited-bitmap mask applied before the copy.
+  single global flag or a small hand-rolled tree. The visited-mask does make
+  "did this round find anything new" cheaply computable *per diagonal PE*
+  now (`x_buf` all-zero after masking) — what's still missing is turning
+  that into a *global* stop signal across all `P` diagonal PEs, which is a
+  much smaller reduction than a whole-rectangle allreduce but still unbuilt.
+- **No parent tracking.** Deliberately not attempted: `reduce_fadds` is a
+  sum, not a selection, so it can't answer "which frontier member reached
+  this node" once more than one predecessor fires in the same round — the
+  same limitation `bfs_spmv/run_bfs.py`'s own docstring documents (point 3)
+  for the host-orchestrated version, which resorts to a separate host-side
+  scan against the original CSC structure instead of solving it on-device.
 - **No host-settable iteration count.** `MAX_ITERS` lives only as a CSL
   `const`, not a compile or runtime param.
 
