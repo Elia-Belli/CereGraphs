@@ -1,4 +1,4 @@
-# bool_diag_spmv — boolean-semiring SpMV, diagonal-reduce, one iteration
+# bool_diag_spmv — boolean-semiring SpMV, diagonal-reduce, iterative
 
 A from-scratch redesign of `../original_spmv` for a different target
 workload: boolean-semiring SpMV (`y = OR_j (A[i,j] AND x[j])`) on a *square*
@@ -18,10 +18,21 @@ yet built — see "Status" below).
   (`mat_col_idx/loc/len_buf`, `mat_rows_buf`, `y_rows_init_buf`), minus
   `mat_vals_buf` (boolean semiring never uses edge weights).
 - `run_bool.py` — host driver: seeds `x` only at the PE grid's diagonal,
-  launches, reads back the full rectangle, keeps only the diagonal entries,
-  verifies against an independent scipy boolean reference.
-- `commands_wse2.sh` — one-shot compile+run smoke test on
-  `../data/rmat4.4x4.lb.mtx` at a 4x4 grid.
+  launches `f_spmv` once, reads back the full rectangle, keeps only the
+  diagonal entries, verifies against an independent scipy boolean reference.
+- `test_iterative.py` — host driver for the on-device iterative entrypoint
+  `f_spmv_iter` (see "Status" below): runs one `f_spmv_iter` launch (5
+  internal rounds) and, against the same compiled kernel, 5 sequential
+  single-shot `f_spmv` launches with the host manually copying each round's
+  `y` back into `x` between launches — then checks the two final vectors are
+  bit-identical. Logs each run to `iterative_results.jsonl`.
+- `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test on
+  `../data/rmat4.4x4.lb.mtx` at a 4x4 grid, for WSE-2 and WSE-3 respectively.
+  Unlike `original_spmv`/`bfs_spmv`, both scripts compile the *same* `src/` —
+  `<collectives_2d>` abstracts the fabric-routing differences between the two
+  architectures, so there's no separate `src_wse3/` tree here.
+- `commands_wse3_iterative.sh` — same compile as `commands_wse3.sh`, but runs
+  `test_iterative.py` instead of `run_bool.py`.
 
 ## Design: why the diagonal, and why `<collectives_2d>`
 
@@ -44,11 +55,12 @@ examples), not hand-rolled fabric routing — a hand-rolled 4-color
 parity-based routing scheme was drafted and abandoned once this library was
 found; it does the same job with far less code to get wrong.
 
-Targeting the diagonal specifically (not a corner) is what makes a future
-BFS loop cheap: the PE that produces row `py`'s final result is exactly the
-PE that needs to *source* the next iteration's broadcast down column `py` —
-reusing `y` as the next iteration's `x` costs nothing beyond running phase 1
-again, no transpose or extra redistribution step.
+Targeting the diagonal specifically (not a corner) is what makes iterating
+cheap: the PE that produces row `py`'s final result is exactly the PE that
+needs to *source* the next round's broadcast down column `py` — reusing `y`
+as the next round's `x` (`f_spmv_iter`'s `reduce_done()` task in
+`bool_pe.csl`) costs nothing beyond running phase 1 again, no transpose or
+extra redistribution step, and no host round trip.
 
 ## Trade-offs versus `original_spmv` (see `../original_spmv/README.md` first)
 
@@ -84,15 +96,92 @@ sparsity, varying grid size, balanced and unbalanced) — see
   diagonal-target design has no meaning otherwise.
 - **Square matrix** (`nrows == ncols`) — asserted by `run_bool.py`.
 
+## Running with a different matrix / grid size
+
+`commands_wse2.sh`/`commands_wse3.sh`/`commands_wse3_iterative.sh` are a
+fixed smoke test (`../data/rmat4.4x4.lb.mtx` on a 4x4 grid) split into two
+steps — an explicit `cslc` call with hand-computed `--params` (`blk`,
+`max_local_nnz*`), then `run_bool.py`/`test_iterative.py --run-only` reusing
+that ELF. That split only exists to avoid recompiling on repeat smoke-test
+runs; the `--params` values in it are specific to that one matrix+grid
+combination and won't work for any other.
+
+For a different matrix or grid size, skip the split and call `run_bool.py`
+(or `test_iterative.py`) directly, **without `--run-only`**. Both scripts run
+`preprocess_bool.preprocess()` themselves before invoking `cslc`, so `blk`
+and the `max_local_nnz*` sizes are computed from the actual matrix and grid
+you pass — you never need to work those out by hand:
+
+```sh
+cd spmv-hypersparse   # repo-root-relative paths, same as the commands_* scripts
+
+cs_python bool_diag_spmv/run_bool.py --arch=wse3 \
+    --num_pe_cols=8 --num_pe_rows=8 --channels=1 \
+    --infile_mtx=data/rmat_s6_e4.mtx \
+    --latestlink bool_diag_spmv/out_s6_8x8
+```
+
+The same flags work for `test_iterative.py` (it shares `cmd_parser.py` with
+`run_bool.py`):
+
+```sh
+cs_python bool_diag_spmv/test_iterative.py --arch=wse3 \
+    --num_pe_cols=8 --num_pe_rows=8 --channels=1 \
+    --infile_mtx=data/rmat_s6_e4.mtx \
+    --latestlink bool_diag_spmv/out_s6_8x8_iter
+```
+
+Notes:
+
+- `--num_pe_cols` **must equal** `--num_pe_rows` (square grid requirement
+  above) — any square size works, it isn't required to be a power of 2 or to
+  evenly divide the matrix size (`preprocess_bool.py` pads).
+- `--infile_mtx` just needs to point at a square `.mtx` file. `../data/`
+  already has a range of RMAT sizes to try: `rmat_s5_e4.mtx` (32x32),
+  `rmat_s6_e4.mtx` (64x64), `rmat_s7_e4.mtx` (128x128), `rmat_s8_e4.mtx`
+  (256x256), up to `rmat_s14_e16.mtx` (16384x16384) — see `../benchmarks/`
+  for how these were generated (`gen_rmat.py`) and load-balanced.
+- `--fabric-dims`/`--fabric-offsets` are optional — both scripts compute a
+  large-enough fabric from the grid size and `--width-west-buf`/
+  `--width-east-buf` (default 0) if you omit them.
+- Drop `--latestlink` to just use the default `latest/` output dir; pass it
+  explicitly (as above) if you want to keep multiple compiled variants
+  around side by side instead of overwriting the previous one.
+- Compilation cost scales with grid size (the 8x8/64-node example above took
+  ~5s to compile vs. <1s for the 4x4 smoke test) — use `--compile-only` to
+  split compilation from running if you're iterating on host-side code only,
+  same as the two-step `commands_*.sh` scripts do.
+- `test_iterative.py`'s `MAX_ITERS = 5` is a hardcoded constant in
+  `src/bool_pe.csl` (see "Status" below) — it does not scale with matrix or
+  grid size, and there's currently no flag to change it from the host.
+
 ## Status
 
-One SpMV iteration only: bootstrap `x` at the diagonal via host memcpy,
-broadcast, local boolean multiply, reduce back to the diagonal, read back and
-verify. **BFS looping (masking the diagonal's result and feeding it back as
-the next iteration's seed, termination condition, multi-iteration host loop)
-is not implemented yet** — by construction (see "why the diagonal" above) it
-should require no new communication primitives, just wiring up the loop and
-a per-diagonal-PE visited-bitmap mask, but this hasn't been built or tested.
+Two entrypoints, both exported from the same compiled kernel:
+
+- `f_spmv` — the original one-shot SpMV: bootstrap `x` at the diagonal via
+  host memcpy, broadcast, local boolean multiply, reduce back to the
+  diagonal, read back and verify (`run_bool.py`).
+- `f_spmv_iter` — on-device iterative version: at the diagonal PEs, `y` from
+  each round is copied straight back into `x` before broadcasting again
+  (`reduce_done()` in `bool_pe.csl`), for a fixed `MAX_ITERS = 5` rounds, no
+  host round trip in between. Verified against 5 sequential host-driven
+  `f_spmv` launches (`test_iterative.py`) — bit-identical, 0 mismatches.
+
+What's still a stub, not yet real (see the `TODO`s in `bool_pe.csl`):
+
+- **Termination condition.** `MAX_ITERS` is a hardcoded fixed count, not a
+  real "is `y` globally empty" check. `<collectives_2d>` only exposes
+  broadcast/scatter/gather/`reduce_fadds` — no ready-made global AND/OR
+  reduce — so a real check needs either an extra `reduce_fadds` pass over a
+  single global flag or a small hand-rolled tree.
+- **No masking.** The diagonal's `y` is fed back as `x` unmodified, so the
+  frontier only ever grows (it's computing exact-`k`-hop reachability, not
+  cumulative BFS reachability). A real BFS loop needs a per-diagonal-PE
+  visited-bitmap mask applied before the copy.
+- **No host-settable iteration count.** `MAX_ITERS` lives only as a CSL
+  `const`, not a compile or runtime param.
+
 Also worth reconsidering before going further: whether the hypersparse
 compressed-column format (inherited unchanged from `original_spmv`) is even
 warranted for GRAPH500-scale sparsity — measurements in

@@ -114,6 +114,27 @@ var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
 var pcol_id: u16;
 var prow_id: u16;
 
+// TODO: this is a fixed iteration count, not a real termination check.
+// `<collectives_2d>` only gives us broadcast/scatter/gather/reduce_fadds --
+// no ready-made global AND/OR reduce -- so detecting "y is globally empty"
+// across all diagonal PEs needs either an extra reduce_fadds pass over a
+// single global flag or a small hand-rolled tree. Deferred until this fixed-
+// count loop is validated (see ../test_iterative.py) against N sequential
+// single-shot f_spmv launches from the host.
+const MAX_ITERS: u16 = 5;
+
+// mpi_x/mpi_y.init() only needs to run once per device session, not once per
+// launch -- device state (this var) persists across separate host
+// runner.launch() calls, same as gemm-collectives_2d/pe.csl gates its own
+// init() behind `step == 0`.
+var mpi_initialized: bool = false;
+
+// how many broadcast/compute/reduce rounds the current f_spmv[_iter] call
+// should run; f_spmv sets this to 1 (unchanged one-shot behavior),
+// f_spmv_iter sets it to MAX_ITERS.
+var iter_count: u16 = 1;
+var iter_counter: u16 = 0;
+
 fn f_enable_tsc() void {
     timestamp.enable_tsc();
     sys_mod.unblock_cmd_stream();
@@ -129,23 +150,55 @@ fn f_toc() void {
     sys_mod.unblock_cmd_stream();
 }
 
-// compute y = A*x, one iteration, boolean semiring, reduce to the diagonal
-fn f_spmv() void {
-    mpi_x.init();
-    mpi_y.init();
+fn start_spmv() void {
+    if (!mpi_initialized) {
+        mpi_x.init();
+        mpi_y.init();
+        mpi_initialized = true;
+    }
     pcol_id = mpi_x.pe_id;
     prow_id = mpi_y.pe_id;
+    iter_counter = iter_count;
 
     // phase 1: broadcast this column's x-block down from its diagonal PE
     // (row == pcol_id). Every PE in the column calls this identically.
     mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
 }
 
+// compute y = A*x, one iteration, boolean semiring, reduce to the diagonal
+fn f_spmv() void {
+    iter_count = 1;
+    start_spmv();
+}
+
+// same as f_spmv, but after reducing to the diagonal, copies y back into x
+// (broadcasting it again down the diagonal's column) and repeats, for
+// MAX_ITERS rounds total, before returning control to the host -- i.e. the
+// output of each round becomes the next round's input vector.
+fn f_spmv_iter() void {
+    iter_count = MAX_ITERS;
+    start_spmv();
+}
+
 task compute() void {
+    // compute() runs once per round: reset the scratch/output state so a
+    // previous round's flags don't leak into this one (a row that was
+    // reachable last round but isn't touched this round must go back to 0,
+    // not stay stuck at 1 forever).
+    var i: u16 = 0;
+    while (i < local_nnz_rows[0]) : (i += 1) {
+        y_flags[i] = 0;
+    }
+    i = 0;
+    while (i < blk) : (i += 1) {
+        y_local_buf[i] = 0.0;
+        y_buf[i] = 0.0;
+    }
+
     // local boolean multiply: for every locally-nonzero column c with
     // x_buf[c] set, mark every local row it touches (via the compact
     // y_rows_init_buf list, exactly as hypersparse_spmv does).
-    var i: u16 = 0;
+    i = 0;
     while (i < local_nnz_cols[0]) : (i += 1) {
         const c = mat_col_idx_buf[i];
         if (x_buf[c] != 0.0) {
@@ -175,9 +228,30 @@ task compute() void {
 }
 
 task reduce_done() void {
-    // every PE must unblock the command stream once its part is done, not
-    // just the diagonal PEs holding the meaningful final result.
-    sys_mod.unblock_cmd_stream();
+    iter_counter -= 1;
+    if (iter_counter > 0) {
+        if (pcol_id == prow_id) {
+            // this is a diagonal PE: its y_buf is this round's real result
+            // for row prow_id, which is also the source column (pcol_id ==
+            // prow_id) for the next round's broadcast -- feed it back as x.
+            //
+            // TODO: BFS will need to mask y_buf against a visited-bitmap
+            // here before copying it into x_buf (see README "Status") --
+            // right now the frontier never shrinks, it just keeps
+            // OR-accumulating reachability with no pruning.
+            var i: u16 = 0;
+            while (i < blk) : (i += 1) {
+                x_buf[i] = y_buf[i];
+            }
+        }
+        // phase 1 of the next round: every PE in the column (diagonal or
+        // not) calls this identically, same as start_spmv().
+        mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+    } else {
+        // every PE must unblock the command stream once its part is done,
+        // not just the diagonal PEs holding the meaningful final result.
+        sys_mod.unblock_cmd_stream();
+    }
 }
 
 comptime {
@@ -198,6 +272,7 @@ comptime {
     @export_symbol(ptr_tsc_end_buffer, "tsc_end_buffer");
 
     @export_symbol(f_spmv);
+    @export_symbol(f_spmv_iter);
     @export_symbol(f_enable_tsc);
     @export_symbol(f_tic);
     @export_symbol(f_toc);
