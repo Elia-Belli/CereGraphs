@@ -34,6 +34,14 @@ what's genuinely done versus what's still a stub.
   rounds actually run are all identical between the two, plus a sanity
   invariant that the masked `x_buf` is genuinely all-zero when the device
   stops. Logs each run to `iterative_results.jsonl`.
+- `plot_bfs_tree.py` — visual correctness check: seeds a *single* BFS source
+  (unlike `test_iterative.py`'s random ~50%-density frontier, chosen here so
+  both trees are one recognizable tree, not a forest), runs the same
+  host-driven-vs-`f_spmv_iter` comparison, and renders the two resulting BFS
+  trees side by side with `networkx`/`matplotlib` — full graph faint gray for
+  context, tree edges bolded, any parent/visited mismatch between the two
+  sides drawn in red. Reuses `extract_parent_result()`/
+  `update_parent_reference()` from `test_iterative.py` directly.
 - `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test on
   `../data/rmat4.4x4.lb.mtx` at a 4x4 grid, for WSE-2 and WSE-3 respectively.
   Unlike `original_spmv`/`bfs_spmv`, both scripts compile the *same* `src/` —
