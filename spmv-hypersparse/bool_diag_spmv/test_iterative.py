@@ -20,19 +20,26 @@
   deliberately not attempted -- reduce_fadds can't do witness-selection, see
   the module docstring in bool_pe.csl.
 
-  This script checks two things: (1) running f_spmv_iter once gives
-  bit-identical results (visited_buf and the final round's new-discoveries
-  in x_buf) to calling single-shot f_spmv from the host in a loop that
-  applies the identical visited-mask and stops the same way; (2)
-  rounds_completed (a host-visible counter, purely for this test) shows the
-  device stopped at exactly the same round the host independently computed,
-  not some other round. (The device side has no round cap at all --
-  runner.launch(..., nonblock=False) blocking on f_spmv_iter and returning
-  is itself proof the on-device relay terminated at all; the host loop below
-  keeps a generous n-round safety net purely so a genuine bug can't hang
-  this *script*, not because the device needs one.) Both entrypoints are
-  exported from the SAME compiled kernel, so this only needs one compile +
-  one SdkRuntime session.
+  This script checks three things: (1) visited_buf (the cumulative
+  discovered set) is bit-identical between running f_spmv_iter once and
+  calling single-shot f_spmv from the host in a loop that applies the
+  identical visited-mask and stops the same way; (2) the terminating
+  round's RAW (unmasked) y_buf is also bit-identical -- NOT the masked
+  x_buf, which the loop's own stop condition forces to all-zero on both
+  sides regardless of correctness, so comparing it would be vacuous; y_buf
+  is genuinely data-dependent (it can be nonzero, full of entries that
+  happen to already be in visited_buf) and is where a bug in the terminating
+  round's own SpMV computation would actually show up; (3) rounds_completed
+  (a host-visible counter, purely for this test) shows the device stopped at
+  exactly the same round the host independently computed, not some other
+  round. Masked x_buf being genuinely all-zero at stop time is checked too,
+  as a sanity invariant rather than a host comparison. (The device side has
+  no round cap at all -- runner.launch(..., nonblock=False) blocking on
+  f_spmv_iter and returning is itself proof the on-device relay terminated
+  at all; the host loop below keeps a generous n-round safety net purely so
+  a genuine bug can't hang this *script*, not because the device needs one.)
+  Both entrypoints are exported from the SAME compiled kernel, so this only
+  needs one compile + one SdkRuntime session.
 
   How to compile and run
      python test_iterative.py --arch=wse3 --num_pe_cols=4 --num_pe_rows=4
@@ -313,7 +320,19 @@ def main():
   # here at all (runner.launch above returned) already proves the device
   # terminated -- nonblock=False blocks until the device unblocks the cmd
   # stream, which only happens once the relay's nz_total goes to zero.
+  #
+  # NOTE: device_new_last (masked x_buf) is NOT compared against the host
+  # below -- now that there's no round cap, the loop *only* stops once a
+  # round's masked output is all-zero, so that vector is trivially zero on
+  # BOTH sides by construction of the stop condition itself, regardless of
+  # whether anything upstream is even correct. It's still useful as an
+  # invariant check (the relay's stop decision better actually agree with
+  # x_buf's content), just not as a host comparison. The real comparison
+  # uses y_buf -- the RAW, unmasked SpMV result for the terminating round,
+  # which is genuinely data-dependent (it can easily be nonzero, full of
+  # entries that all happen to already be in visited_buf).
   device_new_last = extract_diag_result(n, blk, P, read_buf(sym_x_buf))
+  device_last_raw = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
   device_visited = extract_diag_result(n, blk, P, read_buf(sym_visited_buf))
   device_rounds_run = read_rounds_completed()
   t_iter = time.time() - t0
@@ -324,14 +343,15 @@ def main():
   t0 = time.time()
   x_hwl = x_hwl0
   visited = x_bool0.copy()  # f_spmv_iter seeds visited_buf from the initial x_buf too
+  host_last_raw = None  # the terminating round's raw y_buf -- the real comparison target
   host_new_last = None
   per_round_popcount = []
   host_rounds_run = 0
   for _ in range(n):
     seed_x(x_hwl)
     runner.launch("f_spmv", nonblock=False)
-    candidate = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
-    host_new_last = candidate & ~visited
+    host_last_raw = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
+    host_new_last = host_last_raw & ~visited
     visited |= host_new_last
     host_rounds_run += 1
     per_round_popcount.append(int(np.sum(host_new_last)))
@@ -347,26 +367,30 @@ def main():
   runner.stop()
 
   print(f"on-device f_spmv_iter:  visited {int(np.sum(device_visited))}/{n}, "
-        f"last-round new {int(np.sum(device_new_last))}, "
+        f"last-round raw {int(np.sum(device_last_raw))}, "
         f"{device_rounds_run} rounds run, {t_iter*1e3:.2f} ms")
   print(f"host-driven f_spmv:     visited {int(np.sum(visited))}/{n}, "
-        f"last-round new {int(np.sum(host_new_last))}, {host_rounds_run} rounds run, "
+        f"last-round raw {int(np.sum(host_last_raw))}, {host_rounds_run} rounds run, "
         f"{t_recursive*1e3:.2f} ms, per-round popcount {per_round_popcount}")
 
   n_mismatch_visited = int(np.sum(device_visited != visited))
-  n_mismatch_last = int(np.sum(device_new_last != host_new_last))
+  n_mismatch_last_raw = int(np.sum(device_last_raw != host_last_raw))
   rounds_match = device_rounds_run == host_rounds_run
-  passed = (n_mismatch_visited == 0) and (n_mismatch_last == 0) and rounds_match
+  invariant_ok = not device_new_last.any()  # masked x_buf must be all-zero when stopped
+  passed = ((n_mismatch_visited == 0) and (n_mismatch_last_raw == 0)
+            and rounds_match and invariant_ok)
   print(f"[[ visited mismatches: {n_mismatch_visited} / {n} ]]")
-  print(f"[[ last-round new-discovery mismatches: {n_mismatch_last} / {n} ]]")
+  print(f"[[ last-round RAW (unmasked y_buf) mismatches: {n_mismatch_last_raw} / {n} ]]")
   print(f"[[ rounds completed: device={device_rounds_run}, host={host_rounds_run} "
         f"({'match' if rounds_match else 'MISMATCH'}) ]]")
+  print(f"[[ stop invariant (masked x_buf all-zero): "
+        f"{'OK' if invariant_ok else 'VIOLATED -- ' + str(int(np.sum(device_new_last)))} ]]")
   print(f"[[ Result: {'PASS' if passed else 'FAIL'} ]]")
   if not passed:
     idx = np.where(device_visited != visited)[0]
     print(f"visited mismatch indices: {idx[:20].tolist()}{' ...' if len(idx) > 20 else ''}")
-    idx = np.where(device_new_last != host_new_last)[0]
-    print(f"last-round mismatch indices: {idx[:20].tolist()}{' ...' if len(idx) > 20 else ''}")
+    idx = np.where(device_last_raw != host_last_raw)[0]
+    print(f"last-round raw mismatch indices: {idx[:20].tolist()}{' ...' if len(idx) > 20 else ''}")
 
   log_run({
       "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -382,7 +406,8 @@ def main():
       "host_rounds_run": host_rounds_run,
       "verify_pass": passed,
       "mismatches_visited": n_mismatch_visited,
-      "mismatches_last_round": n_mismatch_last,
+      "mismatches_last_round_raw": n_mismatch_last_raw,
+      "stop_invariant_ok": invariant_ok,
   })
 
 
