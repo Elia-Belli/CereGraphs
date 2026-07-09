@@ -67,7 +67,8 @@ def parse_args():
   parser.add_argument("--arch", help="wse2 or wse3 (default wse2)")
   parser.add_argument("--latestlink", default="latest", help="folder for the compiled ELFs")
   parser.add_argument("--source", type=int, default=0, help="single BFS source vertex")
-  parser.add_argument("--out", default="bfs_tree_comparison.png", help="output image path")
+  parser.add_argument("--out", default=None,
+                       help="output image path (default: plots/<matrix>_<grid>_src<N>.png)")
   return parser.parse_args()
 
 
@@ -85,39 +86,85 @@ def build_digraph(A_csr):
   return G
 
 
-def compute_layout(G, used_nodes):
-  """Force-directed layout for `used_nodes` only (the actually-interesting
-  set -- visited by either side), rescaled to fill [-1, 1] x [-1, 1] so it
-  uses the whole panel regardless of how many other, never-visited nodes
-  the full graph has. A plain spring_layout(G, ...) over ALL nodes wastes
-  most of the canvas on those -- their mutual repulsion pushes them away
-  from the interesting cluster, but does nothing to make that cluster
-  itself bigger. Everything else (nodes nothing ever reaches) is placed on
-  a ring around the outside, present for context but not competing for
-  space."""
-  used_nodes = list(used_nodes)
-  other_nodes = [v for v in G.nodes() if v not in used_nodes]
+def compute_radial_layout(G, source):
+  """Concentric rings by BFS level (distance from `source`, computed
+  independently of host_parent/device_parent via plain graph BFS), instead
+  of a force-directed layout -- this directly visualizes the thing that
+  actually matters for a BFS tree (hop count), and rings are the standard
+  convention for it.
 
-  if len(used_nodes) > 1:
-    sub = G.subgraph(used_nodes)
-    pos = nx.spring_layout(sub, seed=42, k=2.5 / math.sqrt(len(used_nodes)), iterations=300)
-    xs = [p[0] for p in pos.values()]
-    ys = [p[1] for p in pos.values()]
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    pos = {
-        v: (2 * (p[0] - xmin) / (xmax - xmin) - 1 if xmax > xmin else 0.0,
-            2 * (p[1] - ymin) / (ymax - ymin) - 1 if ymax > ymin else 0.0)
-        for v, p in pos.items()
-    }
-  else:
-    pos = {v: (0.0, 0.0) for v in used_nodes}
+  Within a ring, nodes are angularly sorted by their CANONICAL BFS parent's
+  angle (a parent computed fresh via nx.bfs_tree(), guaranteed to be exactly
+  one level up), not host_parent/device_parent -- those intentionally allow
+  a node to end up with a parent from a LATER round than its own discovery
+  (see update_parent_reference()'s docstring: "lowest index ever seen",
+  not "lowest index in the immediately preceding round"), so a level-L
+  node's recorded parent is occasionally NOT at level L-1. Using that for
+  layout would break the "children cluster under their parent" clustering
+  this function is trying to do. The actual host_parent/device_parent edges
+  are still drawn wherever they really point in plot_panel() -- they just
+  might not run to an adjacent ring in that rare case, which is fine, even
+  informative, to show as-is.
 
-  if other_nodes:
-    radius = 1.5
-    for i, v in enumerate(other_nodes):
-      angle = 2 * math.pi * i / len(other_nodes)
-      pos[v] = (radius * math.cos(angle), radius * math.sin(angle))
+  Nodes with no path from `source` at all (not merely unvisited by one
+  algorithm run -- genuinely unreachable in the graph) go on a final outer
+  ring, evenly spaced, past the last real BFS level.
+  """
+  dist = nx.single_source_shortest_path_length(G, source)
+  levels = {}
+  for v, d in dist.items():
+    levels.setdefault(d, []).append(v)
+  max_level = max(levels) if levels else 0
+  unreached = [v for v in G.nodes() if v not in dist]
+
+  bfs_tree = nx.bfs_tree(G, source)
+  layout_parent = {v: next(bfs_tree.predecessors(v)) for v in bfs_tree.nodes() if v != source}
+
+  angle = {source: 0.0}
+  pos = {source: (0.0, 0.0)}
+
+  # EQUAL radius steps between levels -- rings should correspond 1:1 to hop
+  # count, not be squeezed or stretched based on how populous each level
+  # happens to be. Sizing the (single, shared) step from the largest level
+  # means a small level right after a huge one still gets pushed out by a
+  # full step, not swallowed by a step sized for its own tiny population
+  # (which would put it imperceptibly close to the ring before it, relative
+  # to that ring's already-large radius). Sparser levels just get unused
+  # circumference; nothing overlaps in the crowded one.
+  max_count = max((len(nodes) for nodes in levels.values()), default=0)
+  step = max(1.5, max_count / 10.0)
+  radius = {L: L * step for L in range(0, max_level + 1)}
+
+  for L in range(1, max_level + 1):
+    nodes_here = sorted(levels.get(L, []))
+    if not nodes_here:
+      continue
+    if L == 1:
+      # only parent is `source` itself -- no angle to inherit, just spread
+      # evenly in node-id order for determinism.
+      for i, v in enumerate(nodes_here):
+        angle[v] = 2 * math.pi * i / len(nodes_here)
+    else:
+      groups = {}
+      for v in nodes_here:
+        groups.setdefault(layout_parent[v], []).append(v)
+      ordered_parents = sorted(groups, key=lambda p: angle[p])
+      total = len(nodes_here)
+      start = 0.0
+      for p in ordered_parents:
+        children = sorted(groups[p])
+        width = 2 * math.pi * len(children) / total
+        for i, v in enumerate(children):
+          angle[v] = start + width * (i + 0.5) / len(children)
+        start += width
+    for v in nodes_here:
+      pos[v] = (radius[L] * math.cos(angle[v]), radius[L] * math.sin(angle[v]))
+
+  if unreached:
+    outer_r = radius[max_level] + max(1.5, len(unreached) / 10.0)
+    for i, v in enumerate(sorted(unreached)):
+      a = 2 * math.pi * i / len(unreached)
+      pos[v] = (outer_r * math.cos(a), outer_r * math.sin(a))
 
   return pos
 
@@ -371,11 +418,7 @@ def main():
 
   print("building the plot...")
   G = build_digraph(A_csr)
-  # lay out nodes visited by EITHER side (the union, so a mismatch still
-  # lands in the main cluster instead of getting flung to the unvisited
-  # ring) to fill the whole panel -- see compute_layout()'s docstring.
-  used_nodes = set(np.nonzero(visited | device_visited)[0].tolist()) | {source}
-  pos = compute_layout(G, used_nodes)
+  pos = compute_radial_layout(G, source)
 
   fig, axes = plt.subplots(1, 2, figsize=(16, 9))
   plot_panel(axes[0], G, pos, host_parent, visited, source, mismatch,
@@ -401,8 +444,16 @@ def main():
   fig.suptitle(f"BFS tree comparison -- {os.path.basename(infile_mtx)}, "
                f"{np_cols}x{np_rows} grid, source={source} -- {status}")
   plt.tight_layout(rect=[0, 0.05, 1, 0.95])
-  plt.savefig(args.out, dpi=150)
-  print(f"saved plot to {args.out}")
+
+  if args.out:
+    out_path = args.out
+  else:
+    matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
+    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
+    out_path = os.path.join(plots_dir, f"{matrix_stem}_{np_cols}x{np_rows}_src{source}.png")
+  os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+  plt.savefig(out_path, dpi=600)
+  print(f"saved plot to {out_path}")
 
 
 if __name__ == "__main__":
