@@ -35,13 +35,29 @@
 // no fixed round count, no host round trip anywhere in the loop.
 // Convergence under visited-masking is monotonic (every round either finds
 // >=1 new node or stops) and bounded by the node count, so this is
-// guaranteed to terminate. Parent tracking (which
-// frontier member discovered a node) is deliberately not attempted here:
-// reduce_fadds is a sum, not a selection, so it can't answer "which PE
-// contributed" once more than one predecessor fires in the same round --
-// see bfs_spmv/run_bfs.py's own docstring point 3 for the same limitation
-// on the host-orchestrated version, which resorts to a separate host-side
-// scan against the original CSC structure instead.
+// guaranteed to terminate.
+//
+// Parent tracking (which vertex discovered a given node) can't use
+// reduce_fadds at all -- it's a sum, not a selection, so it can't answer
+// "which PE contributed" once more than one predecessor fires in the same
+// round (see bfs_spmv/run_bfs.py's own docstring point 3 for the same
+// limitation on the host-orchestrated version). Instead, parent is tracked
+// per-PE, BEFORE the reduce (see compute()): every PE (i,j) in row i knows
+// exactly which of its own local columns touched which local row this
+// round, which reduce_fadds's aggregation would otherwise throw away. Each
+// PE keeps parent_local_buf, indexed identically to y_local_buf (dense over
+// its row-block), holding the lowest-global-index column it has EVER seen
+// touch each local row (across all rounds, not reset -- "lowest index" is
+// the deterministic tie-break used throughout, both for multiple local
+// columns hitting the same row in one round and for the same row being
+// touched again in a later round). Because different PEs in the SAME row
+// cover different column ranges, a row's true best candidate is the min
+// across all P PEs in that row -- <collectives_2d> has no min-reduce, so
+// this last step is done host-side after memcpy_d2h (see
+// extract_parent_result() in ../test_iterative.py). TODO: this final
+// cross-PE min could in principle be done on-device with a relay shaped
+// like the termination check above, but there's no min-reduce primitive to
+// build it from without hand-rolling one.
 
 param memcpy_params;
 param c2d_params;
@@ -156,10 +172,32 @@ var rounds_completed = @zeros([1]u16);
 // into the dense y_local_buf.
 var y_flags = @zeros([max_local_nnz_rows]u16);
 
+// sentinel meaning "no candidate parent seen" -- global vertex indices are
+// always < n, and n is implicitly < 65535 throughout this codebase already
+// (every row/col index here is u16), so this is safely out of range.
+const PARENT_NONE: u16 = 65535;
+
+// parent_compact: per-round scratch, indexed like y_flags (compact distinct-
+// row list), holding the lowest-global-index local column seen touching
+// each compact row THIS round. Reset to PARENT_NONE every round in
+// compute().
+var parent_compact = @zeros([max_local_nnz_rows]u16);
+
+// parent_local_buf: this PE's own candidate parent, dense over its
+// row-block like y_local_buf/x_buf, PERSISTED across rounds (never reset
+// except at a fresh f_spmv_iter call in start_spmv()) -- holds the lowest
+// global vertex index this PE has EVER seen touch each local row, across
+// every round. Meaningful at EVERY PE (unlike x_buf/y_buf/visited_buf,
+// which only matter at the diagonal): different PEs in the same row cover
+// different column ranges, so the row's true parent is the min across all
+// P PEs in that row -- done host-side, see the module docstring above.
+var parent_local_buf = @zeros([blk]u16);
+
 var ptr_x_buf: [*]f32 = &x_buf;
 var ptr_y_buf: [*]f32 = &y_buf;
 var ptr_visited_buf: [*]f32 = &visited_buf;
 var ptr_rounds_completed: [*]u16 = &rounds_completed;
+var ptr_parent_local_buf: [*]u16 = &parent_local_buf;
 var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
 var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
 var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
@@ -222,6 +260,15 @@ fn start_spmv() void {
     }
     if (is_iterative) {
         rounds_completed[0] = 0;
+        // parent_local_buf persists across rounds by design (see the
+        // module docstring / its own comment above) but must still reset
+        // at the start of a FRESH f_spmv_iter call, same reason
+        // visited_buf does -- otherwise a second call in the same session
+        // would inherit stale parents from the first.
+        var p: u16 = 0;
+        while (p < blk) : (p += 1) {
+            parent_local_buf[p] = PARENT_NONE;
+        }
     }
 
     // phase 1: broadcast this column's x-block down from its diagonal PE
@@ -255,6 +302,14 @@ task compute() void {
     while (i < local_nnz_rows[0]) : (i += 1) {
         y_flags[i] = 0;
     }
+    if (is_iterative) {
+        // parent_compact is per-round scratch (unlike parent_local_buf,
+        // which persists) -- reset every round, same reason y_flags is.
+        i = 0;
+        while (i < local_nnz_rows[0]) : (i += 1) {
+            parent_compact[i] = PARENT_NONE;
+        }
+    }
     i = 0;
     while (i < blk) : (i += 1) {
         y_local_buf[i] = 0.0;
@@ -263,7 +318,10 @@ task compute() void {
 
     // local boolean multiply: for every locally-nonzero column c with
     // x_buf[c] set, mark every local row it touches (via the compact
-    // y_rows_init_buf list, exactly as hypersparse_spmv does).
+    // y_rows_init_buf list, exactly as hypersparse_spmv does). Also record
+    // a candidate parent BEFORE the reduce below discards column identity:
+    // this PE's own global vertex index for column c is pcol_id*blk + c,
+    // since c is local to this PE's own column-block.
     i = 0;
     while (i < local_nnz_cols[0]) : (i += 1) {
         const c = mat_col_idx_buf[i];
@@ -274,6 +332,12 @@ task compute() void {
             while (j < len) : (j += 1) {
                 const k = mat_rows_buf[loc + j];
                 y_flags[k] = 1;
+                if (is_iterative) {
+                    const candidate: u16 = pcol_id * blk + c;
+                    if (candidate < parent_compact[k]) {
+                        parent_compact[k] = candidate;
+                    }
+                }
             }
         }
     }
@@ -281,14 +345,20 @@ task compute() void {
     i = 0;
     while (i < local_nnz_rows[0]) : (i += 1) {
         if (y_flags[i] != 0) {
-            y_local_buf[y_rows_init_buf[i]] = 1.0;
+            const dense_idx = y_rows_init_buf[i];
+            y_local_buf[dense_idx] = 1.0;
+            if (is_iterative and parent_compact[i] < parent_local_buf[dense_idx]) {
+                parent_local_buf[dense_idx] = parent_compact[i];
+            }
         }
     }
 
     // phase 2: reduce this row's local contributions toward its diagonal
     // column (== prow_id). Boolean OR via add-then-nonzero (values are
     // 0.0/1.0, so sum > 0 <=> OR); the host treats y_buf as boolean on
-    // readback.
+    // readback. Note parent_local_buf never goes through this reduce --
+    // it's read back and combined host-side instead, see the module
+    // docstring above.
     mpi_x.reduce_fadds(prow_id, @ptrcast([*]f32, &y_local_buf), @ptrcast([*]f32, &y_buf),
                         blk, reduce_done_task_id);
 }
@@ -399,6 +469,7 @@ comptime {
     @export_symbol(ptr_y_buf, "y_buf");
     @export_symbol(ptr_visited_buf, "visited_buf");
     @export_symbol(ptr_rounds_completed, "rounds_completed");
+    @export_symbol(ptr_parent_local_buf, "parent_local_buf");
     @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
     @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
     @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");

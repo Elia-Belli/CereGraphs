@@ -16,11 +16,21 @@
   MID = pcols/2 -- see reduce_done()/term_col_done()/term_row_done()/
   term_row_bcast_done()/term_col_bcast_done() in bool_pe.csl) checks whether
   ANY row found something new this round; if not, the whole grid agrees to
-  stop. Parent tracking (which frontier member discovered a node) is
-  deliberately not attempted -- reduce_fadds can't do witness-selection, see
-  the module docstring in bool_pe.csl.
+  stop.
 
-  This script checks three things: (1) visited_buf (the cumulative
+  Parent tracking (which vertex discovered a given node) can't go through
+  reduce_fadds -- it's a sum, not a selection -- so it's tracked per-PE
+  BEFORE the reduce instead (see compute() in bool_pe.csl): every PE knows
+  exactly which of its own local columns touched which local row this
+  round, and keeps the lowest-global-index one it's ever seen (across all
+  rounds) in parent_local_buf. Because different PEs in the same row cover
+  different column ranges, the row's true parent is the min across all P
+  PEs in that row -- <collectives_2d> has no min-reduce, so that last step
+  is done here, host-side, in extract_parent_result() below, after
+  memcpy_d2h reads back the full (not diagonal-only) parent_local_buf
+  rectangle.
+
+  This script checks four things: (1) visited_buf (the cumulative
   discovered set) is bit-identical between running f_spmv_iter once and
   calling single-shot f_spmv from the host in a loop that applies the
   identical visited-mask and stops the same way; (2) the terminating
@@ -32,14 +42,19 @@
   round's own SpMV computation would actually show up; (3) rounds_completed
   (a host-visible counter, purely for this test) shows the device stopped at
   exactly the same round the host independently computed, not some other
-  round. Masked x_buf being genuinely all-zero at stop time is checked too,
-  as a sanity invariant rather than a host comparison. (The device side has
-  no round cap at all -- runner.launch(..., nonblock=False) blocking on
-  f_spmv_iter and returning is itself proof the on-device relay terminated
-  at all; the host loop below keeps a generous n-round safety net purely so
-  a genuine bug can't hang this *script*, not because the device needs one.)
-  Both entrypoints are exported from the SAME compiled kernel, so this only
-  needs one compile + one SdkRuntime session.
+  round; (4) the assembled parent vector matches a host-side reference that
+  independently recomputes, for every round, the lowest-index active
+  frontier member with a real edge to each row (mirroring the device's own
+  rule exactly, not bfs_spmv/run_bfs.py's stricter "previous frontier only"
+  definition -- see extract_parent_result()'s docstring for why the looser
+  rule is still valid). Masked x_buf being genuinely all-zero at stop time
+  is checked too, as a sanity invariant rather than a host comparison. (The
+  device side has no round cap at all -- runner.launch(..., nonblock=False)
+  blocking on f_spmv_iter and returning is itself proof the on-device relay
+  terminated at all; the host loop below keeps a generous n-round safety
+  net purely so a genuine bug can't hang this *script*, not because the
+  device needs one.) Both entrypoints are exported from the SAME compiled
+  kernel, so this only needs one compile + one SdkRuntime session.
 
   How to compile and run
      python test_iterative.py --arch=wse3 --num_pe_cols=4 --num_pe_rows=4
@@ -70,6 +85,56 @@ def log_run(record):
   with open(LOG_FILE, "a", encoding="utf-8") as f:
     f.write(json.dumps(record) + "\n")
   print(f"[test_iterative] appended run record to {LOG_FILE}")
+
+
+def extract_parent_result(n, blk, P, parent_hwl):
+  """Assemble the length-n parent vector from the full (not diagonal-only)
+  parent_local_buf rectangle. parent_hwl has shape (height=P, width=P, blk):
+  for row-block p, every column-PE parent_hwl[p, :, :] independently
+  computed a candidate parent for that row-block's blk local positions (see
+  bool_pe.csl's module docstring) -- take the min across the P column-PEs
+  (the row/column-min-reduce <collectives_2d> can't do, per the TODO there),
+  same list-then-concatenate-then-truncate shape run_bool.extract_diag_result
+  uses for the diagonal case."""
+  parts = [parent_hwl[p, :, :].min(axis=0) for p in range(P)]
+  parent = np.concatenate(parts).astype(np.int64)[0:n]
+  parent[parent >= n] = -1  # normalize the device's PARENT_NONE (65535) sentinel
+  return parent
+
+
+def update_parent_reference(host_parent, A_csr, frontier_bool):
+  """Host-side reference mirroring bool_pe.csl's compute() exactly: for
+  every row v, if any node currently in frontier_bool has a real edge to v
+  (A_csr[v, :] is row v's predecessor columns, per bool_diag_spmv's
+  row=dest/col=source convention -- see generate_boolean_reference in
+  run_bool.py), take the lowest-index one and keep it if it's better than
+  whatever's already recorded.
+
+  This is deliberately NOT bfs_spmv/run_bfs.py's find_parents(), which only
+  considers the frontier immediately preceding a node's first discovery
+  (guaranteeing a true one-hop-closer BFS parent). The device has no way to
+  enforce that -- compute() runs identically whether or not a row was
+  already visited elsewhere (masking/visited_buf only exist at the
+  diagonal), so a node can pick up a lower-index candidate from ANY round it
+  was ever touched in, not just its discovery round. That's still a fully
+  valid parent by bfs_spmv's own verify_bfs() definition (visited + a real
+  edge -- see its docstring), just not necessarily one BFS level closer, so
+  this reference intentionally matches the device's looser rule rather than
+  the stricter host-orchestrated one.
+  """
+  frontier_idx = np.nonzero(frontier_bool)[0]
+  if frontier_idx.size == 0:
+    return
+  frontier_set = set(frontier_idx.tolist())
+  n = len(host_parent)
+  for v in range(n):
+    start, end = A_csr.indptr[v], A_csr.indptr[v + 1]
+    best = -1
+    for u in A_csr.indices[start:end]:
+      if u in frontier_set and (best == -1 or u < best):
+        best = u
+    if best != -1 and (host_parent[v] == -1 or best < host_parent[v]):
+      host_parent[v] = best
 
 
 def main():
@@ -221,6 +286,7 @@ def main():
   sym_y_buf = runner.get_id("y_buf")
   sym_visited_buf = runner.get_id("visited_buf")
   sym_rounds_completed = runner.get_id("rounds_completed")
+  sym_parent_local_buf = runner.get_id("parent_local_buf")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
   sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
   sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
@@ -308,6 +374,16 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     return int(np.reshape(buf_1d, (height, width, 1), order="F")[(0, 0, 0)])
 
+  def read_parent_local_buf():
+    # unlike x_buf/y_buf/visited_buf, parent_local_buf is meaningful at
+    # EVERY PE (not just the diagonal) -- read back the full rectangle,
+    # same u16-over-u32-wire convention as read_rounds_completed above.
+    buf_1d = np.zeros(height * width * blk, np.uint32)
+    runner.memcpy_d2h(buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
+    return np.reshape(buf_1d, (height, width, blk), order="F")
+
   print("step 2: on-device iterative -- one f_spmv_iter launch, runs until the "
         "on-device termination relay stops it (see module docstring)")
   t0 = time.time()
@@ -335,6 +411,7 @@ def main():
   device_last_raw = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
   device_visited = extract_diag_result(n, blk, P, read_buf(sym_visited_buf))
   device_rounds_run = read_rounds_completed()
+  device_parent = extract_parent_result(n, blk, P, read_parent_local_buf())
   t_iter = time.time() - t0
 
   print("step 3: host-driven baseline -- sequential f_spmv launches, host applies "
@@ -342,12 +419,15 @@ def main():
         "as a safety net for this script, not a device limit -- see module docstring)")
   t0 = time.time()
   x_hwl = x_hwl0
+  frontier_bool = x_bool0  # this round's active input, for update_parent_reference
   visited = x_bool0.copy()  # f_spmv_iter seeds visited_buf from the initial x_buf too
+  host_parent = np.full(n, -1, dtype=np.int64)
   host_last_raw = None  # the terminating round's raw y_buf -- the real comparison target
   host_new_last = None
   per_round_popcount = []
   host_rounds_run = 0
   for _ in range(n):
+    update_parent_reference(host_parent, A_csr, frontier_bool)
     seed_x(x_hwl)
     runner.launch("f_spmv", nonblock=False)
     host_last_raw = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
@@ -358,6 +438,7 @@ def main():
     if not host_new_last.any():
       break  # matches the device's real termination check -- stop as soon
              # as a round finds nothing new
+    frontier_bool = host_new_last
     x_hwl = dist_x_to_diag_hwl(n, host_new_last.astype(np.float32), blk, P)
   else:
     raise RuntimeError(f"host-driven baseline did not converge within {n} rounds -- "
@@ -375,12 +456,15 @@ def main():
 
   n_mismatch_visited = int(np.sum(device_visited != visited))
   n_mismatch_last_raw = int(np.sum(device_last_raw != host_last_raw))
+  n_mismatch_parent = int(np.sum(device_parent != host_parent))
   rounds_match = device_rounds_run == host_rounds_run
   invariant_ok = not device_new_last.any()  # masked x_buf must be all-zero when stopped
   passed = ((n_mismatch_visited == 0) and (n_mismatch_last_raw == 0)
-            and rounds_match and invariant_ok)
+            and (n_mismatch_parent == 0) and rounds_match and invariant_ok)
+  n_with_parent = int(np.sum(device_parent >= 0))
   print(f"[[ visited mismatches: {n_mismatch_visited} / {n} ]]")
   print(f"[[ last-round RAW (unmasked y_buf) mismatches: {n_mismatch_last_raw} / {n} ]]")
+  print(f"[[ parent mismatches: {n_mismatch_parent} / {n} ({n_with_parent} assigned a parent) ]]")
   print(f"[[ rounds completed: device={device_rounds_run}, host={host_rounds_run} "
         f"({'match' if rounds_match else 'MISMATCH'}) ]]")
   print(f"[[ stop invariant (masked x_buf all-zero): "
@@ -391,6 +475,12 @@ def main():
     print(f"visited mismatch indices: {idx[:20].tolist()}{' ...' if len(idx) > 20 else ''}")
     idx = np.where(device_last_raw != host_last_raw)[0]
     print(f"last-round raw mismatch indices: {idx[:20].tolist()}{' ...' if len(idx) > 20 else ''}")
+    idx = np.where(device_parent != host_parent)[0]
+    print(f"parent mismatch indices: {idx[:20].tolist()}{' ...' if len(idx) > 20 else ''}")
+    if idx.size:
+      shown = idx[:10]
+      print(f"  device_parent{shown.tolist()} = {device_parent[shown].tolist()}")
+      print(f"  host_parent{shown.tolist()}   = {host_parent[shown].tolist()}")
 
   log_run({
       "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -407,6 +497,7 @@ def main():
       "verify_pass": passed,
       "mismatches_visited": n_mismatch_visited,
       "mismatches_last_round_raw": n_mismatch_last_raw,
+      "mismatches_parent": n_mismatch_parent,
       "stop_invariant_ok": invariant_ok,
   })
 

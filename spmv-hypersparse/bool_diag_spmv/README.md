@@ -2,8 +2,11 @@
 
 A from-scratch redesign of `../original_spmv` for a different target
 workload: boolean-semiring SpMV (`y = OR_j (A[i,j] AND x[j])`) on a *square*
-adjacency matrix, as the building block for a future BFS implementation (not
-yet built — see "Status" below).
+adjacency matrix, as the building block for an on-device BFS. `f_spmv_iter`
+now runs the full loop entirely on-device — frontier propagation, a
+cumulative visited set, real termination detection, and parent tracking,
+with no host round trip and no fixed iteration cap — see "Status" below for
+what's genuinely done versus what's still a stub.
 
 ## Files
 
@@ -25,9 +28,12 @@ yet built — see "Status" below).
   until the on-device termination relay agrees nothing new was found — no
   round cap) against the same compiled kernel's `f_spmv`, called in a
   host-side loop that applies the identical visited-mask and stops the same
-  way — then checks `visited_buf`, the last round's new-discoveries, and the
-  number of rounds actually run are all identical between the two. Logs
-  each run to `iterative_results.jsonl`.
+  way — then checks `visited_buf`, the terminating round's raw (unmasked)
+  `y_buf`, the assembled parent vector (`extract_parent_result()`, min-reduced
+  host-side from the full `parent_local_buf` rectangle), and the number of
+  rounds actually run are all identical between the two, plus a sanity
+  invariant that the masked `x_buf` is genuinely all-zero when the device
+  stops. Logs each run to `iterative_results.jsonl`.
 - `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test on
   `../data/rmat4.4x4.lb.mtx` at a 4x4 grid, for WSE-2 and WSE-3 respectively.
   Unlike `original_spmv`/`bfs_spmv`, both scripts compile the *same* `src/` —
@@ -100,6 +106,55 @@ the fixed per-call setup/teardown overhead every phase pays regardless of
 hop count, is an actual bottleneck; building it now would reintroduce
 exactly the hand-rolled-routing complexity `<collectives_2d>` was adopted to
 avoid.
+
+### Parent tracking: computed pre-reduce, min-reduced host-side
+
+`reduce_fadds` can't track *which* frontier member discovered a node either
+— same problem as the termination check, sum vs. selection — but unlike the
+termination flag, parent identity can't be recovered *after* the reduce at
+all: by the time `y_buf` exists, every contributing PE's column identity has
+already been summed away. So parent is computed in `compute()`, **before**
+the reduce runs, at the only point column identity is still visible:
+
+- Every PE `(i, j)` in row `i` covers a different slice of the column
+  (source-vertex) range, so a destination row in row-block `i` can have
+  different candidate parents discovered by different PEs in the same row —
+  each PE only sees its own slice, so this can't be resolved locally by any
+  one PE.
+- Each PE keeps `parent_local_buf`, indexed identically to `y_local_buf`
+  (dense over its row-block), holding the lowest-global-index local column
+  it has *ever* seen touch each local row — persisted across rounds, not
+  reset (unlike `y_flags`/`parent_compact`, which are per-round scratch).
+  "Lowest index wins" is applied uniformly: within one round (multiple local
+  columns hitting the same row), and across rounds (a later round touching a
+  row again can still lower its parent if a smaller-index candidate shows
+  up).
+- Because different PEs in the same row hold different candidates for the
+  same destination, the true parent is the **min across all `P` PEs in that
+  row** — a row-reduce, structurally just like the termination check's, but
+  with `min` instead of `sum`. `<collectives_2d>` has no min-reduce
+  primitive, so this step is done host-side instead: `parent_local_buf` is
+  exported from *every* PE (not just the diagonal, unlike `x_buf`/`y_buf`/
+  `visited_buf`), and `test_iterative.py`'s `extract_parent_result()` reads
+  back the full rectangle and takes `.min(axis=...)` across the row's `P`
+  column-PEs after `memcpy_d2h`.
+- TODO: that final cross-PE min could in principle be done on-device with a
+  relay shaped exactly like the termination check's, but there's no
+  min-reduce primitive to build it from without hand-rolling one — noted in
+  `bool_pe.csl`'s module docstring next to the termination-relay TODO above.
+
+One correctness note, not a bug: this is a **looser** validity notion than
+`bfs_spmv/run_bfs.py`'s `find_parents()`, which only considers the frontier
+*immediately preceding* a node's first discovery (guaranteeing the parent is
+exactly one BFS level closer). The device has no way to enforce that —
+`compute()` runs identically whether or not a row was already visited
+elsewhere (masking/`visited_buf` only exist at the diagonal), so a node can
+pick up a candidate from *any* round it was ever touched in, not just its
+discovery round. That's still a fully valid parent by `bfs_spmv`'s own
+`verify_bfs()` definition (visited + a real edge, no level check) — see
+`test_iterative.py`'s `update_parent_reference()` docstring, which
+deliberately mirrors this looser rule rather than `find_parents()`'s
+stricter one.
 
 ## Trade-offs versus `original_spmv` (see `../original_spmv/README.md` first)
 
@@ -206,12 +261,16 @@ Two entrypoints, both exported from the same compiled kernel:
   something new; if not, the whole grid stops. No round-count cap anywhere
   — the loop runs for as many rounds as real BFS convergence takes (bounded
   by the node count, since visited-masking is monotonic) and no host round
-  trip anywhere in between. Verified against a host-side loop of sequential
-  `f_spmv` launches that applies the identical mask and the identical
-  stop rule (`test_iterative.py`) — `visited_buf`, the last round's
-  new-discoveries, *and* the number of rounds actually run are all
-  bit-identical, 0 mismatches, on a 4x4 grid, an odd 5x5 grid, and an
-  8x8/64-node case.
+  trip anywhere in between. Every PE also tracks a candidate parent
+  pre-reduce (see "Parent tracking" above), min-reduced across each row's
+  PEs host-side into the final parent vector. Verified against a host-side
+  loop of sequential `f_spmv` launches that applies the identical mask, the
+  identical stop rule, and an independent host-side parent reference
+  (`test_iterative.py`) — `visited_buf`, the terminating round's raw
+  (unmasked) `y_buf`, the assembled parent vector, *and* the number of
+  rounds actually run are all bit-identical, 0 mismatches, on a 4x4 grid, an
+  odd 5x5 grid, and an 8x8/64-node case (with the masked `x_buf`'s
+  all-zero-at-stop invariant separately confirmed too).
 
 What's still missing (see the `TODO`s in `bool_pe.csl`):
 
@@ -219,12 +278,9 @@ What's still missing (see the `TODO`s in `bool_pe.csl`):
   column ever has a nonzero flag, but `reduce_fadds` can't skip the other
   `P-1` — see "The termination relay" above for the full reasoning and why
   it's deferred rather than hand-rolled now.
-- **No parent tracking.** Deliberately not attempted: `reduce_fadds` is a
-  sum, not a selection, so it can't answer "which frontier member reached
-  this node" once more than one predecessor fires in the same round — the
-  same limitation `bfs_spmv/run_bfs.py`'s own docstring documents (point 3)
-  for the host-orchestrated version, which resorts to a separate host-side
-  scan against the original CSC structure instead of solving it on-device.
+- **Parent's cross-PE min-reduce is host-side, not on-device.** Same root
+  cause as the termination relay (`<collectives_2d>` has no min-reduce), but
+  unbuilt here too — see "Parent tracking" above.
 
 Also worth reconsidering before going further: whether the hypersparse
 compressed-column format (inherited unchanged from `original_spmv`) is even
