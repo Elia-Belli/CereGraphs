@@ -1,27 +1,38 @@
 #!/usr/bin/env cs_python
 # pylint: disable=too-many-function-args
 """ verify bool_diag_spmv's on-device iterative SpMV (f_spmv_iter) against
-  the same number of sequential single-shot f_spmv launches, host-driven.
+  the same, self-terminating sequence of single-shot f_spmv launches,
+  host-driven.
 
-  bool_pe.csl's f_spmv_iter runs MAX_ITERS rounds of
-  (broadcast -> local boolean multiply -> reduce-to-diagonal) on-device. At
-  the diagonal PEs, reduce_done() masks each round's raw result against a
-  cumulative visited_buf before feeding it back as the next round's x -- only
-  genuinely new discoveries propagate, same as this file's own
-  host-recursive baseline below and bfs_spmv/run_bfs.py's host-side
-  `new_mask = candidate & ~visited`. See the TODOs in bool_pe.csl's
-  reduce_done() for what's still missing: a real "y is globally empty"
-  termination check (still a fixed MAX_ITERS loop) and parent tracking
-  (deliberately not attempted -- reduce_fadds can't do witness-selection,
-  see the module docstring in bool_pe.csl).
+  bool_pe.csl's f_spmv_iter runs rounds of (broadcast -> local boolean
+  multiply -> reduce-to-diagonal) on-device, for as many rounds as real BFS
+  convergence takes -- no fixed round count. At the diagonal PEs,
+  reduce_done() masks each round's raw result against a cumulative
+  visited_buf before feeding it back as the next round's x -- only
+  genuinely new discoveries propagate, same as this file's own host-driven
+  baseline below and bfs_spmv/run_bfs.py's host-side
+  `new_mask = candidate & ~visited`. After masking, a 4-phase relay
+  (column-reduce, row-reduce, row-broadcast, column-broadcast, all rooted at
+  MID = pcols/2 -- see reduce_done()/term_col_done()/term_row_done()/
+  term_row_bcast_done()/term_col_bcast_done() in bool_pe.csl) checks whether
+  ANY row found something new this round; if not, the whole grid agrees to
+  stop. Parent tracking (which frontier member discovered a node) is
+  deliberately not attempted -- reduce_fadds can't do witness-selection, see
+  the module docstring in bool_pe.csl.
 
-  This script checks that the on-device loop actually computes what it's
-  supposed to: running f_spmv_iter once should give bit-identical results
-  (both visited_buf and the final round's new-discoveries in x_buf) to
-  calling the single-shot f_spmv MAX_ITERS times from the host, with the
-  host applying the identical visited-mask between launches -- exactly what
-  the device does internally. Both entrypoints are exported from the SAME
-  compiled kernel, so this only needs one compile + one SdkRuntime session.
+  This script checks two things: (1) running f_spmv_iter once gives
+  bit-identical results (visited_buf and the final round's new-discoveries
+  in x_buf) to calling single-shot f_spmv from the host in a loop that
+  applies the identical visited-mask and stops the same way; (2)
+  rounds_completed (a host-visible counter, purely for this test) shows the
+  device stopped at exactly the same round the host independently computed,
+  not some other round. (The device side has no round cap at all --
+  runner.launch(..., nonblock=False) blocking on f_spmv_iter and returning
+  is itself proof the on-device relay terminated at all; the host loop below
+  keeps a generous n-round safety net purely so a genuine bug can't hang
+  this *script*, not because the device needs one.) Both entrypoints are
+  exported from the SAME compiled kernel, so this only needs one compile +
+  one SdkRuntime session.
 
   How to compile and run
      python test_iterative.py --arch=wse3 --num_pe_cols=4 --num_pe_rows=4
@@ -44,11 +55,6 @@ from scipy.io import mmread
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
 )
-
-# Must match bool_pe.csl's MAX_ITERS -- there's no host-settable param for
-# this yet (see the TODO there: it's a fixed-count stub, not a real
-# termination check), so the two sides are kept in sync by hand for now.
-MAX_ITERS = 5
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iterative_results.jsonl")
 
@@ -207,6 +213,7 @@ def main():
   sym_x_buf = runner.get_id("x_buf")
   sym_y_buf = runner.get_id("y_buf")
   sym_visited_buf = runner.get_id("visited_buf")
+  sym_rounds_completed = runner.get_id("rounds_completed")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
   sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
   sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
@@ -282,48 +289,78 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     return oned_to_hwl_colmajor(height, width, blk, buf_1d, np.float32)
 
-  print(f"step 2: on-device iterative -- one f_spmv_iter launch, {MAX_ITERS} internal rounds")
+  def read_rounds_completed():
+    # every PE increments its own copy in lockstep (the 4-phase relay makes
+    # them all agree each round before any of them decides to continue), so
+    # any single PE's value is the global answer -- just read (0, 0). u16
+    # readback mirrors the h2d convention used for mat_rows_buf/local_nnz
+    # above: MEMCPY_16BIT wire format, uint32-typed host buffer.
+    buf_1d = np.zeros(height * width, np.uint32)
+    runner.memcpy_d2h(buf_1d, sym_rounds_completed, 0, 0, width, height, 1,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
+    return int(np.reshape(buf_1d, (height, width, 1), order="F")[(0, 0, 0)])
+
+  print("step 2: on-device iterative -- one f_spmv_iter launch, runs until the "
+        "on-device termination relay stops it (see module docstring)")
   t0 = time.time()
   seed_x(x_hwl0)
   runner.launch("f_spmv_iter", nonblock=False)
   # x_buf ends the call holding the LAST round's masked new-discoveries (see
   # reduce_done() in bool_pe.csl -- it runs the mask/visited update on every
   # round, including the last, so x_buf is never stale); visited_buf holds
-  # everything discovered across all MAX_ITERS rounds.
+  # everything discovered across however many rounds actually ran. Getting
+  # here at all (runner.launch above returned) already proves the device
+  # terminated -- nonblock=False blocks until the device unblocks the cmd
+  # stream, which only happens once the relay's nz_total goes to zero.
   device_new_last = extract_diag_result(n, blk, P, read_buf(sym_x_buf))
   device_visited = extract_diag_result(n, blk, P, read_buf(sym_visited_buf))
+  device_rounds_run = read_rounds_completed()
   t_iter = time.time() - t0
 
-  print(f"step 3: host-recursive baseline -- {MAX_ITERS}x sequential f_spmv launches, "
-        "host applies the same visited-mask between launches")
+  print("step 3: host-driven baseline -- sequential f_spmv launches, host applies "
+        "the same visited-mask and stops the same way (capped at n rounds purely "
+        "as a safety net for this script, not a device limit -- see module docstring)")
   t0 = time.time()
   x_hwl = x_hwl0
   visited = x_bool0.copy()  # f_spmv_iter seeds visited_buf from the initial x_buf too
   host_new_last = None
   per_round_popcount = []
-  for _ in range(MAX_ITERS):
+  host_rounds_run = 0
+  for _ in range(n):
     seed_x(x_hwl)
     runner.launch("f_spmv", nonblock=False)
     candidate = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
     host_new_last = candidate & ~visited
     visited |= host_new_last
+    host_rounds_run += 1
     per_round_popcount.append(int(np.sum(host_new_last)))
+    if not host_new_last.any():
+      break  # matches the device's real termination check -- stop as soon
+             # as a round finds nothing new
     x_hwl = dist_x_to_diag_hwl(n, host_new_last.astype(np.float32), blk, P)
+  else:
+    raise RuntimeError(f"host-driven baseline did not converge within {n} rounds -- "
+                        "this should be impossible (bounded by node count); likely a bug")
   t_recursive = time.time() - t0
 
   runner.stop()
 
   print(f"on-device f_spmv_iter:  visited {int(np.sum(device_visited))}/{n}, "
-        f"last-round new {int(np.sum(device_new_last))}, {t_iter*1e3:.2f} ms")
-  print(f"host-recursive f_spmv:  visited {int(np.sum(visited))}/{n}, "
-        f"last-round new {int(np.sum(host_new_last))}, {t_recursive*1e3:.2f} ms, "
-        f"per-round popcount {per_round_popcount}")
+        f"last-round new {int(np.sum(device_new_last))}, "
+        f"{device_rounds_run} rounds run, {t_iter*1e3:.2f} ms")
+  print(f"host-driven f_spmv:     visited {int(np.sum(visited))}/{n}, "
+        f"last-round new {int(np.sum(host_new_last))}, {host_rounds_run} rounds run, "
+        f"{t_recursive*1e3:.2f} ms, per-round popcount {per_round_popcount}")
 
   n_mismatch_visited = int(np.sum(device_visited != visited))
   n_mismatch_last = int(np.sum(device_new_last != host_new_last))
-  passed = (n_mismatch_visited == 0) and (n_mismatch_last == 0)
+  rounds_match = device_rounds_run == host_rounds_run
+  passed = (n_mismatch_visited == 0) and (n_mismatch_last == 0) and rounds_match
   print(f"[[ visited mismatches: {n_mismatch_visited} / {n} ]]")
   print(f"[[ last-round new-discovery mismatches: {n_mismatch_last} / {n} ]]")
+  print(f"[[ rounds completed: device={device_rounds_run}, host={host_rounds_run} "
+        f"({'match' if rounds_match else 'MISMATCH'}) ]]")
   print(f"[[ Result: {'PASS' if passed else 'FAIL'} ]]")
   if not passed:
     idx = np.where(device_visited != visited)[0]
@@ -337,11 +374,12 @@ def main():
       "n": n,
       "nnz": nnz,
       "pe_grid": f"{np_cols}x{np_rows}",
-      "max_iters": MAX_ITERS,
       "compile_time_s": round(compile_time, 6),
       "device_iter_s": round(t_iter, 6),
       "host_recursive_s": round(t_recursive, 6),
       "per_round_popcount": per_round_popcount,
+      "device_rounds_run": device_rounds_run,
+      "host_rounds_run": host_rounds_run,
       "verify_pass": passed,
       "mismatches_visited": n_mismatch_visited,
       "mismatches_last_round": n_mismatch_last,

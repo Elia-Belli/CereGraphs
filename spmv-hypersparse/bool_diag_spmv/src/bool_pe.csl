@@ -25,11 +25,17 @@
 // exactly the PE that needs to source the next iteration's broadcast down
 // its own column.
 //
-// f_spmv_iter runs this for MAX_ITERS rounds without a host round trip,
-// masking each round's raw result against a cumulative visited_buf (see
-// reduce_done()) before feeding it back as the next round's x -- i.e. only
-// genuinely new discoveries propagate, same as bfs_spmv/run_bfs.py's
-// host-side `new_mask = candidate & ~visited`. Parent tracking (which
+// f_spmv_iter runs this without a host round trip, masking each round's raw
+// result against a cumulative visited_buf (see reduce_done()) before
+// feeding it back as the next round's x -- i.e. only genuinely new
+// discoveries propagate, same as bfs_spmv/run_bfs.py's host-side
+// `new_mask = candidate & ~visited`. It stops once a 4-phase relay (see
+// reduce_done()/term_col_done()/term_row_done()/term_row_bcast_done()/
+// term_col_bcast_done()) agrees no row found anything new this round --
+// no fixed round count, no host round trip anywhere in the loop.
+// Convergence under visited-masking is monotonic (every round either finds
+// >=1 new node or stops) and bounded by the node count, so this is
+// guaranteed to terminate. Parent tracking (which
 // frontier member discovered a node) is deliberately not attempted here:
 // reduce_fadds is a sum, not a selection, so it can't answer "which PE
 // contributed" once more than one predecessor fires in the same round --
@@ -47,6 +53,12 @@ param max_local_nnz_rows: u16;  // max local number of nonzero rows
 
 const compute_task_id: local_task_id = @get_local_task_id(10);
 const reduce_done_task_id: local_task_id = @get_local_task_id(11);
+// termination-check relay (see reduce_done()/MID below) -- 14-17 are taken
+// by <collectives_2d>'s own x/y entrypoints (see the map in layout_bool.csl).
+const term_col_done_task_id: local_task_id = @get_local_task_id(12);
+const term_row_done_task_id: local_task_id = @get_local_task_id(13);
+const term_row_bcast_done_task_id: local_task_id = @get_local_task_id(18);
+const term_col_bcast_done_task_id: local_task_id = @get_local_task_id(19);
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 
@@ -108,8 +120,36 @@ var y_buf = @zeros([blk]f32);
 // identically to x_buf/y_buf (same row/column block, meaningful only at the
 // diagonal PE). Seeded from the initial x_buf in start_spmv() and OR'd with
 // every round's genuinely-new discoveries in reduce_done() -- never used or
-// touched by plain f_spmv (see the iter_count > 1 guards below).
+// touched by plain f_spmv (see the is_iterative guards below).
 var visited_buf = @zeros([blk]f32);
+
+// Real termination check (see reduce_done()): <collectives_2d> only gives
+// us per-row (mpi_x) or per-column (mpi_y) primitives, never "the
+// diagonal" directly, so reaching from one diagonal PE to another always
+// means relaying through a full row AND a full column. That forces a
+// 4-phase relay -- column-reduce, row-reduce, row-broadcast,
+// column-broadcast -- rooted at MID on both axes, which lands the
+// aggregation point at (MID, MID): itself a diagonal PE, and the position
+// that minimizes each phase's worst-case chain latency (max(root, P-1-root)
+// hops, per <collectives_2d>'s own linear-chain reduce implementation).
+const P: u16 = @get_rectangle().width;
+const MID: u16 = P / 2;
+
+// nz_local: this round's local "did I find anything new" flag (see
+// reduce_done()) -- 0.0 everywhere except at the diagonal PE, which sets it
+// after masking. nz_col: after the column-reduce, meaningful only at row
+// MID (one value per column). nz_total: after the row-reduce, meaningful
+// only at (MID, MID); after the two broadcasts that follow, meaningful
+// (and identical) everywhere -- != 0.0 means at least one row is still
+// discovering new nodes.
+var nz_local = @zeros([1]f32);
+var nz_col = @zeros([1]f32);
+var nz_total = @zeros([1]f32);
+
+// rounds_completed: host-visible counter of how many rounds f_spmv_iter
+// actually ran this call, purely for verifying early termination actually
+// happens (see ../test_iterative.py) -- not read by the kernel itself.
+var rounds_completed = @zeros([1]u16);
 
 // scratch: compact per-PE flags over the local distinct-row list
 // (y_rows_init_buf), set true by the local multiply before being expanded
@@ -119,6 +159,7 @@ var y_flags = @zeros([max_local_nnz_rows]u16);
 var ptr_x_buf: [*]f32 = &x_buf;
 var ptr_y_buf: [*]f32 = &y_buf;
 var ptr_visited_buf: [*]f32 = &visited_buf;
+var ptr_rounds_completed: [*]u16 = &rounds_completed;
 var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
 var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
 var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
@@ -134,26 +175,15 @@ var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
 var pcol_id: u16;
 var prow_id: u16;
 
-// TODO: this is a fixed iteration count, not a real termination check.
-// `<collectives_2d>` only gives us broadcast/scatter/gather/reduce_fadds --
-// no ready-made global AND/OR reduce -- so detecting "y is globally empty"
-// across all diagonal PEs needs either an extra reduce_fadds pass over a
-// single global flag or a small hand-rolled tree. Deferred until this fixed-
-// count loop is validated (see ../test_iterative.py) against N sequential
-// single-shot f_spmv launches from the host.
-const MAX_ITERS: u16 = 5;
-
 // mpi_x/mpi_y.init() only needs to run once per device session, not once per
 // launch -- device state (this var) persists across separate host
 // runner.launch() calls, same as gemm-collectives_2d/pe.csl gates its own
 // init() behind `step == 0`.
 var mpi_initialized: bool = false;
 
-// how many broadcast/compute/reduce rounds the current f_spmv[_iter] call
-// should run; f_spmv sets this to 1 (unchanged one-shot behavior),
-// f_spmv_iter sets it to MAX_ITERS.
-var iter_count: u16 = 1;
-var iter_counter: u16 = 0;
+// true for f_spmv_iter calls (masking/visited/termination-relay logic
+// applies), false for plain f_spmv (always exactly one round, untouched).
+var is_iterative: bool = false;
 
 fn f_enable_tsc() void {
     timestamp.enable_tsc();
@@ -178,9 +208,8 @@ fn start_spmv() void {
     }
     pcol_id = mpi_x.pe_id;
     prow_id = mpi_y.pe_id;
-    iter_counter = iter_count;
 
-    if (iter_count > 1 and pcol_id == prow_id) {
+    if (is_iterative and pcol_id == prow_id) {
         // f_spmv_iter only: seed visited with the initial frontier (the
         // host-provided x_buf) so the BFS source set never gets
         // "rediscovered" as a false new-node on a later round. Overwriting
@@ -191,6 +220,9 @@ fn start_spmv() void {
             visited_buf[i] = x_buf[i];
         }
     }
+    if (is_iterative) {
+        rounds_completed[0] = 0;
+    }
 
     // phase 1: broadcast this column's x-block down from its diagonal PE
     // (row == pcol_id). Every PE in the column calls this identically.
@@ -199,16 +231,18 @@ fn start_spmv() void {
 
 // compute y = A*x, one iteration, boolean semiring, reduce to the diagonal
 fn f_spmv() void {
-    iter_count = 1;
+    is_iterative = false;
     start_spmv();
 }
 
 // same as f_spmv, but after reducing to the diagonal, copies y back into x
-// (broadcasting it again down the diagonal's column) and repeats, for
-// MAX_ITERS rounds total, before returning control to the host -- i.e. the
-// output of each round becomes the next round's input vector.
+// (broadcasting it again down the diagonal's column) and repeats until the
+// termination relay (see reduce_done()) agrees no row found anything new --
+// i.e. the output of each round becomes the next round's input vector, for
+// as many rounds as real BFS convergence takes, before returning control to
+// the host.
 fn f_spmv_iter() void {
-    iter_count = MAX_ITERS;
+    is_iterative = true;
     start_spmv();
 }
 
@@ -260,26 +294,31 @@ task compute() void {
 }
 
 task reduce_done() void {
-    iter_counter -= 1;
+    if (!is_iterative) {
+        // plain f_spmv: always exactly one round -- every PE must unblock
+        // the command stream once its part is done, not just the diagonal
+        // PEs holding the meaningful final result.
+        sys_mod.unblock_cmd_stream();
+        return;
+    }
 
-    if (iter_count > 1 and pcol_id == prow_id) {
-        // f_spmv_iter only (plain f_spmv leaves visited_buf/x_buf alone
-        // entirely -- see the matching guard in start_spmv()). This is a
-        // diagonal PE: its y_buf is this round's raw (unmasked) result for
-        // row prow_id, which is also the source column (pcol_id ==
-        // prow_id) for the next round's broadcast.
+    if (pcol_id == prow_id) {
+        // This is a diagonal PE: its y_buf is this round's raw (unmasked)
+        // result for row prow_id, which is also the source column
+        // (pcol_id == prow_id) for the next round's broadcast.
         //
         // Runs on EVERY round, including the last: if this only ran when
-        // there's a next round to feed (like the old unconditional copy
-        // did), the final round's discoveries would never make it into
+        // there's a next round to feed (like an unconditional copy would),
+        // the final round's discoveries would never make it into
         // visited_buf, and x_buf would end the call holding stale data
         // from the second-to-last round instead of this round's actual
         // new nodes.
         //
-        // TODO: mask against a real visited set now happens -- what's
-        // still missing is a real "y is globally empty" termination check
-        // (see MAX_ITERS above); we still always run MAX_ITERS rounds
-        // regardless of whether new_mask went empty early.
+        // nz_local must be reset every round -- it's local state we write
+        // ourselves (unlike nz_col/nz_total below, which reduce_fadds's own
+        // root-side logic overwrites fresh each call), so a stale 1.0 from
+        // a round that DID find something new would otherwise never clear.
+        nz_local[0] = 0.0;
         var i: u16 = 0;
         while (i < blk) : (i += 1) {
             var newly: f32 = y_buf[i];
@@ -289,18 +328,61 @@ task reduce_done() void {
             }
             if (newly != 0.0) {
                 visited_buf[i] = 1.0;
+                nz_local[0] = 1.0;
             }
             x_buf[i] = newly;
         }
     }
 
-    if (iter_counter > 0) {
-        // phase 1 of the next round: every PE in the column (diagonal or
-        // not) calls this identically, same as start_spmv().
+    rounds_completed[0] += 1;
+    // start the termination-check relay -- see the comment on
+    // nz_local/nz_col/nz_total above and term_col_done()/term_row_done()
+    // /term_row_bcast_done()/term_col_bcast_done() below for the other
+    // 3 phases. The final phase (term_col_bcast_done) is what actually
+    // decides whether to broadcast x_buf again or stop -- there is no
+    // round-count cap anywhere in this call chain, only nz_total.
+    mpi_y.reduce_fadds(MID, @ptrcast([*]f32, &nz_local), @ptrcast([*]f32, &nz_col),
+                        1, term_col_done_task_id);
+}
+
+// TODO: at most ONE PE per column (the diagonal) ever has a nonzero
+// nz_local -- every other PE in the column still pays a real @fadds
+// (receive into RAMP, add zero, re-emit), because reduce_fadds can't know
+// in advance that it's the only sender. A hand-rolled pass-through route
+// (bypass RAMP entirely at non-sender PEs, same trick <layout>'s row/column
+// broadcast pattern uses) could turn this phase into a plain send instead
+// of a full reduce. Deferred: the fixed per-call configure/FSM/teardown
+// overhead every phase pays regardless of hop count is likely the bigger
+// cost here, and hand-rolling routes reintroduces exactly the complexity
+// <collectives_2d> was adopted to avoid (see the module docstring above) --
+// only worth doing if profiling shows this phase is an actual bottleneck.
+task term_col_done() void {
+    // column-reduce done: row MID of every column now holds that column's
+    // diagonal flag in nz_col. Row-reduce along row MID next, combining
+    // all P columns' flags into nz_total at (MID, MID).
+    mpi_x.reduce_fadds(MID, @ptrcast([*]f32, &nz_col), @ptrcast([*]f32, &nz_total),
+                        1, term_row_done_task_id);
+}
+
+task term_row_done() void {
+    // row-reduce done: (MID, MID) now holds nz_total = sum over all P rows'
+    // flags. Flood it back out, row first...
+    mpi_x.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_row_bcast_done_task_id);
+}
+
+task term_row_bcast_done() void {
+    // ...then down every column, so literally every PE ends up with the
+    // same nz_total.
+    mpi_y.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_col_bcast_done_task_id);
+}
+
+task term_col_bcast_done() void {
+    // every PE now agrees on nz_total: != 0.0 means at least one row found
+    // something new this round, so it's worth broadcasting x_buf again.
+    // No round-count cap -- this is the only condition that ends the loop.
+    if (nz_total[0] != 0.0) {
         mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
     } else {
-        // every PE must unblock the command stream once its part is done,
-        // not just the diagonal PEs holding the meaningful final result.
         sys_mod.unblock_cmd_stream();
     }
 }
@@ -308,10 +390,15 @@ task reduce_done() void {
 comptime {
     @bind_local_task(compute, compute_task_id);
     @bind_local_task(reduce_done, reduce_done_task_id);
+    @bind_local_task(term_col_done, term_col_done_task_id);
+    @bind_local_task(term_row_done, term_row_done_task_id);
+    @bind_local_task(term_row_bcast_done, term_row_bcast_done_task_id);
+    @bind_local_task(term_col_bcast_done, term_col_bcast_done_task_id);
 
     @export_symbol(ptr_x_buf, "x_buf");
     @export_symbol(ptr_y_buf, "y_buf");
     @export_symbol(ptr_visited_buf, "visited_buf");
+    @export_symbol(ptr_rounds_completed, "rounds_completed");
     @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
     @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
     @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");
