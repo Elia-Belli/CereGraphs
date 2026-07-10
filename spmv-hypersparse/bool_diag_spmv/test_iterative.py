@@ -22,13 +22,15 @@
   reduce_fadds -- it's a sum, not a selection -- so it's tracked per-PE
   BEFORE the reduce instead (see compute() in bool_pe.csl): every PE knows
   exactly which of its own local columns touched which local row this
-  round, and keeps the lowest-global-index one it's ever seen (across all
-  rounds) in parent_local_buf. Because different PEs in the same row cover
-  different column ranges, the row's true parent is the min across all P
-  PEs in that row -- <collectives_2d> has no min-reduce, so that last step
-  is done here, host-side, in extract_parent_result() below, after
-  memcpy_d2h reads back the full (not diagonal-only) parent_local_buf
-  rectangle.
+  round, and -- gated on that row not being visited yet, which is what
+  makes this a genuine one-hop-closer BFS parent rather than merely a
+  valid-but-arbitrary predecessor, see bool_pe.csl's module docstring --
+  keeps the lowest-global-index one it's seen in parent_local_buf. Because
+  different PEs in the same row cover different column ranges, the row's
+  true parent is the min across all P PEs in that row -- <collectives_2d>
+  has no min-reduce, so that last step is done here, host-side, in
+  extract_parent_result() below, after memcpy_d2h reads back the full (not
+  diagonal-only) parent_local_buf rectangle.
 
   This script checks four things: (1) visited_buf (the cumulative
   discovered set) is bit-identical between running f_spmv_iter once and
@@ -44,10 +46,9 @@
   exactly the same round the host independently computed, not some other
   round; (4) the assembled parent vector matches a host-side reference that
   independently recomputes, for every round, the lowest-index active
-  frontier member with a real edge to each row (mirroring the device's own
-  rule exactly, not bfs_spmv/run_bfs.py's stricter "previous frontier only"
-  definition -- see extract_parent_result()'s docstring for why the looser
-  rule is still valid). Masked x_buf being genuinely all-zero at stop time
+  frontier member with a real edge to each not-yet-visited row (mirroring
+  the device's own rule exactly -- see update_parent_reference()'s
+  docstring). Masked x_buf being genuinely all-zero at stop time
   is checked too, as a sanity invariant rather than a host comparison. (The
   device side has no round cap at all -- runner.launch(..., nonblock=False)
   blocking on f_spmv_iter and returning is itself proof the on-device relay
@@ -102,25 +103,26 @@ def extract_parent_result(n, blk, P, parent_hwl):
   return parent
 
 
-def update_parent_reference(host_parent, A_csr, frontier_bool):
+def update_parent_reference(host_parent, A_csr, frontier_bool, visited):
   """Host-side reference mirroring bool_pe.csl's compute() exactly: for
-  every row v, if any node currently in frontier_bool has a real edge to v
-  (A_csr[v, :] is row v's predecessor columns, per bool_diag_spmv's
-  row=dest/col=source convention -- see generate_boolean_reference in
-  run_bool.py), take the lowest-index one and keep it if it's better than
-  whatever's already recorded.
+  every row v NOT YET VISITED (as of the start of this round -- see below),
+  if any node currently in frontier_bool has a real edge to v (A_csr[v, :]
+  is row v's predecessor columns, per bool_diag_spmv's row=dest/col=source
+  convention -- see generate_boolean_reference in run_bool.py), take the
+  lowest-index one as v's parent.
 
-  This is deliberately NOT bfs_spmv/run_bfs.py's find_parents(), which only
-  considers the frontier immediately preceding a node's first discovery
-  (guaranteeing a true one-hop-closer BFS parent). The device has no way to
-  enforce that -- compute() runs identically whether or not a row was
-  already visited elsewhere (masking/visited_buf only exist at the
-  diagonal), so a node can pick up a lower-index candidate from ANY round it
-  was ever touched in, not just its discovery round. That's still a fully
-  valid parent by bfs_spmv's own verify_bfs() definition (visited + a real
-  edge -- see its docstring), just not necessarily one BFS level closer, so
-  this reference intentionally matches the device's looser rule rather than
-  the stricter host-orchestrated one.
+  The `visited` gate is what makes this a genuine, textbook one-hop-closer
+  BFS parent (matching bfs_spmv/run_bfs.py's find_parents(), which only
+  considers the frontier immediately preceding a node's first discovery):
+  no row can ever receive a hit before its own true discovery round (a hit
+  from ANY frontier member immediately makes that row visited by the end of
+  the same round -- see run_bool.f_spmv's OR-reduce), so gating on
+  `visited` restricts this to exactly a row's discovery round. Earlier
+  versions of this function had no such gate (matching an earlier, buggier
+  version of compute() that could let an unrelated, much-later round's
+  frontier member overwrite an already-visited row's parent whenever its
+  index happened to be lower) -- see visited_buf's role in bool_pe.csl's
+  module docstring for the on-device side of this fix.
   """
   frontier_idx = np.nonzero(frontier_bool)[0]
   if frontier_idx.size == 0:
@@ -128,12 +130,14 @@ def update_parent_reference(host_parent, A_csr, frontier_bool):
   frontier_set = set(frontier_idx.tolist())
   n = len(host_parent)
   for v in range(n):
+    if visited[v]:
+      continue
     start, end = A_csr.indptr[v], A_csr.indptr[v + 1]
     best = -1
     for u in A_csr.indices[start:end]:
       if u in frontier_set and (best == -1 or u < best):
         best = u
-    if best != -1 and (host_parent[v] == -1 or best < host_parent[v]):
+    if best != -1:
       host_parent[v] = best
 
 
@@ -427,7 +431,7 @@ def main():
   per_round_popcount = []
   host_rounds_run = 0
   for _ in range(n):
-    update_parent_reference(host_parent, A_csr, frontier_bool)
+    update_parent_reference(host_parent, A_csr, frontier_bool, visited)
     seed_x(x_hwl)
     runner.launch("f_spmv", nonblock=False)
     host_last_raw = extract_diag_result(n, blk, P, read_buf(sym_y_buf))

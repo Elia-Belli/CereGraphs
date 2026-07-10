@@ -44,13 +44,30 @@
 // limitation on the host-orchestrated version). Instead, parent is tracked
 // per-PE, BEFORE the reduce (see compute()): every PE (i,j) in row i knows
 // exactly which of its own local columns touched which local row this
-// round, which reduce_fadds's aggregation would otherwise throw away. Each
-// PE keeps parent_local_buf, indexed identically to y_local_buf (dense over
-// its row-block), holding the lowest-global-index column it has EVER seen
-// touch each local row (across all rounds, not reset -- "lowest index" is
-// the deterministic tie-break used throughout, both for multiple local
-// columns hitting the same row in one round and for the same row being
-// touched again in a later round). Because different PEs in the SAME row
+// round, which reduce_fadds's aggregation would otherwise throw away.
+//
+// A candidate is only ever recorded for a row that ISN'T YET VISITED (see
+// the visited_buf[dense_idx] == 0.0 check in compute()) -- without that
+// gate, a row that was already visited several rounds ago could still get
+// touched by a later round's frontier (any node with a real structural
+// edge into it, however many hops away that node actually is), silently
+// overwriting a true one-hop-closer parent with an unrelated, invalid one
+// whenever the later node's global index happened to be lower. Since no PE
+// can ever see a hit on a row before that row's actual global discovery
+// round (a hit at any PE immediately makes the row visited by the end of
+// that same round, via the row-reduce all PEs share), gating on
+// visited_buf restricts candidate recording to exactly a row's true
+// discovery round -- gives a genuine, textbook one-hop-closer BFS parent,
+// not merely a valid-but-arbitrary predecessor. This requires visited_buf
+// (otherwise meaningful only at the diagonal PE, see its own comment
+// below) to be distributed to every PE in the row before compute() runs
+// each round -- see visited_bcast_done()/term_col_bcast_done() below.
+//
+// Each PE keeps parent_local_buf, indexed identically to y_local_buf
+// (dense over its row-block), holding the lowest-global-index column it
+// has ever recorded for each local row ("lowest index" is the
+// deterministic tie-break for multiple local columns hitting the same row
+// in the same discovery round). Because different PEs in the SAME row
 // cover different column ranges, a row's true best candidate is the min
 // across all P PEs in that row -- <collectives_2d> has no min-reduce, so
 // this last step is done host-side after memcpy_d2h (see
@@ -75,6 +92,9 @@ const term_col_done_task_id: local_task_id = @get_local_task_id(12);
 const term_row_done_task_id: local_task_id = @get_local_task_id(13);
 const term_row_bcast_done_task_id: local_task_id = @get_local_task_id(18);
 const term_col_bcast_done_task_id: local_task_id = @get_local_task_id(19);
+// distributes visited_buf across each row before compute() runs -- see the
+// module docstring above and visited_bcast_done() below.
+const visited_bcast_done_task_id: local_task_id = @get_local_task_id(20);
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 
@@ -133,10 +153,14 @@ var y_local_buf = @zeros([blk]f32);
 var y_buf = @zeros([blk]f32);
 
 // visited_buf: cumulative "ever discovered" bitmap for f_spmv_iter, indexed
-// identically to x_buf/y_buf (same row/column block, meaningful only at the
-// diagonal PE). Seeded from the initial x_buf in start_spmv() and OR'd with
-// every round's genuinely-new discoveries in reduce_done() -- never used or
-// touched by plain f_spmv (see the is_iterative guards below).
+// identically to x_buf/y_buf (same row/column block). Real writes only ever
+// happen at the diagonal PE: seeded from the initial x_buf in start_spmv(),
+// OR'd with every round's genuinely-new discoveries in reduce_done(). Every
+// other PE in the row gets a fresh copy each round via visited_bcast_done()
+// (same "only the diagonal's copy is real, broadcast overwrites everyone
+// else's" convention x_buf already uses) -- compute() needs this at every
+// PE to gate parent tracking (see the module docstring above). Never used
+// or touched by plain f_spmv (see the is_iterative guards below).
 var visited_buf = @zeros([blk]f32);
 
 // Real termination check (see reduce_done()): <collectives_2d> only gives
@@ -271,8 +295,28 @@ fn start_spmv() void {
         }
     }
 
-    // phase 1: broadcast this column's x-block down from its diagonal PE
-    // (row == pcol_id). Every PE in the column calls this identically.
+    if (is_iterative) {
+        // distribute this row-block's just-seeded visited_buf to every PE
+        // in the row before compute() runs its first round -- see
+        // visited_bcast_done() and the module docstring above. Every PE in
+        // the row calls this identically (only the diagonal's data is
+        // real); phase 1 proper (the x_buf column broadcast) follows once
+        // that completes.
+        mpi_x.broadcast(prow_id, @ptrcast([*]u32, &visited_buf), blk, visited_bcast_done_task_id);
+    } else {
+        // plain f_spmv never touches visited_buf/parent tracking -- go
+        // straight to phase 1.
+        // phase 1: broadcast this column's x-block down from its diagonal
+        // PE (row == pcol_id). Every PE in the column calls this
+        // identically.
+        mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+    }
+}
+
+task visited_bcast_done() void {
+    // every PE in the row now has an up-to-date copy of this row-block's
+    // visited_buf -- safe for compute() to gate parent tracking on. Phase 1
+    // proper: broadcast x_buf down the column, same as always.
     mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
 }
 
@@ -347,7 +391,11 @@ task compute() void {
         if (y_flags[i] != 0) {
             const dense_idx = y_rows_init_buf[i];
             y_local_buf[dense_idx] = 1.0;
-            if (is_iterative and parent_compact[i] < parent_local_buf[dense_idx]) {
+            // visited_buf[dense_idx] == 0.0 restricts this to a row's true
+            // discovery round -- see the module docstring above for why
+            // that's required for a genuine one-hop-closer parent.
+            if (is_iterative and visited_buf[dense_idx] == 0.0
+                and parent_compact[i] < parent_local_buf[dense_idx]) {
                 parent_local_buf[dense_idx] = parent_compact[i];
             }
         }
@@ -451,7 +499,10 @@ task term_col_bcast_done() void {
     // something new this round, so it's worth broadcasting x_buf again.
     // No round-count cap -- this is the only condition that ends the loop.
     if (nz_total[0] != 0.0) {
-        mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+        // distribute this round's just-updated visited_buf across each row
+        // before looping back into compute() -- see visited_bcast_done()
+        // and the module docstring above.
+        mpi_x.broadcast(prow_id, @ptrcast([*]u32, &visited_buf), blk, visited_bcast_done_task_id);
     } else {
         sys_mod.unblock_cmd_stream();
     }
@@ -464,6 +515,7 @@ comptime {
     @bind_local_task(term_row_done, term_row_done_task_id);
     @bind_local_task(term_row_bcast_done, term_row_bcast_done_task_id);
     @bind_local_task(term_col_bcast_done, term_col_bcast_done_task_id);
+    @bind_local_task(visited_bcast_done, visited_bcast_done_task_id);
 
     @export_symbol(ptr_x_buf, "x_buf");
     @export_symbol(ptr_y_buf, "y_buf");

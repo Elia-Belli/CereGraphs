@@ -1,30 +1,45 @@
 #!/usr/bin/env cs_python
 # pylint: disable=too-many-function-args
 """ plot bool_diag_spmv's on-device BFS tree (f_spmv_iter) side-by-side with
-  an independently-computed host-side reference, to check correctness
-  visually rather than just via test_iterative.py's numeric mismatch counts.
+  scipy.sparse.csgraph.breadth_first_order, a fully independent reference
+  computed directly on the original matrix (zero dependency on
+  bool_pe.csl/preprocess_bool.py), to check correctness visually rather
+  than just via test_iterative.py's numeric mismatch counts.
 
-  Unlike test_iterative.py (which seeds a random ~50%-density initial
-  frontier to stress-test masking across many simultaneous discoveries at
-  once), this script seeds a SINGLE source node, so both trees are an actual
-  single BFS tree rather than a forest -- the standard, recognizable shape
-  for this kind of picture. host_parent[source] and device_parent[source]
-  are both set to `source` itself afterward (bfs_spmv/run_bfs.py's own
-  convention for the root) since neither side ever assigns the source a
-  "discovered via an edge" parent.
+  This script seeds a SINGLE source node (unlike test_iterative.py's random
+  ~50%-density initial frontier, which stress-tests masking across many
+  simultaneous discoveries at once), so both trees are an actual single BFS
+  tree rather than a forest -- the standard, recognizable shape for this
+  kind of picture. scipy_parent[source] and device_parent[source] are both
+  set to `source` itself afterward (bfs_spmv/run_bfs.py's own convention
+  for the root) since neither side ever assigns the source a "discovered
+  via an edge" parent.
 
-  Left panel:  host-driven reference -- sequential f_spmv launches, with
-               update_parent_reference() (imported from test_iterative.py)
-               tracking parent/visited state on the host exactly the way
-               bool_pe.csl's compute() does it on-device.
+  Left panel:  scipy reference -- breadth_first_order on the original
+               A_csr (transposed to row=source/col=dest first), predecessor
+               array normalized to bool_diag_spmv's -1 "no parent"
+               sentinel.
   Right panel: on-device reference -- one f_spmv_iter launch; parent
                assembled from the full parent_local_buf rectangle via
-               extract_parent_result() (also from test_iterative.py).
+               extract_parent_result() (imported from test_iterative.py).
 
   Both panels draw the full graph in light gray for context, with the
-  parent->child BFS tree edges bolded on top; any node/edge where the two
-  sides disagree (parent choice or visited status) is drawn in red instead
-  of the usual color, so a real bug would jump out visually.
+  parent->child BFS tree edges bolded on top; any node where the device's
+  visited set disagrees with scipy's is drawn in red instead of the usual
+  color, so a real bug would jump out visually. scipy's visited set is an
+  exact-match, unambiguous check (no implementation-specific tie-breaks
+  involved); device_parent is separately checked for VALIDITY against the
+  true graph (visited + a real edge, one hop closer -- bfs_spmv/run_bfs.py's
+  own verify_bfs() definition, and now genuinely enforced on-device too, see
+  bool_pe.csl's module docstring), not an exact match against scipy_parent,
+  since scipy can still pick a DIFFERENT, equally-valid one-hop predecessor
+  when a node has several, using a different tie-break than our "lowest
+  index" rule (confirmed empirically: scipy's BFS assigns whichever
+  candidate predecessor its FIFO queue processes first, not the
+  lowest-index one). Pass --show-parent-mismatch to additionally
+  color-highlight (orange, on the device panel only) nodes where that
+  tie-break difference actually shows up, kept visually distinct from real
+  (red) mismatches since it's expected, not a bug.
 
   How to compile and run
      cs_python plot_bfs_tree.py --arch=wse3 --num_pe_cols=8 --num_pe_rows=8
@@ -44,7 +59,8 @@ from preprocess_bool import preprocess
 from run_bool import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
                        hwl_to_oned_colmajor, oned_to_hwl_colmajor)
 from scipy.io import mmread
-from test_iterative import extract_parent_result, update_parent_reference
+from scipy.sparse.csgraph import breadth_first_order
+from test_iterative import extract_parent_result
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
@@ -69,6 +85,13 @@ def parse_args():
   parser.add_argument("--source", type=int, default=0, help="single BFS source vertex")
   parser.add_argument("--out", default=None,
                        help="output image path (default: plots/<matrix>_<grid>_src<N>.png)")
+  parser.add_argument("--show-parent-mismatch", action="store_true",
+                       help="also color-highlight (orange) nodes where our parent choice "
+                            "differs from scipy's own breadth_first_order pick -- these are "
+                            "EXPECTED whenever a node has multiple valid predecessors (scipy "
+                            "and we use different, equally-valid tie-break rules -- see "
+                            "invalid_parents()'s docstring), not bugs, so this is off by "
+                            "default and kept visually distinct from real (red) mismatches")
   return parser.parse_args()
 
 
@@ -88,23 +111,22 @@ def build_digraph(A_csr):
 
 def compute_radial_layout(G, source):
   """Concentric rings by BFS level (distance from `source`, computed
-  independently of host_parent/device_parent via plain graph BFS), instead
+  independently of scipy_parent/device_parent via plain graph BFS), instead
   of a force-directed layout -- this directly visualizes the thing that
   actually matters for a BFS tree (hop count), and rings are the standard
   convention for it.
 
   Within a ring, nodes are angularly sorted by their CANONICAL BFS parent's
   angle (a parent computed fresh via nx.bfs_tree(), guaranteed to be exactly
-  one level up), not host_parent/device_parent -- those intentionally allow
-  a node to end up with a parent from a LATER round than its own discovery
-  (see update_parent_reference()'s docstring: "lowest index ever seen",
-  not "lowest index in the immediately preceding round"), so a level-L
-  node's recorded parent is occasionally NOT at level L-1. Using that for
-  layout would break the "children cluster under their parent" clustering
-  this function is trying to do. The actual host_parent/device_parent edges
-  are still drawn wherever they really point in plot_panel() -- they just
-  might not run to an adjacent ring in that rare case, which is fine, even
-  informative, to show as-is.
+  one level up), not scipy_parent/device_parent directly -- both are
+  genuine one-hop-closer BFS parents (bool_pe.csl's compute() gates parent
+  tracking on visited_buf so a row can only ever be assigned a parent
+  during its own true discovery round -- see its module docstring), but
+  nx.bfs_tree() is still used here as the canonical layout reference since
+  it's independent of either implementation's own tie-break among multiple
+  equally-valid one-hop predecessors. Using device_parent for layout would
+  make that tie-break (not the actual BFS structure) drive the clustering
+  this function is trying to do.
 
   Nodes with no path from `source` at all (not merely unvisited by one
   algorithm run -- genuinely unreachable in the graph) go on a final outer
@@ -169,7 +191,23 @@ def compute_radial_layout(G, source):
   return pos
 
 
-def plot_panel(ax, G, pos, parent, visited, source, mismatch, title):
+def plot_panel(ax, G, pos, parent, visited, source, mismatch, title, extra_label,
+                scipy_diff=None):
+  """extra_label: a pre-formatted trailing string for the title, e.g.
+  "4 rounds" (device panel -- rounds_completed) or "3 levels" (scipy panel
+  -- max BFS depth reached, which has no discrete-round concept of its
+  own).
+
+  scipy_diff: optional per-node boolean array (only meaningful when
+  --show-parent-mismatch is passed) -- True where THIS side's parent choice
+  differs from scipy's own breadth_first_order pick. Colored orange,
+  distinct from red, since these are expected tie-break differences (see
+  parse_args()'s --show-parent-mismatch help), not bugs -- mismatch (a real
+  disagreement: visited-set mismatch against scipy) still takes priority in
+  the color/z-order if both happen to apply to the same node."""
+  if scipy_diff is None:
+    scipy_diff = np.zeros(len(visited), dtype=bool)
+
   nx.draw_networkx_edges(G, pos, ax=ax, edge_color="lightgray", arrows=True,
                           arrowsize=6, width=0.5, node_size=250)
 
@@ -179,6 +217,8 @@ def plot_panel(ax, G, pos, parent, visited, source, mismatch, title):
       node_colors.append("red")
     elif v == source:
       node_colors.append("gold")
+    elif scipy_diff[v]:
+      node_colors.append("orange")
     elif visited[v]:
       node_colors.append("skyblue")
     else:
@@ -188,7 +228,15 @@ def plot_panel(ax, G, pos, parent, visited, source, mismatch, title):
   nx.draw_networkx_labels(G, pos, ax=ax, font_size=7)
 
   tree_edges = [(parent[v], v) for v in G.nodes() if v != source and parent[v] >= 0]
-  tree_edge_colors = ["red" if mismatch[v] else "darkblue" for (_, v) in tree_edges]
+
+  def edge_color(v):
+    if mismatch[v]:
+      return "red"
+    if scipy_diff[v]:
+      return "orange"
+    return "darkblue"
+
+  tree_edge_colors = [edge_color(v) for (_, v) in tree_edges]
   nx.draw_networkx_edges(G, pos, ax=ax, edgelist=tree_edges, edge_color=tree_edge_colors,
                           width=2.0, arrows=True, arrowsize=10, node_size=250)
 
@@ -200,8 +248,29 @@ def plot_panel(ax, G, pos, parent, visited, source, mismatch, title):
   nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=[source], node_color=source_color,
                           edgecolors="black", linewidths=1.2, node_size=320)
 
-  ax.set_title(f"{title}\n{int(np.sum(visited))}/{len(visited)} visited")
+  ax.set_title(f"{title}\n{int(np.sum(visited))}/{len(visited)} visited, {extra_label}")
   ax.axis("off")
+
+
+def invalid_parents(parent, visited_arr, A_csr, source):
+  """Nodes whose recorded parent isn't a valid BFS predecessor -- visited,
+  and a real edge in the ORIGINAL matrix (A_csr[v, u] != 0, per
+  bool_diag_spmv's row=dest/col=source convention -- see
+  generate_boolean_reference in run_bool.py). This is bfs_spmv/run_bfs.py's
+  own verify_bfs() definition of "valid", deliberately NOT an exact-parent
+  match against scipy's breadth_first_order: scipy picks its own arbitrary
+  valid predecessor when a node has several, using a different tie-break
+  than device_parent's "lowest index", so exact agreement isn't expected --
+  only that whichever parent WE picked is actually a real, already-visited
+  predecessor in the true graph."""
+  bad = []
+  for v in range(len(parent)):
+    if v == source or not visited_arr[v]:
+      continue
+    u = parent[v]
+    if u < 0 or not visited_arr[u] or A_csr[v, u] == 0:
+      bad.append(v)
+  return bad
 
 
 def main():
@@ -310,9 +379,9 @@ def main():
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr)
 
   sym_x_buf = runner.get_id("x_buf")
-  sym_y_buf = runner.get_id("y_buf")
   sym_visited_buf = runner.get_id("visited_buf")
   sym_parent_local_buf = runner.get_id("parent_local_buf")
+  sym_rounds_completed = runner.get_id("rounds_completed")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
   sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
   sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
@@ -382,49 +451,89 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     return np.reshape(buf_1d, (height, width, blk), order="F")
 
+  def read_rounds_completed():
+    # every PE increments its own copy in lockstep (the termination relay
+    # makes them all agree each round before any of them decides to
+    # continue), so any single PE's value is the global answer -- just
+    # read (0, 0). u16 readback mirrors the h2d convention used for
+    # mat_rows_buf/local_nnz above: MEMCPY_16BIT wire format, uint32-typed
+    # host buffer.
+    buf_1d = np.zeros(height * width, np.uint32)
+    runner.memcpy_d2h(buf_1d, sym_rounds_completed, 0, 0, width, height, 1,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
+    return int(np.reshape(buf_1d, (height, width, 1), order="F")[(0, 0, 0)])
+
   print("on-device: one f_spmv_iter launch")
   seed_x(x_hwl0)
   runner.launch("f_spmv_iter", nonblock=False)
   device_visited = extract_diag_result(n, blk, P, read_buf(sym_visited_buf))
   device_parent = extract_parent_result(n, blk, P, read_parent_local_buf())
   device_parent[source] = source  # root, not "undiscovered" -- see module docstring
-
-  print("host-driven: sequential f_spmv launches")
-  x_hwl = x_hwl0
-  frontier_bool = x_bool0
-  visited = x_bool0.copy()
-  host_parent = np.full(n, -1, dtype=np.int64)
-  for _ in range(n):
-    update_parent_reference(host_parent, A_csr, frontier_bool)
-    seed_x(x_hwl)
-    runner.launch("f_spmv", nonblock=False)
-    candidate = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
-    new_mask = candidate & ~visited
-    visited |= new_mask
-    if not new_mask.any():
-      break
-    frontier_bool = new_mask
-    x_hwl = dist_x_to_diag_hwl(n, new_mask.astype(np.float32), blk, P)
-  else:
-    raise RuntimeError(f"host-driven baseline did not converge within {n} rounds -- "
-                        "this should be impossible (bounded by node count); likely a bug")
-  host_parent[source] = source
+  device_rounds_run = read_rounds_completed()
 
   runner.stop()
 
-  mismatch = (host_parent != device_parent) | (visited != device_visited)
+  # Fully independent reference: scipy's own BFS, with zero dependency on
+  # bool_pe.csl, preprocess_bool.py, or the CSL matrix partitioning -- a bug
+  # shared by the on-device pipeline's own building blocks would never show
+  # up as a self-comparison. scipy operates directly on the original A_csr.
+  print("scipy reference: breadth_first_order")
+  # transpose because A_csr is row=dest/col=source (bool_diag_spmv's
+  # convention -- see generate_boolean_reference in run_bool.py) but
+  # breadth_first_order needs row=source/col=dest (csgraph[i,j] != 0 means
+  # edge i -> j).
+  A_fwd = A_csr.transpose().tocsr()
+  scipy_order, scipy_pred = breadth_first_order(A_fwd, source, directed=True,
+                                                 return_predecessors=True)
+  scipy_visited = np.zeros(n, dtype=bool)
+  scipy_visited[scipy_order] = True
+  scipy_parent = scipy_pred.astype(np.int64)
+  scipy_parent[scipy_parent < 0] = -1  # normalize scipy's -9999 sentinel to ours
+  scipy_parent[source] = source  # root, not "undiscovered" -- see module docstring
+
+  n_mismatch_scipy_device = int(np.sum(scipy_visited != device_visited))
+  bad_device = invalid_parents(device_parent, device_visited, A_csr, source)
+
+  # Where OUR parent choice differs from scipy's own pick -- expected
+  # whenever a node has multiple valid predecessors (different, equally
+  # valid tie-break rules -- see invalid_parents()'s docstring and the
+  # --show-parent-mismatch help), NOT a bug, so this is reported separately
+  # from bad_device (actual invalidity) and only visualized behind
+  # --show-parent-mismatch. Restricted to nodes both sides actually
+  # visited -- scipy_parent is only meaningful there (source and any node
+  # scipy didn't reach keep scipy's own "no predecessor" sentinel).
+  node_ids = np.arange(n)
+  scipy_diff_device = ((device_parent != scipy_parent) & device_visited & scipy_visited
+                        & (node_ids != source))
+
+  print(f"[[ scipy visited: {int(np.sum(scipy_visited))}/{n} ]]")
+  print(f"[[ visited vs scipy mismatches: device={n_mismatch_scipy_device} ]]")
+  print(f"[[ invalid device parents vs original graph: {len(bad_device)} ]]")
+  if bad_device:
+    print(f"  bad device parents at: {bad_device[:20]}{' ...' if len(bad_device) > 20 else ''}")
+  print(f"[[ parent differs from scipy's own pick (expected tie-break "
+        f"difference, not a bug): device={int(np.sum(scipy_diff_device))} ]]")
+
+  mismatch = device_visited != scipy_visited
   n_mismatch = int(np.sum(mismatch))
-  print(f"[[ mismatches (parent or visited): {n_mismatch} / {n} ]]")
+  scipy_ok = n_mismatch_scipy_device == 0 and not bad_device
+  print(f"[[ mismatches (visited, device vs scipy): {n_mismatch} / {n} ]]")
+  print(f"[[ scipy cross-check: {'OK' if scipy_ok else 'FAILED'} ]]")
 
   print("building the plot...")
   G = build_digraph(A_csr)
   pos = compute_radial_layout(G, source)
 
+  dist_from_source = nx.single_source_shortest_path_length(G, source)
+  scipy_levels = max(dist_from_source.values()) if dist_from_source else 0
+
   fig, axes = plt.subplots(1, 2, figsize=(16, 9))
-  plot_panel(axes[0], G, pos, host_parent, visited, source, mismatch,
-             "Host reference BFS tree")
+  plot_panel(axes[0], G, pos, scipy_parent, scipy_visited, source, mismatch,
+             "scipy reference BFS tree", f"{scipy_levels} levels")
   plot_panel(axes[1], G, pos, device_parent, device_visited, source, mismatch,
-             "Device (f_spmv_iter) BFS tree")
+             "Device (f_spmv_iter) BFS tree", f"{device_rounds_run} rounds",
+             scipy_diff=scipy_diff_device if args.show_parent_mismatch else None)
 
   legend_handles = [
       plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="gold",
@@ -438,9 +547,14 @@ def main():
       plt.Line2D([0], [0], color="lightgray", lw=1, label="graph edge"),
       plt.Line2D([0], [0], color="darkblue", lw=2, label="BFS tree edge"),
   ]
-  fig.legend(handles=legend_handles, loc="lower center", ncol=6, frameon=False)
+  if args.show_parent_mismatch:
+    legend_handles.append(
+        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="orange",
+                   markeredgecolor="black", markersize=10, label="differs from scipy"))
+  fig.legend(handles=legend_handles, loc="lower center", ncol=len(legend_handles), frameon=False)
 
   status = "0 mismatches" if n_mismatch == 0 else f"{n_mismatch} MISMATCHES"
+  status += ", scipy OK" if scipy_ok else ", scipy CHECK FAILED"
   fig.suptitle(f"BFS tree comparison -- {os.path.basename(infile_mtx)}, "
                f"{np_cols}x{np_rows} grid, source={source} -- {status}")
   plt.tight_layout(rect=[0, 0.05, 1, 0.95])

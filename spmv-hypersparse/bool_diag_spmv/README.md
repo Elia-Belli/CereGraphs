@@ -36,12 +36,14 @@ what's genuinely done versus what's still a stub.
   stops. Logs each run to `iterative_results.jsonl`.
 - `plot_bfs_tree.py` — visual correctness check: seeds a *single* BFS source
   (unlike `test_iterative.py`'s random ~50%-density frontier, chosen here so
-  both trees are one recognizable tree, not a forest), runs the same
-  host-driven-vs-`f_spmv_iter` comparison, and renders the two resulting BFS
-  trees side by side with `networkx`/`matplotlib` — full graph faint gray for
-  context, tree edges bolded, any parent/visited mismatch between the two
-  sides drawn in red. Reuses `extract_parent_result()`/
-  `update_parent_reference()` from `test_iterative.py` directly.
+  both trees are one recognizable tree, not a forest), runs one
+  `f_spmv_iter` launch and compares it against `scipy.sparse.csgraph.
+  breadth_first_order` — a fully independent reference with zero dependency
+  on `bool_pe.csl`/`preprocess_bool.py` — and renders the two resulting BFS
+  trees side by side with `networkx`/`matplotlib` — full graph faint gray
+  for context, tree edges bolded, any visited-set mismatch between the two
+  sides drawn in red. Reuses `extract_parent_result()` from
+  `test_iterative.py` directly.
 - `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test on
   `../data/rmat4.4x4.lb.mtx` at a 4x4 grid, for WSE-2 and WSE-3 respectively.
   Unlike `original_spmv`/`bfs_spmv`, both scripts compile the *same* `src/` —
@@ -129,14 +131,30 @@ the reduce runs, at the only point column identity is still visible:
   different candidate parents discovered by different PEs in the same row —
   each PE only sees its own slice, so this can't be resolved locally by any
   one PE.
+- A candidate is only ever recorded for a row that **isn't visited yet**
+  (`visited_buf[dense_idx] == 0.0`, checked in `compute()`). Since no PE can
+  ever see a hit on a row before that row's true global discovery round (a
+  hit at any PE immediately makes the row visited, grid-wide, by the end of
+  that same round, via the row-reduce all PEs share), this restricts
+  candidate recording to *exactly* a row's discovery round — giving a
+  genuine, textbook one-hop-closer BFS parent, not merely a valid-but-
+  arbitrary predecessor (see "One correctness note" below for the bug this
+  fixes). This needs `visited_buf` — otherwise meaningful only at the
+  diagonal PE — distributed to every PE in the row before `compute()` runs
+  each round: a new broadcast phase (`visited_bcast_done()`, `mpi_x`,
+  rooted at each row's own diagonal, same pattern `start_spmv()`'s `x_buf`
+  column broadcast already uses) inserted right after the termination
+  relay decides to continue (`term_col_bcast_done()`) and right after
+  `visited_buf` is first seeded (`start_spmv()`), before `compute()`'s
+  first round.
 - Each PE keeps `parent_local_buf`, indexed identically to `y_local_buf`
   (dense over its row-block), holding the lowest-global-index local column
-  it has *ever* seen touch each local row — persisted across rounds, not
-  reset (unlike `y_flags`/`parent_compact`, which are per-round scratch).
-  "Lowest index wins" is applied uniformly: within one round (multiple local
-  columns hitting the same row), and across rounds (a later round touching a
-  row again can still lower its parent if a smaller-index candidate shows
-  up).
+  it has recorded for each local row — persisted across rounds, not reset
+  (unlike `y_flags`/`parent_compact`, which are per-round scratch). "Lowest
+  index wins" is applied within one round only now (multiple local columns
+  hitting the same row in that row's own discovery round) — the visited
+  gate above means there's nothing left to compare across rounds; once a
+  row is visited, no further candidate is ever recorded for it.
 - Because different PEs in the same row hold different candidates for the
   same destination, the true parent is the **min across all `P` PEs in that
   row** — a row-reduce, structurally just like the termination check's, but
@@ -151,18 +169,24 @@ the reduce runs, at the only point column identity is still visible:
   min-reduce primitive to build it from without hand-rolling one — noted in
   `bool_pe.csl`'s module docstring next to the termination-relay TODO above.
 
-One correctness note, not a bug: this is a **looser** validity notion than
-`bfs_spmv/run_bfs.py`'s `find_parents()`, which only considers the frontier
-*immediately preceding* a node's first discovery (guaranteeing the parent is
-exactly one BFS level closer). The device has no way to enforce that —
-`compute()` runs identically whether or not a row was already visited
-elsewhere (masking/`visited_buf` only exist at the diagonal), so a node can
-pick up a candidate from *any* round it was ever touched in, not just its
-discovery round. That's still a fully valid parent by `bfs_spmv`'s own
-`verify_bfs()` definition (visited + a real edge, no level check) — see
-`test_iterative.py`'s `update_parent_reference()` docstring, which
-deliberately mirrors this looser rule rather than `find_parents()`'s
-stricter one.
+One correctness note, since this was a real bug at one point: without the
+visited gate above, `compute()` has no way to tell whether a row it's
+touching this round was already visited many rounds ago — a much later
+round's frontier member with a real structural edge into an
+already-discovered row would silently overwrite its parent whenever that
+later member's global index happened to be lower, producing an invalid
+(same-level, or even more-hops-away) "parent" that plainly wasn't one BFS
+level closer, however plausible it looked as *a* valid predecessor. The
+device-side fix (`visited_buf` gate above) plus the matching host-side fix
+in `test_iterative.py`'s `update_parent_reference()` (gated on the host's
+own `visited` array the same way) now give a parent that matches
+`bfs_spmv/run_bfs.py`'s stricter `find_parents()` definition (exactly one
+BFS level closer), not merely `verify_bfs()`'s looser one (visited + a real
+edge, no level check) — confirmed by `plot_bfs_tree.py`, whose
+`--show-parent-mismatch` tie-break-difference count against scipy's own
+`breadth_first_order` dropped to the residual cases where multiple
+one-hop-closer predecessors are equally valid and scipy's FIFO-order
+tie-break picks a different one than our lowest-index rule.
 
 ## Trade-offs versus `original_spmv` (see `../original_spmv/README.md` first)
 

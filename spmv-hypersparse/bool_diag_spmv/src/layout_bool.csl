@@ -7,7 +7,7 @@
 // color/task-id map (mirrors the convention in gemv-collectives_2d/layout.csl)
 //   0 c2d_x_color_0    10 compute_task_id           18 term_row_bcast_done_task_id
 //   1 c2d_x_color_1    11 reduce_done_task_id        19 term_col_bcast_done_task_id
-//   4 c2d_y_color_0    12 term_col_done_task_id
+//   4 c2d_y_color_0    12 term_col_done_task_id      20 visited_bcast_done_task_id
 //   5 c2d_y_color_1    13 term_row_done_task_id
 //                      14 c2d_x_entrypt_0
 //                      15 c2d_x_entrypt_1
