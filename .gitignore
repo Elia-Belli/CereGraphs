@@ -2,11 +2,17 @@ out/
 out_wse3/
 out_wse3_iterative/
 out_plot/
+out_wse3_bfs/
+out_wse3_iter/
+
 simfab_traces/
 wio_flows*
 __pycache__/
+
 
 sim_stats.json
 sim.log
 simconfig.json
 latest/
+
+.claude/

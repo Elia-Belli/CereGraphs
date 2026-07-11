@@ -17,6 +17,6 @@ cslc bool_diag_spmv/src/layout_bool.csl --arch wse3 --fabric-dims=11,6 --fabric-
 --params=max_local_nnz:8,max_local_nnz_cols:4,max_local_nnz_rows:4 -o=bool_diag_spmv/out_wse3 \
 --memcpy --channels=1 --width-west-buf=0 --width-east-buf=0
 
-cs_python bool_diag_spmv/run_bool.py --arch=wse3 --num_pe_cols=4 --num_pe_rows=4 --latestlink bool_diag_spmv/out_wse3 --channels=1 \
+cs_python bool_diag_spmv/run_single_spmv.py --arch=wse3 --num_pe_cols=4 --num_pe_rows=4 --latestlink bool_diag_spmv/out_wse3 --channels=1 \
 --width-west-buf=0 --width-east-buf=0 --run-only \
 --infile_mtx=data/rmat4.4x4.lb.mtx

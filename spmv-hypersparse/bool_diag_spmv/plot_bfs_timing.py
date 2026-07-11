@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-""" plot a single bfs_timing.csv row (one bench_timing.py run) as a stacked
+""" plot a single bfs_timing.csv row (one run_bfs.py run) as a stacked
   bar chart: one bar per BFS round (left to right), each bar built from the
   9 leaf phases stacked bottom-to-top in chronological order, bracketed by
-  two standalone "h2d" bars (h2d_matrix, h2d_seed -- see bench_timing.py's
-  module docstring for the Graph500-motivated split between the one-time
-  matrix-structure upload and the per-search source-seed upload) before
-  round 0, and a standalone "d2h" bar (visited_buf + parent_local_buf
-  readback -- the actual BFS output, not bench_timing.py's own
+  two standalone "h2d" bars (h2d_matrix, h2d_seed -- see bfs_timing.py's
+  H2D_PARTS / GRAPH500_BENCHMARK.md for the Graph500-motivated split between
+  the one-time matrix-structure upload and the per-search source-seed
+  upload) before round 0, and a standalone "d2h" bar (visited_buf +
+  parent_local_buf readback -- the actual BFS output, not run_bfs.py's own
   rounds_completed/ts_buf instrumentation reads -- after the last round) --
   the one-shot host<->device transfers that aren't part of any round.
 
@@ -16,7 +16,7 @@
   short tick mark partway up each segment shows that phase's MIN cycles
   across PEs (the fastest PE), so the segment communicates both "how long
   this phase actually took" and "how much PE-to-PE spread there was" without
-  needing new data beyond what bench_timing.py already logs. h2d_matrix/
+  needing new data beyond what run_bfs.py already logs. h2d_matrix/
   h2d_seed/d2h get the same max-height + min-tick treatment, just as a
   single unstacked segment each (there's no sub-phase breakdown for a
   single memcpy bracket).
@@ -24,6 +24,11 @@
   relay_total is intentionally never drawn as its own segment -- it's the
   sum of the 4 relay_* sub-phases already in the stack, so plotting it too
   would double-count that time.
+
+  This module is importable (plot_timing_row(row, out_path)) -- run_bfs.py
+  calls it directly after appending a row, so one run_bfs.py invocation
+  produces the plot without a separate manual step. It's also runnable
+  standalone, to re-plot an existing CSV row without re-running the device:
 
   How to run
      python3 plot_bfs_timing.py --csv bfs_timing.csv --row -1
@@ -37,18 +42,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
-# chronological order == stack order, bottom to top.
-LEAF_PHASES = [
-    "visited_bcast",
-    "vertical_bcast",
-    "local_compute",
-    "reduce",
-    "local_term_cond",
-    "relay_col_reduce",
-    "relay_row_reduce",
-    "relay_row_bcast",
-    "relay_col_bcast",
-]
+from bfs_timing import H2D_PARTS, LEAF_PHASES
 
 # dataviz skill's validated categorical palette (references/palette.md) --
 # light-mode hexes. One solo hue per non-relay phase; the relay's 4
@@ -69,7 +63,7 @@ RELAY_PHASES = ["relay_col_reduce", "relay_row_reduce", "relay_row_bcast", "rela
 # (magenta, orange), not a phase color. h2d_matrix/h2d_seed share the
 # magenta hue (2 shades, same "one hue family = related sub-parts" idea as
 # the relay group) since they're both "h2d", just split per Graph500's
-# construction-vs-per-search distinction (see bench_timing.py).
+# construction-vs-per-search distinction (see GRAPH500_BENCHMARK.md).
 H2D_BASE_HEX = "#e87ba4"  # magenta
 D2H_COLOR = "#eb6834"  # orange
 
@@ -107,7 +101,6 @@ def hue_shades(base_hex, n):
 PHASE_COLORS = dict(SOLO_COLORS)
 PHASE_COLORS.update(zip(RELAY_PHASES, hue_shades(RELAY_BASE_HEX, len(RELAY_PHASES))))
 
-H2D_PARTS = ["h2d_matrix", "h2d_seed"]
 H2D_COLORS = dict(zip(H2D_PARTS, hue_shades(H2D_BASE_HEX, len(H2D_PARTS))))
 
 TEXT_PRIMARY = "#0b0b0b"
@@ -117,56 +110,22 @@ BASELINE = "#c3c2b7"
 SURFACE = "#fcfcfb"
 
 
-def parse_args():
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--csv", default=None, help="bfs_timing.csv path (default: next to this "
-                                                    "script)")
-  parser.add_argument("--row", type=int, default=-1,
-                       help="which CSV row to plot (0-indexed, default: -1 = last/most recent). "
-                            "Ignored if --infile_mtx/--pe_grid select exactly one row.")
-  parser.add_argument("--infile_mtx", default=None,
-                       help="filter to rows whose infile_mtx matches this basename")
-  parser.add_argument("--pe_grid", default=None, help="filter to rows with this pe_grid, e.g. 8x8")
-  parser.add_argument("--channels", type=int, default=None,
-                       help="filter to rows with this --channels value (bench_timing.py's I/O "
-                            "channel count)")
-  parser.add_argument("--out", default=None, help="output PNG path (default: plots/timing_"
-                                                    "<matrix>_<grid>_src<N>.png)")
-  return parser.parse_args()
-
-
 def parse_cycle_list(s):
   return np.array([int(v) for v in s.split(";")], dtype=np.int64)
 
 
-def select_row(rows, args):
-  filtered = rows
-  if args.infile_mtx is not None:
-    filtered = [r for r in filtered if r["infile_mtx"] == args.infile_mtx]
-  if args.pe_grid is not None:
-    filtered = [r for r in filtered if r["pe_grid"] == args.pe_grid]
-  if args.channels is not None:
-    filtered = [r for r in filtered if int(r["channels"]) == args.channels]
-  if args.infile_mtx is not None or args.pe_grid is not None or args.channels is not None:
-    assert filtered, "no CSV rows match the given --infile_mtx/--pe_grid/--channels filters"
-    if len(filtered) > 1:
-      print(f"[[ {len(filtered)} rows match the filters -- using the most recent; "
-            "narrow further or use --row if you meant a specific one ]]")
-    return filtered[-1]
-  assert rows, "CSV has no rows to plot"
-  return rows[args.row]
+def default_out_path(script_dir, matrix, pe_grid, source, channels):
+  matrix_stem = os.path.splitext(matrix)[0]
+  plots_dir = os.path.join(script_dir, "plots", "timing")
+  return os.path.join(plots_dir, f"timing_{matrix_stem}_{pe_grid}_src{source}_ch{channels}.png")
 
 
-def main():
-  args = parse_args()
-
-  csv_path = args.csv
-  if csv_path is None:
-    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bfs_timing.csv")
-  with open(csv_path, newline="", encoding="utf-8") as f:
-    rows = list(csv.DictReader(f))
-
-  row = select_row(rows, args)
+def plot_timing_row(row, out_path):
+  """row: a dict with the same keys bfs_timing.csv's header has (either
+  read back via csv.DictReader, or the in-memory dict run_bfs.py just
+  built before writing it) -- values may be str (from CSV) or native
+  types (from run_bfs.py's own dict); everything is cast explicitly below
+  so both sources work unmodified."""
   rounds_completed = int(row["rounds_completed"])
   matrix = row["infile_mtx"]
   pe_grid = row["pe_grid"]
@@ -312,16 +271,62 @@ def main():
              bbox_to_anchor=(0.5, -0.02))
   plt.tight_layout(rect=[0, 0.16, 1, 0.94])
 
-  if args.out:
-    out_path = args.out
-  else:
-    matrix_stem = os.path.splitext(matrix)[0]
-    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots", "timing")
-    out_path = os.path.join(
-        plots_dir, f"timing_{matrix_stem}_{pe_grid}_src{source}_ch{channels}.png")
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=200, bbox_inches="tight")
-  print(f"saved plot to {out_path}")
+  plt.close(fig)
+  print(f"saved timing plot to {out_path}")
+
+
+def parse_args():
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--csv", default=None, help="bfs_timing.csv path (default: next to this "
+                                                    "script)")
+  parser.add_argument("--row", type=int, default=-1,
+                       help="which CSV row to plot (0-indexed, default: -1 = last/most recent). "
+                            "Ignored if --infile_mtx/--pe_grid select exactly one row.")
+  parser.add_argument("--infile_mtx", default=None,
+                       help="filter to rows whose infile_mtx matches this basename")
+  parser.add_argument("--pe_grid", default=None, help="filter to rows with this pe_grid, e.g. 8x8")
+  parser.add_argument("--channels", type=int, default=None,
+                       help="filter to rows with this --channels value (bench_timing.py's I/O "
+                            "channel count)")
+  parser.add_argument("--out", default=None, help="output PNG path (default: plots/timing_"
+                                                    "<matrix>_<grid>_src<N>.png)")
+  return parser.parse_args()
+
+
+def select_row(rows, args):
+  filtered = rows
+  if args.infile_mtx is not None:
+    filtered = [r for r in filtered if r["infile_mtx"] == args.infile_mtx]
+  if args.pe_grid is not None:
+    filtered = [r for r in filtered if r["pe_grid"] == args.pe_grid]
+  if args.channels is not None:
+    filtered = [r for r in filtered if int(r["channels"]) == args.channels]
+  if args.infile_mtx is not None or args.pe_grid is not None or args.channels is not None:
+    assert filtered, "no CSV rows match the given --infile_mtx/--pe_grid/--channels filters"
+    if len(filtered) > 1:
+      print(f"[[ {len(filtered)} rows match the filters -- using the most recent; "
+            "narrow further or use --row if you meant a specific one ]]")
+    return filtered[-1]
+  assert rows, "CSV has no rows to plot"
+  return rows[args.row]
+
+
+def main():
+  args = parse_args()
+
+  csv_path = args.csv
+  if csv_path is None:
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bfs_timing.csv")
+  with open(csv_path, newline="", encoding="utf-8") as f:
+    rows = list(csv.DictReader(f))
+
+  row = select_row(rows, args)
+  out_path = args.out or default_out_path(
+      os.path.dirname(os.path.abspath(__file__)), row["infile_mtx"], row["pe_grid"],
+      row["source"], row["channels"])
+  plot_timing_row(row, out_path)
 
 
 if __name__ == "__main__":

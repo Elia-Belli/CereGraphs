@@ -58,7 +58,7 @@
   kernel, so this only needs one compile + one SdkRuntime session.
 
   How to compile and run
-     python test_iterative.py --arch=wse3 --num_pe_cols=4 --num_pe_rows=4
+     python run_host_driven_bfs.py --arch=wse3 --num_pe_cols=4 --num_pe_rows=4
         --channels=1 --driver=<path to cslc> --infile_mtx=<path to mtx file>
 """
 
@@ -70,9 +70,9 @@ from datetime import datetime, timezone
 
 import numpy as np
 from cmd_parser import parse_args
+from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
+                        extract_parent_result, hwl_to_oned_colmajor, oned_to_hwl_colmajor)
 from preprocess_bool import preprocess
-from run_bool import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
-                       hwl_to_oned_colmajor, oned_to_hwl_colmajor)
 from scipy.io import mmread
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
@@ -85,22 +85,7 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iterative_r
 def log_run(record):
   with open(LOG_FILE, "a", encoding="utf-8") as f:
     f.write(json.dumps(record) + "\n")
-  print(f"[test_iterative] appended run record to {LOG_FILE}")
-
-
-def extract_parent_result(n, blk, P, parent_hwl):
-  """Assemble the length-n parent vector from the full (not diagonal-only)
-  parent_local_buf rectangle. parent_hwl has shape (height=P, width=P, blk):
-  for row-block p, every column-PE parent_hwl[p, :, :] independently
-  computed a candidate parent for that row-block's blk local positions (see
-  bool_pe.csl's module docstring) -- take the min across the P column-PEs
-  (the row/column-min-reduce <collectives_2d> can't do, per the TODO there),
-  same list-then-concatenate-then-truncate shape run_bool.extract_diag_result
-  uses for the diagonal case."""
-  parts = [parent_hwl[p, :, :].min(axis=0) for p in range(P)]
-  parent = np.concatenate(parts).astype(np.int64)[0:n]
-  parent[parent >= n] = -1  # normalize the device's PARENT_NONE (65535) sentinel
-  return parent
+  print(f"[run_host_driven_bfs] appended run record to {LOG_FILE}")
 
 
 def update_parent_reference(host_parent, A_csr, frontier_bool, visited):
@@ -108,15 +93,15 @@ def update_parent_reference(host_parent, A_csr, frontier_bool, visited):
   every row v NOT YET VISITED (as of the start of this round -- see below),
   if any node currently in frontier_bool has a real edge to v (A_csr[v, :]
   is row v's predecessor columns, per bool_diag_spmv's row=dest/col=source
-  convention -- see generate_boolean_reference in run_bool.py), take the
-  lowest-index one as v's parent.
+  convention -- see generate_boolean_reference in run_single_spmv.py), take
+  the lowest-index one as v's parent.
 
   The `visited` gate is what makes this a genuine, textbook one-hop-closer
   BFS parent (matching bfs_spmv/run_bfs.py's find_parents(), which only
   considers the frontier immediately preceding a node's first discovery):
   no row can ever receive a hit before its own true discovery round (a hit
   from ANY frontier member immediately makes that row visited by the end of
-  the same round -- see run_bool.f_spmv's OR-reduce), so gating on
+  the same round -- see bool_pe.csl's f_spmv OR-reduce), so gating on
   `visited` restricts this to exactly a row's discovery round. Earlier
   versions of this function had no such gate (matching an earlier, buggier
   version of compute() that could let an unrelated, much-later round's

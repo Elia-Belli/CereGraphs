@@ -15,87 +15,26 @@
   The host reads back the full PE rectangle and keeps only the diagonal entries.
 
   How to compile and run
-     python run_bool.py --arch=wse2 --num_pe_cols=4 --num_pe_rows=4 --channels=1
+     python run_single_spmv.py --arch=wse2 --num_pe_cols=4 --num_pe_rows=4 --channels=1
         --driver=<path to cslc> --compile-only --infile_mtx=<path to mtx file>
-     python run_bool.py --arch=wse2 --num_pe_cols=4 --num_pe_rows=4 --channels=1
+     python run_single_spmv.py --arch=wse2 --num_pe_cols=4 --num_pe_rows=4 --channels=1
         --run-only --infile_mtx=<path to mtx file>
 """
 
 import math
 import os
-import subprocess
 import time
-from typing import Optional
 
 import numpy as np
 from cmd_parser import parse_args
+from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
+                        hwl_to_oned_colmajor, oned_to_hwl_colmajor)
 from preprocess_bool import preprocess
 from scipy.io import mmread
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
 )
-
-
-def hwl_to_oned_colmajor(height: int, width: int, pe_length: int, A_hwl: np.ndarray, dtype):
-  """
-    Given a 3-D tensor A[height][width][pe_length], transform it to
-    1D array by column-major
-    """
-  if A_hwl.dtype == np.float32:
-    A_1d = np.zeros(height * width * pe_length, dtype)
-    idx = 0
-    for l in range(pe_length):
-      for w in range(width):
-        for h in range(height):
-          A_1d[idx] = A_hwl[(h, w, l)]
-          idx = idx + 1
-  elif A_hwl.dtype == np.uint16:
-    assert dtype == np.uint32, "only support dtype = u32 if A is u16"
-    A_1d = np.zeros(height * width * pe_length, dtype)
-    idx = 0
-    for l in range(pe_length):
-      for w in range(width):
-        for h in range(height):
-          x = A_hwl[(h, w, l)]
-          A_1d[idx] = np.uint32(x)
-          idx = idx + 1
-  else:
-    raise RuntimeError(f"{A_hwl.dtype} is not supported")
-
-  return A_1d
-
-
-def oned_to_hwl_colmajor(height: int, width: int, pe_length: int, A_1d: np.ndarray, dtype):
-  """
-    Given a 1-D tensor A_1d[height*width*pe_length], transform it to
-    3-D tensor A[height][width][pe_length] by column-major
-    """
-  assert dtype == np.float32, "only support f32 readback for this kernel"
-  assert A_1d.dtype == np.float32, "only support f32 to f32"
-  return np.reshape(A_1d, (height, width, pe_length), order="F")
-
-
-# x is boolean, length n. Only the diagonal PE of each column (py == px)
-# gets a real slice; every other PE starts at zero and receives the
-# broadcast from phase 1. This replaces hypersparse_spmv's dist_x_to_hwl,
-# which spread x across every PE in a column.
-def dist_x_to_diag_hwl(n, x_bool, blk, P):
-  x_pad = np.zeros(P * blk, dtype=np.float32)
-  x_pad[0:n] = x_bool.astype(np.float32)
-
-  x_hwl = np.zeros((P, P, blk), dtype=np.float32)
-  for p in range(P):
-    x_hwl[(p, p)] = x_pad[p * blk:(p + 1) * blk]
-  return x_hwl
-
-
-# Extract the diagonal PEs' y_buf (the only ones holding a meaningful final
-# result) and reassemble into the length-n boolean output vector.
-def extract_diag_result(n, blk, P, y_hwl):
-  parts = [y_hwl[(p, p)] for p in range(P)]
-  y_pad = np.concatenate(parts)
-  return y_pad[0:n] > 0.0
 
 
 def generate_boolean_reference(nrows, ncols, csrRowPtr, csrColInd, x_bool):
@@ -117,60 +56,6 @@ def verify_result(ref, res):
   if n_mismatch != 0:
     idx = np.where(ref != res)[0]
     print(f"mismatched indices: {idx}")
-
-
-def csl_compile_core(
-    cslc: str,
-    file_config: str,
-    elf_dir: str,
-    fabric_width: int,
-    fabric_height: int,
-    core_fabric_offset_x: int,
-    core_fabric_offset_y: int,
-    use_precompile: bool,
-    arch: Optional[str],
-    np_cols: int,
-    np_rows: int,
-    blk: int,
-    max_local_nnz: int,
-    max_local_nnz_cols: int,
-    max_local_nnz_rows: int,
-    channels: int,
-    width_west_buf: int,
-    width_east_buf: int,
-    max_rounds: Optional[int] = None,
-):
-  comp_dir = elf_dir
-
-  if not use_precompile:
-    args = []
-    args.append(cslc)
-    args.append(file_config)
-    args.append(f"--fabric-dims={fabric_width},{fabric_height}")
-    args.append(f"--fabric-offsets={core_fabric_offset_x},{core_fabric_offset_y}")
-    args.append(f"--params=pcols:{np_cols}")
-    args.append(f"--params=prows:{np_rows}")
-    args.append(f"--params=blk:{blk}")
-    args.append(f"--params=max_local_nnz:{max_local_nnz}")
-    args.append(f"--params=max_local_nnz_cols:{max_local_nnz_cols}")
-    args.append(f"--params=max_local_nnz_rows:{max_local_nnz_rows}")
-    # left at layout_bool.csl's own default (32) unless a caller (see
-    # bench_timing.py) needs per-round timing over a deeper BFS.
-    if max_rounds is not None:
-      args.append(f"--params=max_rounds:{max_rounds}")
-
-    args.append(f"-o={comp_dir}")
-    if arch is not None:
-      args.append(f"--arch={arch}")
-    args.append("--memcpy")
-    args.append(f"--channels={channels}")
-    args.append(f"--width-west-buf={width_west_buf}")
-    args.append(f"--width-east-buf={width_east_buf}")
-
-    print(f"subprocess.check_call(args = {args}")
-    subprocess.check_call(args)
-  else:
-    print("[csl_compile_core] use pre-compile ELFs")
 
 
 def main():

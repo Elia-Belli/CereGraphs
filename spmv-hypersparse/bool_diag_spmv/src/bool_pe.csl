@@ -71,7 +71,7 @@
 // cover different column ranges, a row's true best candidate is the min
 // across all P PEs in that row -- <collectives_2d> has no min-reduce, so
 // this last step is done host-side after memcpy_d2h (see
-// extract_parent_result() in ../test_iterative.py). TODO: this final
+// extract_parent_result() in ../device_io.py). TODO: this final
 // cross-PE min could in principle be done on-device with a relay shaped
 // like the termination check above, but there's no min-reduce primitive to
 // build it from without hand-rolling one.
@@ -111,9 +111,10 @@ var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
 
 // Per-round, per-phase timing (f_spmv_iter only -- see record_ts() below).
 // One raw hardware timestamp is captured at each of these round-boundary
-// points; host-side (bench_timing.py) subtracts consecutive pairs (as
-// 48-bit values, cerebras.sdk.sdk_utils.make_u48) to get each phase's
-// elapsed cycles, and MID-1/MID-2 vs. the rest gives min/max/avg across
+// points; host-side (bfs_timing.py, used by run_bfs.py) subtracts
+// consecutive pairs (as 48-bit values, cerebras.sdk.sdk_utils.make_u48) to
+// get each phase's elapsed cycles, and MID-1/MID-2 vs. the rest gives
+// min/max/avg across
 // PEs once every PE's copy is read back. Two consecutive slots delimit one
 // phase; where a task immediately re-issues the next collective with no
 // other work in between, its entry timestamp doubles as both the previous
@@ -153,7 +154,7 @@ const NUM_TS_SLOTS: u16 = 10;
 // flat [max_rounds][NUM_TS_SLOTS][3]u16, row-major (round slowest, then
 // slot, then the 3 raw timestamp words) -- see record_ts() for the index
 // arithmetic. No per-call reset needed: the host only ever reads the
-// [0, rounds_completed) prefix (see ../bench_timing.py), so stale entries
+// [0, rounds_completed) prefix (see ../run_bfs.py), so stale entries
 // from a longer PRIOR run past the current run's rounds_completed are
 // simply never looked at.
 var ts_buf = @zeros([max_rounds * NUM_TS_SLOTS * 3]u16);
@@ -191,8 +192,9 @@ const mpi_y = @import_module("<collectives_2d/pe>", .{
     .src1_dsr_ids = [1]u16{2},
     });
 
-// matrix structure, populated per-PE by run_bool.py via memcpy (hypersparse
-// compressed-column format, identical to hypersparse_spmv minus mat_vals_buf)
+// matrix structure, populated per-PE by run_single_spmv.py/run_bfs.py via
+// memcpy (hypersparse compressed-column format, identical to
+// hypersparse_spmv minus mat_vals_buf)
 var mat_rows_buf = @zeros([max_local_nnz]u16);
 var mat_col_idx_buf = @zeros([max_local_nnz_cols]u16);
 var mat_col_loc_buf = @zeros([max_local_nnz_cols]u16);
@@ -254,7 +256,7 @@ var nz_total = @zeros([1]f32);
 
 // rounds_completed: host-visible counter of how many rounds f_spmv_iter
 // actually ran this call, purely for verifying early termination actually
-// happens (see ../test_iterative.py) -- not read by the kernel itself.
+// happens (see ../run_host_driven_bfs.py) -- not read by the kernel itself.
 var rounds_completed = @zeros([1]u16);
 
 // scratch: compact per-PE flags over the local distinct-row list

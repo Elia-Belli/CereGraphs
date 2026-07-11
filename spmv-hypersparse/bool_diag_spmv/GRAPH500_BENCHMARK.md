@@ -3,7 +3,7 @@
 This is a separate document from `README.md` on purpose: it's about the
 *benchmark methodology* (what counts as "the BFS time," how TEPS is
 defined) rather than the kernel's own design. Scope right now is narrow —
-get a real TEPS number out of `bench_timing.py` — so **construction and
+get a real TEPS number out of `run_bfs.py` — so **construction and
 readback are left as explicit placeholders below**, not fully resolved.
 
 ## 1. What Graph500 actually defines
@@ -58,10 +58,10 @@ reported alongside.
 
 ## 2. Mapping onto `bool_diag_spmv`
 
-`bench_timing.py` already measures four separate things. Here's how each
+`run_bfs.py` already measures four separate things. Here's how each
 one maps onto the Kernel 1 / Kernel 2 split above:
 
-| bench_timing.py component | Graph500 analogue | Status |
+| `run_bfs.py` component | Graph500 analogue | Status |
 |---|---|---|
 | `h2d_matrix` (`mat_rows_buf`, `mat_col_idx/loc/len_buf`, `y_rows_init_buf`, `local_nnz*`) | **Kernel 1 (construction)** — built once, reused across searches | **Placeholder** — measured, logged, but not yet folded into any TEPS number |
 | `h2d_seed` (`x_buf`, the search root) | Part of Kernel 2 — "immediately prior to visiting the search root" | **In scope now** |
@@ -75,8 +75,8 @@ join the TEPS denominator is an open question below, not decided yet.
 
 ## 3. Current "search time" definition (cycles, in scope now)
 
-**Implemented** — `bench_timing.py` logs this as `search_time_cycles`.
-For one search (one CSV row from `bench_timing.py`):
+**Implemented** — `run_bfs.py` logs this as `search_time_cycles`.
+For one search (one CSV row from `run_bfs.py`):
 
 ```
 search_time_cycles = h2d_seed_cycles
@@ -98,13 +98,13 @@ placeholders above).
 ## 4. `m` — edges traversed, for `bool_diag_spmv`'s own matrix convention
 
 `bool_diag_spmv` stores `A` as row=dest/col=source (`A_csr[r, c] != 0`
-means edge `c -> r`; see `generate_boolean_reference` in `run_bool.py`).
+means edge `c -> r`; see `generate_boolean_reference` in `run_single_spmv.py`).
 The test matrices (`benchmarks/gen_rmat.py`) are explicitly **symmetrized**
 before being written out ("symmetrize (undirected graph, standard for BFS
 benchmarking)"), so `A_csr[v, u] != 0 <=> A_csr[u, v] != 0` — the same
 undirected-with-both-tuples-stored shape Graph500's own reference graphs
 have. That means the reference implementation's dedup rule ports directly
-(implemented in `bench_timing.py`, vectorized rather than the loop form
+(implemented in `run_bfs.py`, vectorized rather than the loop form
 below):
 
 ```python
@@ -116,9 +116,9 @@ m = sum(
 )
 ```
 
-**Implemented** — `bench_timing.py` now decodes `visited_buf` (via
-`extract_diag_result`/`oned_to_hwl_colmajor`, the same helpers
-`test_iterative.py`/`plot_bfs_tree.py` already use) and computes `m` as
+**Implemented** — `run_bfs.py` now decodes `visited_buf` (via
+`extract_diag_result`/`oned_to_hwl_colmajor`, the shared `device_io.py`
+helpers every driver script uses) and computes `m` as
 `np.sum(visited[coo.row] & (coo.col <= coo.row))` on `A_csr.tocoo()` — one
 vectorized pass, no Python-level loop over `n`/`nnz`.
 
@@ -128,7 +128,7 @@ only correct for a symmetric (undirected) `A_csr`. Running it against
 produced `m=1836 > nnz/2=1800` — impossible for the real quantity, and a
 clear tell that the input wasn't actually symmetric. Confirmed directly:
 `rand600.mtx` has `A_csr != A_csr.T` and 3 self-loops (`gen_rmat.py`
-explicitly avoids both). `bench_timing.py` now checks `A_csr` symmetry up
+explicitly avoids both). `run_bfs.py` now checks `A_csr` symmetry up
 front and logs a `matrix_symmetric` CSV column.
 
 To be clear about *why* symmetry matters here: it's a property of
@@ -148,17 +148,17 @@ kernel, in whichever round that vertex is in the active frontier (see
 `compute()` in `bool_pe.csl`) — so this counts real, meaningful
 algorithmic work for a directed graph, it's just **not** a Graph500-spec-
 comparable number (the spec has no defined `m` for directed input at all).
-`bench_timing.py` picks the formula automatically based on
+`run_bfs.py` picks the formula automatically based on
 `matrix_symmetric` and records which one was used in the `m_convention`
 column (`"undirected_dedup"` or `"directed_source_visited"`).
 
 ## 5. Known deviations from the full Graph500 protocol (not addressed yet)
 
-- **One search, not 64.** `bench_timing.py` runs a single `--source` per
+- **One search, not 64.** `run_bfs.py` runs a single `--source` per
   invocation. The harmonic-mean-over-64-searches step doesn't apply until
   multiple searches per compiled matrix are actually run and aggregated.
 - **Clock frequency is an assumed constant, not calibrated.** `CLOCK_FREQ_HZ
-  = 875 MHz` in `bench_timing.py` converts `search_time_cycles` ->
+  = 875 MHz` in `run_bfs.py` converts `search_time_cycles` ->
   `search_time_seconds` for TEPS, but isn't calibrated against this
   simulator run in any way -- same "not an absolute hardware-calibrated
   figure" caveat this repo's other tsc-based timing already carries (see
@@ -171,7 +171,7 @@ column (`"undirected_dedup"` or `"directed_source_visited"`).
 
 ## 6. Current status
 
-**Implemented, end to end**: `bench_timing.py` logs `search_time_cycles`,
+**Implemented, end to end**: `run_bfs.py` logs `search_time_cycles`,
 `m_edges_traversed`, `m_convention`, `visited_count`, `matrix_symmetric`,
 `clock_freq_hz`, `search_time_seconds`, and `gteps` (GTEPS -- 10^9
 edges/s, the conventional Graph500-reporting unit) for every run. `m`/

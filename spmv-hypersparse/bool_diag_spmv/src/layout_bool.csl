@@ -23,9 +23,9 @@ param max_local_nnz: u16;
 param max_local_nnz_cols: u16;
 param max_local_nnz_rows: u16;
 // upper bound on f_spmv_iter rounds profiled by ts_buf (see bool_pe.csl) --
-// defaulted so existing callers (run_bool.py/test_iterative.py/
-// plot_bfs_tree.py) that don't care about per-round timing don't need to
-// pass anything; bench_timing.py overrides it explicitly.
+// defaulted so existing callers (run_single_spmv.py/run_host_driven_bfs.py)
+// that don't care about per-round timing don't need to pass anything;
+// run_bfs.py overrides it explicitly.
 param max_rounds: u16 = 10;
 
 comptime {

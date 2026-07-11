@@ -20,37 +20,76 @@ what's genuinely done versus what's still a stub.
   identical hypersparse compressed-column partitioning
   (`mat_col_idx/loc/len_buf`, `mat_rows_buf`, `y_rows_init_buf`), minus
   `mat_vals_buf` (boolean semiring never uses edge weights).
-- `run_bool.py` — host driver: seeds `x` only at the PE grid's diagonal,
+- `device_io.py` — shared host<->device data-marshaling helpers (hwl<->1d
+  layout conversions, diagonal/parent result extraction, the `cslc`
+  invocation) used by every driver script below — not runnable on its own.
+- `bfs_timing.py` — shared per-round timing constants/decoders (the
+  `TS_*`/`PHASES` slot map matching `bool_pe.csl`'s `record_ts()`, the
+  `read_tic_toc_delta()`/`decode_round_timestamps()` helpers) — single
+  source of truth for `run_bfs.py` (writes `bfs_timing.csv`) and
+  `plot_bfs_timing.py` (reads it back), not runnable on its own.
+- `bfs_tree_plot.py` — shared BFS-tree-comparison rendering (digraph
+  construction, the radial BFS-level layout, panel drawing, parent
+  validity checking) — used by `run_bfs.py`, not runnable on its own.
+- `run_single_spmv.py` (formerly `run_bool.py`) — host driver for the base,
+  one-shot `f_spmv` entrypoint: seeds `x` only at the PE grid's diagonal,
   launches `f_spmv` once, reads back the full rectangle, keeps only the
-  diagonal entries, verifies against an independent scipy boolean reference.
-- `test_iterative.py` — host driver for the on-device iterative entrypoint
-  `f_spmv_iter` (see "Status" below): runs one `f_spmv_iter` launch (runs
-  until the on-device termination relay agrees nothing new was found — no
-  round cap) against the same compiled kernel's `f_spmv`, called in a
-  host-side loop that applies the identical visited-mask and stops the same
-  way — then checks `visited_buf`, the terminating round's raw (unmasked)
-  `y_buf`, the assembled parent vector (`extract_parent_result()`, min-reduced
+  diagonal entries, verifies against an independent scipy boolean
+  reference. A foundational sanity check independent of any BFS-specific
+  machinery (masking, termination, parent tracking) — see "run_bfs.py vs.
+  the two test scripts" below for how this relates to `run_bfs.py`.
+- `run_host_driven_bfs.py` (formerly `test_iterative.py`) — regression test
+  for the on-device iterative entrypoint `f_spmv_iter` (see "Status"
+  below): runs one `f_spmv_iter` launch (runs until the on-device
+  termination relay agrees nothing new was found — no round cap) against
+  the same compiled kernel's `f_spmv`, called in a host-side loop that
+  applies the identical visited-mask and stops the same way, seeded with a
+  random ~50%-density *multi-source* frontier specifically to stress-test
+  masking across many simultaneous discoveries at once — then checks
+  `visited_buf`, the terminating round's raw (unmasked) `y_buf`, the
+  assembled parent vector (`extract_parent_result()`, min-reduced
   host-side from the full `parent_local_buf` rectangle), and the number of
   rounds actually run are all identical between the two, plus a sanity
   invariant that the masked `x_buf` is genuinely all-zero when the device
   stops. Logs each run to `iterative_results.jsonl`.
-- `plot_bfs_tree.py` — visual correctness check: seeds a *single* BFS source
-  (unlike `test_iterative.py`'s random ~50%-density frontier, chosen here so
-  both trees are one recognizable tree, not a forest), runs one
-  `f_spmv_iter` launch and compares it against `scipy.sparse.csgraph.
-  breadth_first_order` — a fully independent reference with zero dependency
-  on `bool_pe.csl`/`preprocess_bool.py` — and renders the two resulting BFS
-  trees side by side with `networkx`/`matplotlib` — full graph faint gray
-  for context, tree edges bolded, any visited-set mismatch between the two
-  sides drawn in red. Reuses `extract_parent_result()` from
-  `test_iterative.py` directly.
+- `run_bfs.py` — the main, user-facing driver: a *single-source* BFS, one
+  compile + one `f_spmv_iter` launch, reporting three things from that one
+  run (each independently toggleable, all on by default): a tree
+  comparison plot against `scipy.sparse.csgraph.breadth_first_order`
+  (`--notree` to skip), the same scipy cross-check printed as numbers
+  (`--nocorrectness` to skip), and per-round phase timing + a Graph500-style
+  GTEPS estimate appended to `bfs_timing.csv` plus its own bar-chart plot
+  (`--notimings` to skip, which also skips the tsc instrumentation itself
+  and its real transfer-time cost). See "`run_bfs.py` vs. the two test
+  scripts" below for why this is a separate thing from
+  `run_host_driven_bfs.py`, and `GRAPH500_BENCHMARK.md` for the GTEPS
+  methodology.
+- `plot_bfs_timing.py` — the per-round stacked-bar timing chart
+  `run_bfs.py` calls automatically; also runnable standalone
+  (`plot_timing_row()`) to re-plot an existing `bfs_timing.csv` row without
+  re-running the device.
 - `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test on
   `../data/rmat4.4x4.lb.mtx` at a 4x4 grid, for WSE-2 and WSE-3 respectively.
   Unlike `original_spmv`/`bfs_spmv`, both scripts compile the *same* `src/` —
   `<collectives_2d>` abstracts the fabric-routing differences between the two
   architectures, so there's no separate `src_wse3/` tree here.
 - `commands_wse3_iterative.sh` — same compile as `commands_wse3.sh`, but runs
-  `test_iterative.py` instead of `run_bool.py`.
+  `run_host_driven_bfs.py` instead of `run_single_spmv.py`.
+
+### `run_bfs.py` vs. the two test scripts
+
+`run_single_spmv.py` and `run_host_driven_bfs.py` are correctness tests for
+two different *layers*, not redundant with each other or with `run_bfs.py`:
+`run_single_spmv.py` validates the base one-shot `f_spmv` primitive
+(broadcast + local multiply + reduce, no BFS semantics at all);
+`run_host_driven_bfs.py` validates the iterative machinery built on top of
+it (masking, termination, parent tracking) under a deliberately adversarial
+multi-source stress frontier, and depends on `f_spmv` already being known
+correct. Neither does a real single-source BFS run. `run_bfs.py` is the
+separate, user-facing "run an actual BFS and show me the result" tool —
+its own `--nocorrectness` check is a single-source scipy cross-check, not
+`run_host_driven_bfs.py`'s stress test, which stays its own script rather
+than being folded in.
 
 ## Design: why the diagonal, and why `<collectives_2d>`
 
@@ -161,7 +200,7 @@ the reduce runs, at the only point column identity is still visible:
   with `min` instead of `sum`. `<collectives_2d>` has no min-reduce
   primitive, so this step is done host-side instead: `parent_local_buf` is
   exported from *every* PE (not just the diagonal, unlike `x_buf`/`y_buf`/
-  `visited_buf`), and `test_iterative.py`'s `extract_parent_result()` reads
+  `visited_buf`), and `run_host_driven_bfs.py`'s `extract_parent_result()` reads
   back the full rectangle and takes `.min(axis=...)` across the row's `P`
   column-PEs after `memcpy_d2h`.
 - TODO: that final cross-PE min could in principle be done on-device with a
@@ -178,11 +217,11 @@ later member's global index happened to be lower, producing an invalid
 (same-level, or even more-hops-away) "parent" that plainly wasn't one BFS
 level closer, however plausible it looked as *a* valid predecessor. The
 device-side fix (`visited_buf` gate above) plus the matching host-side fix
-in `test_iterative.py`'s `update_parent_reference()` (gated on the host's
+in `run_host_driven_bfs.py`'s `update_parent_reference()` (gated on the host's
 own `visited` array the same way) now give a parent that matches
 `bfs_spmv/run_bfs.py`'s stricter `find_parents()` definition (exactly one
 BFS level closer), not merely `verify_bfs()`'s looser one (visited + a real
-edge, no level check) — confirmed by `plot_bfs_tree.py`, whose
+edge, no level check) — confirmed by `run_bfs.py`, whose
 `--show-parent-mismatch` tie-break-difference count against scipy's own
 `breadth_first_order` dropped to the residual cases where multiple
 one-hop-closer predecessors are equally valid and scipy's FIFO-order
@@ -220,20 +259,20 @@ sparsity, varying grid size, balanced and unbalanced) — see
 
 - **Square PE grid** (`pcols == prows`) — asserted at compile time. The
   diagonal-target design has no meaning otherwise.
-- **Square matrix** (`nrows == ncols`) — asserted by `run_bool.py`.
+- **Square matrix** (`nrows == ncols`) — asserted by `run_single_spmv.py`.
 
 ## Running with a different matrix / grid size
 
 `commands_wse2.sh`/`commands_wse3.sh`/`commands_wse3_iterative.sh` are a
 fixed smoke test (`../data/rmat4.4x4.lb.mtx` on a 4x4 grid) split into two
 steps — an explicit `cslc` call with hand-computed `--params` (`blk`,
-`max_local_nnz*`), then `run_bool.py`/`test_iterative.py --run-only` reusing
+`max_local_nnz*`), then `run_single_spmv.py`/`run_host_driven_bfs.py --run-only` reusing
 that ELF. That split only exists to avoid recompiling on repeat smoke-test
 runs; the `--params` values in it are specific to that one matrix+grid
 combination and won't work for any other.
 
-For a different matrix or grid size, skip the split and call `run_bool.py`
-(or `test_iterative.py`) directly, **without `--run-only`**. Both scripts run
+For a different matrix or grid size, skip the split and call `run_single_spmv.py`
+(or `run_host_driven_bfs.py`) directly, **without `--run-only`**. Both scripts run
 `preprocess_bool.preprocess()` themselves before invoking `cslc`, so `blk`
 and the `max_local_nnz*` sizes are computed from the actual matrix and grid
 you pass — you never need to work those out by hand:
@@ -241,17 +280,17 @@ you pass — you never need to work those out by hand:
 ```sh
 cd spmv-hypersparse   # repo-root-relative paths, same as the commands_* scripts
 
-cs_python bool_diag_spmv/run_bool.py --arch=wse3 \
+cs_python bool_diag_spmv/run_single_spmv.py --arch=wse3 \
     --num_pe_cols=8 --num_pe_rows=8 --channels=1 \
     --infile_mtx=data/rmat_s6_e4.mtx \
     --latestlink bool_diag_spmv/out_s6_8x8
 ```
 
-The same flags work for `test_iterative.py` (it shares `cmd_parser.py` with
-`run_bool.py`):
+The same flags work for `run_host_driven_bfs.py` (it shares `cmd_parser.py` with
+`run_single_spmv.py`):
 
 ```sh
-cs_python bool_diag_spmv/test_iterative.py --arch=wse3 \
+cs_python bool_diag_spmv/run_host_driven_bfs.py --arch=wse3 \
     --num_pe_cols=8 --num_pe_rows=8 --channels=1 \
     --infile_mtx=data/rmat_s6_e4.mtx \
     --latestlink bool_diag_spmv/out_s6_8x8_iter
@@ -284,7 +323,7 @@ Two entrypoints, both exported from the same compiled kernel:
 
 - `f_spmv` — the original one-shot SpMV: bootstrap `x` at the diagonal via
   host memcpy, broadcast, local boolean multiply, reduce back to the
-  diagonal, read back and verify (`run_bool.py`).
+  diagonal, read back and verify (`run_single_spmv.py`).
 - `f_spmv_iter` — on-device iterative version: at the diagonal PEs, each
   round's raw result is masked against a cumulative `visited_buf` before
   being fed back as the next round's `x` (`reduce_done()` in `bool_pe.csl`)
@@ -298,7 +337,7 @@ Two entrypoints, both exported from the same compiled kernel:
   PEs host-side into the final parent vector. Verified against a host-side
   loop of sequential `f_spmv` launches that applies the identical mask, the
   identical stop rule, and an independent host-side parent reference
-  (`test_iterative.py`) — `visited_buf`, the terminating round's raw
+  (`run_host_driven_bfs.py`) — `visited_buf`, the terminating round's raw
   (unmasked) `y_buf`, the assembled parent vector, *and* the number of
   rounds actually run are all bit-identical, 0 mismatches, on a 4x4 grid, an
   odd 5x5 grid, and an 8x8/64-node case (with the masked `x_buf`'s
