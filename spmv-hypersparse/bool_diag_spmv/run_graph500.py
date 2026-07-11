@@ -101,16 +101,21 @@ def pick_sources(args, A_csc, n):
       assert 0 <= s < n, f"--sources entry {s} out of range [0, {n})"
     return sources
 
-  # Graph500 samples roots with at least one outgoing edge -- a source with
-  # no out-edges can never discover anything, so m/GTEPS for it would be a
-  # meaningless divide-by-(effectively)-zero. row=dest/col=source (see
-  # generate_boolean_reference in run_single_spmv.py), so out-degree is the
-  # per-column nnz count.
-  outdeg = np.diff(A_csc.indptr)
+  # Graph500's own rule (https://graph500.org/?page_id=12 section 5): sample
+  # roots with degree >= 1, NOT COUNTING SELF-LOOPS -- a source with only a
+  # self-loop (or no edges at all) can never discover anything new, so
+  # m/GTEPS for it would be a meaningless divide-by-(effectively)-zero.
+  # row=dest/col=source (see generate_boolean_reference in
+  # run_single_spmv.py), so raw out-degree is the per-column nnz count;
+  # subtract 1 for any column that also has a diagonal (self-loop) entry.
+  # gen_rmat.py's own output never has self-loops, but an arbitrary
+  # --infile_mtx (e.g. data/rand600.mtx) can.
+  outdeg = np.diff(A_csc.indptr) - (A_csc.diagonal() != 0).astype(np.int64)
   candidates = np.nonzero(outdeg > 0)[0]
   if len(candidates) < args.num_searches:
-    print(f"[[ NOTE: only {len(candidates)} vertices have outgoing edges -- requested "
-          f"--num-searches={args.num_searches}, using all {len(candidates)} available instead ]]")
+    print(f"[[ NOTE: only {len(candidates)} vertices have degree >= 1 (excluding self-loops) -- "
+          f"requested --num-searches={args.num_searches}, using all {len(candidates)} available "
+          "instead ]]")
   num = min(args.num_searches, len(candidates))
   rng = np.random.default_rng(args.seed)
   return rng.choice(candidates, size=num, replace=False).tolist()

@@ -45,6 +45,19 @@ Verified directly against the [official spec](https://graph500.org/?page_id=12)
   timed search (it happens fresh for every one of the 64 roots) — but the
   graph's structure, built once and reused across all 64 searches, is not.
 
+**Root selection** (section 5 of the spec, quoted verbatim): *"The search
+keys must be randomly sampled from the vertices in the graph. To avoid
+trivial searches, sample only from vertices that are connected to some
+other vertex. Their degrees, not counting self-loops, must be at least
+one. If there are fewer than 64 such vertices, run fewer than 64
+searches."* So: degree >= 1 excluding self-loops, 64 **unique** (no
+repeats) roots sampled uniformly at random, and simply run fewer searches
+if the graph doesn't have 64 qualifying vertices. Notably, **there is no
+giant-connected-component requirement** — a vertex with a single real edge
+into a tiny, otherwise-isolated pair still qualifies. `run_graph500.py`'s
+`pick_sources()` implements exactly this rule (see section 5 below for the
+one place it initially got the self-loop exclusion wrong, now fixed).
+
 **TEPS**: `TEPS(n) = m / bfs_time(n)`, where `m` is the number of edges in
 the traversed component — each self-loop counted once, each non-self-loop
 edge counted once total (not twice, even though the underlying storage
@@ -161,18 +174,25 @@ based on `matrix_symmetric` and record which one was used in the
 
 ## 5. Known deviations from the full Graph500 protocol (not addressed yet)
 
-- **Root selection isn't restricted to the giant connected component.**
-  `run_graph500.py` samples roots uniformly from vertices with at least one
-  outgoing edge (any out-degree > 0), not from the giant component
-  specifically. On `data/rmat_s8_e4.mtx` this surfaced two roots landing in
-  tiny (2-vertex) disconnected components, each with `m=1` and GTEPS three
+- ~~Root selection isn't restricted to the giant connected component~~ --
+  **not actually a deviation**. The spec's own rule (section 1 above) only
+  requires degree >= 1, not giant-component membership -- a root landing in
+  a tiny, otherwise-isolated pair is spec-compliant, not a bug. On
+  `data/rmat_s8_e4.mtx`, two of the 64 sampled roots did land in tiny
+  (2-vertex) disconnected components, each with `m=1` and GTEPS three
   orders of magnitude below the rest -- harmonic mean is (correctly)
   extremely sensitive to this, dragging the reported harmonic-mean GTEPS
-  well below the median for that run. This is real, not a bug: it's exactly
-  what harmonic mean is supposed to do with a disproportionately slow/tiny
-  search. Whether to additionally restrict sampling to the giant component
-  (closer to what real Graph500 reference generators effectively guarantee
-  by construction) is an open methodology question, not yet decided.
+  well below the median for that run. That's exactly what harmonic mean is
+  *supposed* to do with a disproportionately slow/tiny search, not a
+  methodology gap to fix.
+- **Fixed**: `pick_sources()` originally filtered candidates by raw
+  out-degree (per-column nnz count), which -- for a matrix with self-loops
+  -- could count a vertex whose only "out-edge" is a self-loop as
+  qualifying. The spec explicitly excludes self-loops from the degree
+  count. `gen_rmat.py`'s own output never has self-loops so this never
+  showed up against it, but an arbitrary `--infile_mtx` can have them (e.g.
+  `data/rand600.mtx`, 3 self-loops). Now subtracts the diagonal presence
+  (`A_csc.diagonal() != 0`) from the raw out-degree before filtering.
 - **Clock frequency is an assumed constant, not calibrated.** `CLOCK_FREQ_HZ
   = 875 MHz` converts `search_time_cycles` -> `search_time_seconds` for
   TEPS, but isn't calibrated against this simulator run in any way -- same
