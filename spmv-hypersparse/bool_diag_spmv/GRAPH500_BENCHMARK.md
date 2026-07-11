@@ -45,6 +45,18 @@ Verified directly against the [official spec](https://graph500.org/?page_id=12)
   timed search (it happens fresh for every one of the 64 roots) — but the
   graph's structure, built once and reused across all 64 searches, is not.
 
+  **The output, precisely**: the reference implementation's own signature
+  is `void run_bfs(int64_t root, int64_t* pred)` (`mpi/bfs_custom.c`) — the
+  predecessor/parent array (`pred[root] = root`, `pred[unreachable] = -1`)
+  is the *entire* official output. There is no separate "visited" output in
+  the spec at all — visited is nothing more than "has a valid predecessor
+  (or is the root)". `pred` is filled in as an ordinary in-memory array
+  (host RAM), never touching disk — confirming "memory" in "the output has
+  been written to memory" means RAM, and "do not time any I/O outside of
+  the search routine" is what excludes disk writes (e.g. this repo's own
+  CSV logging, which happens after every tic/toc bracket closes, not
+  inside one).
+
 **Root selection** (section 5 of the spec, quoted verbatim): *"The search
 keys must be randomly sampled from the vertices in the graph. To avoid
 trivial searches, sample only from vertices that are connected to some
@@ -86,17 +98,20 @@ above:
 | `h2d_matrix` (`mat_rows_buf`, `mat_col_idx/loc/len_buf`, `y_rows_init_buf`, `local_nnz*`) | **Kernel 1 (construction)** — built once, reused across searches | **Resolved in `run_graph500.py`** — uploaded exactly once per benchmark run, timed separately, excluded from every search's own time (in `run_bfs.py`, which always does one compile + one search, this is logged per-run but not part of `search_time_cycles` either) |
 | `h2d_seed` (`x_buf`, the search root) | Part of Kernel 2 — "immediately prior to visiting the search root" | **In scope** |
 | on-device BFS rounds (`visited_bcast`, `vertical_bcast`, `local_compute`, `reduce`, `local_term_cond`, `relay_*`, all from `ts_buf`/`record_ts()`) | Kernel 2 itself — the actual `run_bfs()` | **In scope** |
-| `d2h` (`visited_buf` + `parent_local_buf` readback) | Part of Kernel 2 — "output has been written to memory" | **Placeholder** — measured, logged (both scripts), but not yet folded into `search_time_cycles`/GTEPS |
+| `d2h` (`parent_local_buf` readback only) | Part of Kernel 2 — "output has been written to memory" (the spec's own output, see section 1) | **Resolved** — folded into `search_time_cycles` (section 3) |
 
-`d2h` is the one remaining open item: it's real per-search cost (Graph500's
-own rule times it as part of the search), but folding it in changes every
-existing GTEPS number, so it's deferred until that's a deliberate decision,
-not a side effect of this doc update.
+`visited_buf` is **no longer read back at all** by either script — it's
+kernel-internal state (used for masking/termination), not part of
+Graph500's own output. `device_io.derive_visited_from_parent()` recovers an
+identical `visited` array host-side from `parent_local_buf` alone (proven,
+not approximated — see its own docstring), so dropping that transfer both
+matches the spec more closely (parent is the only real output) and removes
+genuinely redundant device-to-host traffic from every search.
 
 ## 3. Current "search time" definition (cycles, in scope now)
 
-**Implemented** — `run_bfs.py` logs this as `search_time_cycles`.
-For one search (one CSV row from `run_bfs.py`):
+**Implemented** — both `run_bfs.py` and `run_graph500.py` log this as
+`search_time_cycles`, per search:
 
 ```
 search_time_cycles = h2d_seed_cycles
@@ -104,16 +119,19 @@ search_time_cycles = h2d_seed_cycles
                         visited_bcast_max[r] + vertical_bcast_max[r]
                         + local_compute_max[r] + reduce_max[r]
                         + local_term_cond_max[r] + relay_total_max[r]
+                    + d2h_cycles   (parent_local_buf readback only)
 ```
 
 Using each phase's `_max_cycles` (the straggler PE) per round, summed
 across rounds — the same definition `plot_bfs_timing.py`'s stacked bars
 already visualize (each round's bar height = sum of its phase segments).
 `relay_total` is used directly here rather than re-summing its own 4
-sub-phases, to avoid double-counting.
+sub-phases, to avoid double-counting. `d2h_cycles` is the straggler-PE max
+over just the `parent_local_buf` transfer (see section 2) -- smaller than
+it used to be, now that `visited_buf` isn't read back at all.
 
-`h2d_matrix` and `d2h` are **excluded** from this sum for now (see the
-placeholders above).
+`h2d_matrix` is still **excluded**, correctly -- it's Kernel 1
+(construction), never part of any individual search's time.
 
 ## 4. `m` — edges traversed, for `bool_diag_spmv`'s own matrix convention
 
@@ -136,11 +154,11 @@ m = sum(
 )
 ```
 
-**Implemented** — `run_bfs.py` now decodes `visited_buf` (via
-`extract_diag_result`/`oned_to_hwl_colmajor`, the shared `device_io.py`
-helpers every driver script uses) and computes `m` as
-`np.sum(visited[coo.row] & (coo.col <= coo.row))` on `A_csr.tocoo()` — one
-vectorized pass, no Python-level loop over `n`/`nnz`.
+**Implemented** — both scripts derive `visited` from `parent_local_buf`
+(via `device_io.derive_visited_from_parent()` -- see section 2) and compute
+`m` as `np.sum(visited[coo.row] & (coo.col <= coo.row))` on `A_csr.tocoo()`
+(`bfs_timing.compute_m_and_gteps`) — one vectorized pass, no Python-level
+loop over `n`/`nnz`.
 
 **Caveat confirmed by testing, not just theoretical**: this dedup rule is
 only correct for a symmetric (undirected) `A_csr`. Running it against
@@ -193,6 +211,14 @@ based on `matrix_symmetric` and record which one was used in the
   showed up against it, but an arbitrary `--infile_mtx` can have them (e.g.
   `data/rand600.mtx`, 3 self-loops). Now subtracts the diagonal presence
   (`A_csc.diagonal() != 0`) from the raw out-degree before filtering.
+- **Fixed**: `d2h` was previously excluded from `search_time_cycles`
+  entirely, and even when it was measured, it bundled a `visited_buf`
+  transfer that (per section 1's "the output, precisely") was never
+  actually part of Graph500's own definition of the search's output.
+  `visited_buf` is no longer read back at all (derived from
+  `parent_local_buf` instead, see section 2); the resulting -- smaller,
+  parent-only -- `d2h_cycles` is now folded into `search_time_cycles`
+  (section 3) for every search, in both scripts.
 - **Clock frequency is an assumed constant, not calibrated.** `CLOCK_FREQ_HZ
   = 875 MHz` converts `search_time_cycles` -> `search_time_seconds` for
   TEPS, but isn't calibrated against this simulator run in any way -- same
@@ -200,34 +226,41 @@ based on `matrix_symmetric` and record which one was used in the
   tsc-based timing already carries (see `bool_pe.csl`'s own tsc comment).
   Revisit if a real reference frequency for the simulator/hardware being
   targeted becomes available.
-- **`d2h` placeholder status** (section 2) — needs a decision once the
-  core TEPS number has settled: does readback belong in the denominator,
-  and if so, amortized how?
 
 ## 6. Current status
 
 **Implemented, end to end**: `run_graph500.py` runs the full spec-shaped
 sweep -- one compile, one matrix upload (timed once, excluded from every
 search), then N single-source searches (default 64) from distinct random
-roots, each producing `search_time_cycles`, `m_edges_traversed`,
-`m_convention`, `visited_count`, `matrix_symmetric`, `search_time_seconds`,
-and `gteps` (one row per search, appended to `graph500_searches.csv`), plus
-one summary row (`graph500_summary.csv`) with `harmonic_mean_gteps` (the
-spec's own aggregation rule, section 1), `min_gteps`, `median_gteps`,
-`max_gteps`, and `construction_time_seconds`. Between searches, no explicit
-host-side reset is needed beyond re-uploading `x_buf` -- `bool_pe.csl`'s
-`start_spmv()` already reinitializes `visited_buf`/`rounds_completed`/
-`parent_local_buf`/`ts_round` on every fresh `f_spmv_iter()` call (see its
-own comments). Verified against `data/rmat_s8_e4.mtx` (256 vertices, 8x8
-grid): 64/64 searches passed their per-search scipy correctness check
-(`--nocorrectness` to skip, on by default).
+roots (sampled per the spec's own degree-based rule, section 1), each
+producing `search_time_cycles` (h2d_seed + on-device rounds + d2h parent
+readback, section 3), `m_edges_traversed`, `m_convention`, `visited_count`,
+`matrix_symmetric`, `search_time_seconds`, and `gteps` (one row per search,
+appended to `graph500_searches.csv`), plus one summary row
+(`graph500_summary.csv`) with `harmonic_mean_gteps` (the spec's own
+aggregation rule, section 1), `min_gteps`, `median_gteps`, `max_gteps`, and
+`construction_time_seconds`. Between searches, no explicit host-side reset
+is needed beyond re-uploading `x_buf` -- `bool_pe.csl`'s `start_spmv()`
+already reinitializes `visited_buf`/`rounds_completed`/`parent_local_buf`/
+`ts_round` on every fresh `f_spmv_iter()` call (see its own comments).
+`visited_buf` itself is never read back by either script -- `visited` is
+derived host-side from `parent_local_buf` alone (`device_io.
+derive_visited_from_parent()`, section 2), which is both more spec-faithful
+(parent is Graph500's *only* defined output) and strictly less
+device-to-host traffic per search. Verified against `data/rmat_s8_e4.mtx`
+(256 vertices, 8x8 grid): 64/64 searches passed their per-search scipy
+correctness check (`--nocorrectness` to skip, on by default), both before
+and after the `d2h`/`visited_buf` change above.
 
 `run_bfs.py` remains the single-search deep-dive tool (tree plot, verbose
 per-phase breakdown, `--show-parent-mismatch`) and still logs its own
 `search_time_cycles`/`gteps` for that one search into `bfs_timing.csv` --
 useful for drilling into one specific root's phase breakdown, not for the
-spec's own 64-search aggregate.
+spec's own 64-search aggregate. It shares the same `d2h`/`visited_buf`
+fix, so its own numbers moved too (e.g. on `data/rmat4.4x4.lb.mtx`,
+`search_time_cycles` went from 18220 to 19688 cycles and `gteps` from
+0.005187 to 0.004800 -- lower, but the honest, spec-complete number).
 
-What's left is everything in section 5 above: the giant-component root-
-selection question, `d2h`'s denominator status, and (if it ever matters) a
-calibrated clock frequency instead of the assumed 875 MHz.
+What's left is everything in section 5 above: only the clock-frequency
+calibration caveat remains open; root selection and `d2h` are both
+resolved.

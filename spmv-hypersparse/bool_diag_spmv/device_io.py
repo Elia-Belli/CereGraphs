@@ -86,6 +86,33 @@ def extract_parent_result(n, blk, P, parent_hwl):
   return parent
 
 
+def derive_visited_from_parent(n, parent, source):
+  """visited[v] == True iff parent[v] >= 0 or v is the source itself.
+
+  This is provably equivalent to reading back bool_pe.csl's visited_buf
+  directly, not an approximation: compute() only ever records a parent
+  candidate for row v in the SAME round v's row-reduce first turns
+  visited_buf[v] nonzero (the visited_buf[dense_idx] == 0.0 gate in
+  compute() -- see its own comment -- means every PE that contributes a hit
+  to v's row-reduce in v's true discovery round also attempts to record a
+  parent candidate that round), so parent_local_buf's row-min is non-
+  PARENT_NONE exactly when v was ever discovered. The source is seeded
+  directly into visited_buf in start_spmv(), never through compute(), so it
+  never gets a parent recorded there -- callers already patch
+  parent[source] = source after extract_parent_result(), which this
+  function's `v is the source` check also covers.
+
+  This is also Graph500's own convention: the reference implementation's
+  Kernel 2 output is exactly the predecessor array (pred[v] = -1 for
+  unreached, pred[root] = root) -- there's no separate "visited" output at
+  all, so recovering it from parent instead of reading back visited_buf
+  separately is not just an optimization, it's the more spec-faithful
+  representation of "the output"."""
+  visited = parent >= 0
+  visited[source] = True
+  return visited
+
+
 def csl_compile_core(
     cslc: str,
     file_config: str,

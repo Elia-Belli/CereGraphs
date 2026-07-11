@@ -55,8 +55,8 @@ import plot_bfs_timing
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode_phase_row,
                          read_tic_toc_delta)
 from bfs_tree_plot import build_digraph, invalid_parents, render_tree_comparison
-from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
-                        extract_parent_result, hwl_to_oned_colmajor, oned_to_hwl_colmajor)
+from device_io import (csl_compile_core, derive_visited_from_parent, dist_x_to_diag_hwl,
+                        extract_parent_result, hwl_to_oned_colmajor)
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
@@ -241,7 +241,6 @@ def main():
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_trace=True)
 
   sym_x_buf = runner.get_id("x_buf")
-  sym_visited_buf = runner.get_id("visited_buf")
   sym_parent_local_buf = runner.get_id("parent_local_buf")
   sym_rounds_completed = runner.get_id("rounds_completed")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
@@ -326,13 +325,15 @@ def main():
   runner.launch("f_spmv_iter", nonblock=False)
 
   if need_timing:
-    print("timing d2h readback (visited_buf + parent_local_buf -- the real BFS output)...")
+    # Graph500's own output is exactly the predecessor/parent array (see
+    # GRAPH500_BENCHMARK.md section 1 -- the reference implementation's
+    # run_bfs(root, pred) signature) -- no separate "visited" readback is
+    # part of the spec, and derive_visited_from_parent() below recovers it
+    # from parent_local_buf alone, so only that one transfer needs to be
+    # timed as the search's "output written to memory" cost.
+    print("timing d2h readback (parent_local_buf -- the real BFS output)...")
     runner.launch("f_tic", nonblock=True)
 
-  visited_buf_1d = np.zeros(height * width * blk, np.float32)
-  runner.memcpy_d2h(visited_buf_1d, sym_visited_buf, 0, 0, width, height, blk,
-                     streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                     order=MemcpyOrder.COL_MAJOR, nonblock=True)
   parent_local_buf_1d = np.zeros(height * width * blk, np.uint32)
   runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
                      streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
@@ -340,7 +341,7 @@ def main():
 
   d2h_cycles = None
   if need_timing:
-    runner.launch("f_toc", nonblock=False)  # blocks -> both d2h reads above are done
+    runner.launch("f_toc", nonblock=False)  # blocks -> the d2h read above is done
     d2h_cycles = read_tic_toc_delta(runner, sym_tsc_start_buffer, sym_tsc_end_buffer, height, width)
 
   # rounds_completed is needed regardless (tree plot's round-count label,
@@ -362,11 +363,10 @@ def main():
 
   runner.stop()
 
-  device_visited = extract_diag_result(n, blk, P, oned_to_hwl_colmajor(
-      height, width, blk, visited_buf_1d, np.float32))
   device_parent = extract_parent_result(
       n, blk, P, np.reshape(parent_local_buf_1d, (height, width, blk), order="F"))
   device_parent[source] = source  # root, not "undiscovered" -- see bool_pe.csl's module docstring
+  device_visited = derive_visited_from_parent(n, device_parent, source)
 
   scipy_parent = scipy_visited = scipy_levels = None
   mismatch = n_mismatch = scipy_ok = scipy_diff_device = None
@@ -450,10 +450,10 @@ def main():
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
     row.update(row_cols)
 
-    search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles
+    search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles + int(d2h_cycles.max())
     row["search_time_cycles"] = search_time_cycles
-    print(f"[[ search_time_cycles (h2d_seed + device rounds, GRAPH500_BENCHMARK.md section 3): "
-          f"{search_time_cycles} ]]")
+    print(f"[[ search_time_cycles (h2d_seed + device rounds + d2h parent readback, "
+          f"GRAPH500_BENCHMARK.md section 3): {search_time_cycles} ]]")
 
     coo = A_csr.tocoo()
     m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(

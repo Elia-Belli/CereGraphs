@@ -19,6 +19,15 @@
       EVERY fresh f_spmv_iter() call (see its own comments on why
       overwriting, not OR-ing, is safe for repeated launches in the same
       session) -- no separate host-side reset step is needed or sent.
+    - each search's own timed portion runs from seeding x_buf through
+      reading parent_local_buf back into host memory -- the reference
+      implementation's own run_bfs(root, pred) signature makes the
+      predecessor array the sole official output (no separate "visited"
+      readback exists in the spec at all), so that's the only d2h transfer
+      that needs to be part of search_time_cycles. visited is derived
+      host-side from parent alone (device_io.derive_visited_from_parent) --
+      provably equivalent to reading visited_buf separately, see its own
+      docstring -- so no other readback is needed or timed.
 
   run_bfs.py remains the single-search deep-dive tool (tree plot, verbose
   per-phase breakdown, --show-parent-mismatch); this script trades that
@@ -45,8 +54,8 @@ from scipy.sparse.csgraph import breadth_first_order
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode_phase_row,
                          read_tic_toc_delta)
 from bfs_tree_plot import invalid_parents
-from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
-                        extract_parent_result, hwl_to_oned_colmajor, oned_to_hwl_colmajor)
+from device_io import (csl_compile_core, derive_visited_from_parent, dist_x_to_diag_hwl,
+                        extract_parent_result, hwl_to_oned_colmajor)
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
@@ -241,7 +250,6 @@ def main():
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_trace=True)
 
   sym_x_buf = runner.get_id("x_buf")
-  sym_visited_buf = runner.get_id("visited_buf")
   sym_parent_local_buf = runner.get_id("parent_local_buf")
   sym_rounds_completed = runner.get_id("rounds_completed")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
@@ -333,16 +341,18 @@ def main():
     # fresh f_spmv_iter() call -- see the module docstring above.
     runner.launch("f_spmv_iter", nonblock=False)
 
+    # Graph500's own output is exactly the predecessor/parent array (see
+    # GRAPH500_BENCHMARK.md section 1 -- the reference implementation's
+    # run_bfs(root, pred) signature) -- derive_visited_from_parent() below
+    # recovers visited from parent_local_buf alone, so only that one
+    # transfer needs to be timed as the search's "output written to memory"
+    # cost, and it's folded into search_time_cycles below.
     runner.launch("f_tic", nonblock=True)
-    visited_buf_1d = np.zeros(height * width * blk, np.float32)
-    runner.memcpy_d2h(visited_buf_1d, sym_visited_buf, 0, 0, width, height, blk,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=True)
     parent_local_buf_1d = np.zeros(height * width * blk, np.uint32)
     runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
-    runner.launch("f_toc", nonblock=False)  # blocks -> both d2h reads above are done
+    runner.launch("f_toc", nonblock=False)  # blocks -> the d2h read above is done
     d2h_cycles = read_tic_toc_delta(runner, sym_tsc_start_buffer, sym_tsc_end_buffer,
                                      height, width)
 
@@ -358,11 +368,10 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     ts_hwl_u32 = np.reshape(ts_buf_1d, (height, width, ts_len), order="F")
 
-    device_visited = extract_diag_result(n, blk, P, oned_to_hwl_colmajor(
-        height, width, blk, visited_buf_1d, np.float32))
     device_parent = extract_parent_result(
         n, blk, P, np.reshape(parent_local_buf_1d, (height, width, blk), order="F"))
     device_parent[source] = source
+    device_visited = derive_visited_from_parent(n, device_parent, source)
 
     scipy_ok = None
     if need_correctness:
@@ -381,7 +390,7 @@ def main():
 
     row_cols, device_time_cycles, profiled_rounds = decode_phase_row(
         ts_hwl_u32, height, width, max_rounds, rounds_completed, verbose=False)
-    search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles
+    search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles + int(d2h_cycles.max())
     m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(
         A_coo_static, device_visited, is_symmetric, search_time_cycles)
 
