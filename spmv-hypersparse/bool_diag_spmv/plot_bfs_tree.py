@@ -563,7 +563,7 @@ def main():
     out_path = args.out
   else:
     matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
-    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
+    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots", "tree")
     out_path = os.path.join(plots_dir, f"{matrix_stem}_{np_cols}x{np_rows}_src{source}.png")
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=600)

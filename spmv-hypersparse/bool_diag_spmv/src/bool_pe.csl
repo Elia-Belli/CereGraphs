@@ -83,6 +83,7 @@ param blk: u16;                 // per-PE dense vector chunk size = ceil(n/P)
 param max_local_nnz: u16;       // max local number of nonzeros (matrix structure only, no vals)
 param max_local_nnz_cols: u16;  // max local number of nonzero columns
 param max_local_nnz_rows: u16;  // max local number of nonzero rows
+param max_rounds: u16;          // upper bound on f_spmv_iter rounds profiled by ts_buf below
 
 const compute_task_id: local_task_id = @get_local_task_id(10);
 const reduce_done_task_id: local_task_id = @get_local_task_id(11);
@@ -107,6 +108,71 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const timestamp = @import_module("<time>");
 var tsc_start_buffer = @zeros([timestamp.tsc_size_words]u16);
 var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
+
+// Per-round, per-phase timing (f_spmv_iter only -- see record_ts() below).
+// One raw hardware timestamp is captured at each of these round-boundary
+// points; host-side (bench_timing.py) subtracts consecutive pairs (as
+// 48-bit values, cerebras.sdk.sdk_utils.make_u48) to get each phase's
+// elapsed cycles, and MID-1/MID-2 vs. the rest gives min/max/avg across
+// PEs once every PE's copy is read back. Two consecutive slots delimit one
+// phase; where a task immediately re-issues the next collective with no
+// other work in between, its entry timestamp doubles as both the previous
+// phase's end and the next phase's start (see the call sites below):
+//   0 TS_VBCAST_ISSUE        -- before mpi_x.broadcast(visited_buf)
+//   1 TS_VBCAST_DONE         -- entry of visited_bcast_done() (visited
+//                                bcast end / vertical x_buf bcast start)
+//   2 TS_COMPUTE_ENTRY       -- entry of compute() (vertical bcast end /
+//                                local compute start)
+//   3 TS_REDUCE_ISSUE        -- before mpi_x.reduce_fadds in compute()
+//                                (local compute end / reduce start)
+//   4 TS_REDUCE_DONE         -- entry of reduce_done() (reduce end / local
+//                                term-condition start)
+//   5 TS_RELAY_ISSUE         -- before mpi_y.reduce_fadds(nz_local) in
+//                                reduce_done() (local term-cond end /
+//                                relay phase A start)
+//   6 TS_TERM_COL_DONE       -- entry of term_col_done() (relay phase A
+//                                [col-reduce] end / phase B start)
+//   7 TS_TERM_ROW_DONE       -- entry of term_row_done() (relay phase B
+//                                [row-reduce] end / phase C start)
+//   8 TS_TERM_ROW_BCAST_DONE -- entry of term_row_bcast_done() (relay
+//                                phase C [row-bcast] end / phase D start)
+//   9 TS_TERM_COL_BCAST_DONE -- entry of term_col_bcast_done() (relay
+//                                phase D [col-bcast] end / relay total end)
+const TS_VBCAST_ISSUE: u16 = 0;
+const TS_VBCAST_DONE: u16 = 1;
+const TS_COMPUTE_ENTRY: u16 = 2;
+const TS_REDUCE_ISSUE: u16 = 3;
+const TS_REDUCE_DONE: u16 = 4;
+const TS_RELAY_ISSUE: u16 = 5;
+const TS_TERM_COL_DONE: u16 = 6;
+const TS_TERM_ROW_DONE: u16 = 7;
+const TS_TERM_ROW_BCAST_DONE: u16 = 8;
+const TS_TERM_COL_BCAST_DONE: u16 = 9;
+const NUM_TS_SLOTS: u16 = 10;
+
+// flat [max_rounds][NUM_TS_SLOTS][3]u16, row-major (round slowest, then
+// slot, then the 3 raw timestamp words) -- see record_ts() for the index
+// arithmetic. No per-call reset needed: the host only ever reads the
+// [0, rounds_completed) prefix (see ../bench_timing.py), so stale entries
+// from a longer PRIOR run past the current run's rounds_completed are
+// simply never looked at.
+var ts_buf = @zeros([max_rounds * NUM_TS_SLOTS * 3]u16);
+var ts_scratch = @zeros([timestamp.tsc_size_words]u16);
+// which round record_ts() below should file its captures under -- see the
+// two assignment sites (start_spmv(), term_col_bcast_done()) for why this
+// can't just be rounds_completed[0] directly (that counter increments
+// mid-round, in reduce_done(), before the relay phases' own captures).
+var ts_round: u16 = 0;
+
+fn record_ts(round: u16, slot: u16) void {
+    if (round < max_rounds) {
+        timestamp.get_timestamp(&ts_scratch);
+        const base: u16 = (round * NUM_TS_SLOTS + slot) * 3;
+        ts_buf[base] = ts_scratch[0];
+        ts_buf[base + 1] = ts_scratch[1];
+        ts_buf[base + 2] = ts_scratch[2];
+    }
+}
 
 // queues/dsr_ids mirror gemm-collectives_2d/pe.csl -- they don't conflict
 // with memcpy's queue 0.
@@ -233,6 +299,7 @@ var ptr_local_nnz_rows: [*]u16 = &local_nnz_rows;
 
 var ptr_tsc_start_buffer: [*]u16 = &tsc_start_buffer;
 var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
+var ptr_ts_buf: [*]u16 = &ts_buf;
 
 var pcol_id: u16;
 var prow_id: u16;
@@ -296,6 +363,11 @@ fn start_spmv() void {
     }
 
     if (is_iterative) {
+        // rounds_completed[0] == 0 here (just set above) -- see ts_round's
+        // own comment for why this can't be read directly at every capture
+        // site instead.
+        ts_round = rounds_completed[0];
+        record_ts(ts_round, TS_VBCAST_ISSUE);
         // distribute this row-block's just-seeded visited_buf to every PE
         // in the row before compute() runs its first round -- see
         // visited_bcast_done() and the module docstring above. Every PE in
@@ -314,6 +386,9 @@ fn start_spmv() void {
 }
 
 task visited_bcast_done() void {
+    // only ever activated from an is_iterative path (see start_spmv()/
+    // term_col_bcast_done()) -- safe to record unconditionally.
+    record_ts(ts_round, TS_VBCAST_DONE);
     // every PE in the row now has an up-to-date copy of this row-block's
     // visited_buf -- safe for compute() to gate parent tracking on. Phase 1
     // proper: broadcast x_buf down the column, same as always.
@@ -338,6 +413,9 @@ fn f_spmv_iter() void {
 }
 
 task compute() void {
+    if (is_iterative) {
+        record_ts(ts_round, TS_COMPUTE_ENTRY);
+    }
     // compute() runs once per round: reset the scratch/output state so a
     // previous round's flags don't leak into this one (a row that was
     // reachable last round but isn't touched this round must go back to 0,
@@ -401,6 +479,9 @@ task compute() void {
         }
     }
 
+    if (is_iterative) {
+        record_ts(ts_round, TS_REDUCE_ISSUE);
+    }
     // phase 2: reduce this row's local contributions toward its diagonal
     // column (== prow_id). Boolean OR via add-then-nonzero (values are
     // 0.0/1.0, so sum > 0 <=> OR); the host treats y_buf as boolean on
@@ -419,6 +500,7 @@ task reduce_done() void {
         sys_mod.unblock_cmd_stream();
         return;
     }
+    record_ts(ts_round, TS_REDUCE_DONE);
 
     if (pcol_id == prow_id) {
         // This is a diagonal PE: its y_buf is this round's raw (unmasked)
@@ -453,6 +535,7 @@ task reduce_done() void {
     }
 
     rounds_completed[0] += 1;
+    record_ts(ts_round, TS_RELAY_ISSUE);
     // start the termination-check relay -- see the comment on
     // nz_local/nz_col/nz_total above and term_col_done()/term_row_done()
     // /term_row_bcast_done()/term_col_bcast_done() below for the other
@@ -475,6 +558,9 @@ task reduce_done() void {
 // <collectives_2d> was adopted to avoid (see the module docstring above) --
 // only worth doing if profiling shows this phase is an actual bottleneck.
 task term_col_done() void {
+    // only ever activated from reduce_done()'s is_iterative-only relay
+    // start -- safe to record unconditionally.
+    record_ts(ts_round, TS_TERM_COL_DONE);
     // column-reduce done: row MID of every column now holds that column's
     // diagonal flag in nz_col. Row-reduce along row MID next, combining
     // all P columns' flags into nz_total at (MID, MID).
@@ -483,22 +569,30 @@ task term_col_done() void {
 }
 
 task term_row_done() void {
+    record_ts(ts_round, TS_TERM_ROW_DONE);
     // row-reduce done: (MID, MID) now holds nz_total = sum over all P rows'
     // flags. Flood it back out, row first...
     mpi_x.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_row_bcast_done_task_id);
 }
 
 task term_row_bcast_done() void {
+    record_ts(ts_round, TS_TERM_ROW_BCAST_DONE);
     // ...then down every column, so literally every PE ends up with the
     // same nz_total.
     mpi_y.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_col_bcast_done_task_id);
 }
 
 task term_col_bcast_done() void {
+    record_ts(ts_round, TS_TERM_COL_BCAST_DONE);
     // every PE now agrees on nz_total: != 0.0 means at least one row found
     // something new this round, so it's worth broadcasting x_buf again.
     // No round-count cap -- this is the only condition that ends the loop.
     if (nz_total[0] != 0.0) {
+        // rounds_completed[0] was already incremented (in reduce_done())
+        // to reflect the round that just finished -- which is exactly the
+        // 0-indexed index of the round about to start.
+        ts_round = rounds_completed[0];
+        record_ts(ts_round, TS_VBCAST_ISSUE);
         // distribute this round's just-updated visited_buf across each row
         // before looping back into compute() -- see visited_bcast_done()
         // and the module docstring above.
@@ -532,6 +626,7 @@ comptime {
     @export_symbol(ptr_local_nnz_rows, "local_nnz_rows");
     @export_symbol(ptr_tsc_start_buffer, "tsc_start_buffer");
     @export_symbol(ptr_tsc_end_buffer, "tsc_end_buffer");
+    @export_symbol(ptr_ts_buf, "ts_buf");
 
     @export_symbol(f_spmv);
     @export_symbol(f_spmv_iter);

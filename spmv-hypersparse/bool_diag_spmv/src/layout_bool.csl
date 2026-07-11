@@ -22,6 +22,11 @@ param blk: u16;                 // per-PE dense vector chunk size = ceil(n/P)
 param max_local_nnz: u16;
 param max_local_nnz_cols: u16;
 param max_local_nnz_rows: u16;
+// upper bound on f_spmv_iter rounds profiled by ts_buf (see bool_pe.csl) --
+// defaulted so existing callers (run_bool.py/test_iterative.py/
+// plot_bfs_tree.py) that don't care about per-round timing don't need to
+// pass anything; bench_timing.py overrides it explicitly.
+param max_rounds: u16 = 10;
 
 comptime {
     // the diagonal-target design requires a square grid: every row/column
@@ -58,6 +63,7 @@ layout {
                 .max_local_nnz = max_local_nnz,
                 .max_local_nnz_cols = max_local_nnz_cols,
                 .max_local_nnz_rows = max_local_nnz_rows,
+                .max_rounds = max_rounds,
             });
         } // while py
     } // while px
@@ -80,6 +86,7 @@ layout {
 
     @export_name("tsc_start_buffer", [*]u16, true);
     @export_name("tsc_end_buffer", [*]u16, true);
+    @export_name("ts_buf", [*]u16, true);
 
     @export_name("f_spmv", fn()void);
     @export_name("f_spmv_iter", fn()void);

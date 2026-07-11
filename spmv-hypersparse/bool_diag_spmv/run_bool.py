@@ -138,6 +138,7 @@ def csl_compile_core(
     channels: int,
     width_west_buf: int,
     width_east_buf: int,
+    max_rounds: Optional[int] = None,
 ):
   comp_dir = elf_dir
 
@@ -153,6 +154,10 @@ def csl_compile_core(
     args.append(f"--params=max_local_nnz:{max_local_nnz}")
     args.append(f"--params=max_local_nnz_cols:{max_local_nnz_cols}")
     args.append(f"--params=max_local_nnz_rows:{max_local_nnz_rows}")
+    # left at layout_bool.csl's own default (32) unless a caller (see
+    # bench_timing.py) needs per-round timing over a deeper BFS.
+    if max_rounds is not None:
+      args.append(f"--params=max_rounds:{max_rounds}")
 
     args.append(f"-o={comp_dir}")
     if arch is not None:
