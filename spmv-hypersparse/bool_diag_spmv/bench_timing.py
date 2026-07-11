@@ -65,6 +65,31 @@
   roots per graph), h2d_matrix is paid once and amortized; h2d_seed is
   paid every search, same as d2h.
 
+  search_time_cycles / m_edges_traversed / visited_count / gteps implement
+  the in-scope half of GRAPH500_BENCHMARK.md's TEPS definition (sections
+  3/4/6): search_time_cycles = h2d_seed's worst-case-PE cycles + every
+  profiled round's on-device phases (worst-case PE per phase, summed) --
+  h2d_matrix/d2h stay excluded from it for now (see the doc's placeholder
+  sections). m_edges_traversed uses one of two conventions depending on
+  matrix_symmetric (recorded in m_convention): for a symmetric (undirected)
+  A_csr, the reference implementation's own dedup rule (self-loops counted
+  once, each non-self-loop edge counted once total, not twice) --
+  Graph500-spec-comparable. For a directed A_csr (the BFS kernel itself has
+  no symmetry requirement -- only Graph500's own edge-counting convention
+  does), every directed edge whose source was visited instead (matches what
+  the SpMV kernel actually examines: each visited vertex's out-edges,
+  exactly once, the round it's in the active frontier) -- a real,
+  meaningful count, just not directly comparable to a Graph500-spec number.
+  See GRAPH500_BENCHMARK.md section 4 for both formulas and how the
+  non-symmetric case was discovered (a real test matrix, rand600.mtx,
+  produced an m over its own nnz/2 upper bound under the undirected rule).
+  GTEPS = m / (search_time_cycles / clock_freq_hz) / 1e9 -- the
+  conventional Graph500-reporting unit (10^9 edges/s), since raw TEPS
+  values run into the millions/billions. CLOCK_FREQ_HZ is a plain
+  assumed constant (875 MHz), not calibrated against this simulator run in
+  any way -- same "not an absolute hardware-calibrated figure" caveat this
+  repo's other tsc-based timing already carries.
+
   How to compile and run
      cs_python bench_timing.py --arch=wse3 --num_pe_cols=8 --num_pe_rows=8
         --channels=1 --driver=<path to cslc> --infile_mtx=<path to mtx file>
@@ -80,8 +105,8 @@ from datetime import datetime, timezone
 
 import numpy as np
 from preprocess_bool import preprocess
-from run_bool import (csl_compile_core, dist_x_to_diag_hwl,
-                       hwl_to_oned_colmajor)
+from run_bool import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
+                       hwl_to_oned_colmajor, oned_to_hwl_colmajor)
 from scipy.io import mmread
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
@@ -117,6 +142,13 @@ PHASES = [
     ("relay_row_bcast", TS_TERM_ROW_DONE, TS_TERM_ROW_BCAST_DONE),
     ("relay_col_bcast", TS_TERM_ROW_BCAST_DONE, TS_TERM_COL_BCAST_DONE),
     ("relay_total", TS_RELAY_ISSUE, TS_TERM_COL_BCAST_DONE),
+]
+
+# on-device phases that make up the Graph500-style "search time" (see
+# GRAPH500_BENCHMARK.md section 3) -- relay_total is used directly instead
+# of its own 4 relay_col/row_* sub-phases, to avoid double-counting.
+SEARCH_TIME_PHASES = [
+    "visited_bcast", "vertical_bcast", "local_compute", "reduce", "local_term_cond", "relay_total",
 ]
 
 
@@ -170,6 +202,10 @@ def decode_round_timestamps(ts_hwl_u32, height, width, max_rounds):
 # timestamp.tsc_size_words in bool_pe.csl -- the <time> library's fixed
 # [3]u16 timestamp width (see SKILL-LIBRARIES.md's <time> entry).
 TSC_WORDS = 3
+
+# WSE clock frequency, for converting search_time_cycles -> seconds for
+# GTEPS (GRAPH500_BENCHMARK.md section 5/6).
+CLOCK_FREQ_HZ = 875e6
 
 
 def read_tic_toc_delta(runner, sym_tsc_start, sym_tsc_end, height, width):
@@ -236,6 +272,23 @@ def main():
   assert 0 <= source < n, f"--source={source} out of range [0, {n})"
 
   print(f"Load matrix A, {nrows}-by-{ncols} with {nnz} nonzeros (structural, boolean)")
+
+  # Graph500's own m formula (the undirected dedup rule below) only makes
+  # sense for a symmetrized graph -- true for gen_rmat.py's output (it
+  # symmetrizes and drops self-loops explicitly) but NOT guaranteed for an
+  # arbitrary --infile_mtx. The BFS kernel itself has no such requirement
+  # (it computes y = OR_j(A[i,j] AND x[j]) correctly on any square boolean
+  # matrix, directed or not) -- only Graph500-style edge counting cares.
+  # For a non-symmetric A_csr we use a different, directed-appropriate m
+  # instead (see below), not a "meaningless" placeholder -- see
+  # GRAPH500_BENCHMARK.md section 4.
+  is_symmetric = (A_csr != A_csr.T).nnz == 0
+  if not is_symmetric:
+    print("[[ NOTE: A_csr is not symmetric (a directed graph, not gen_rmat.py's undirected "
+          "style) -- using the directed edges-traversed formula instead of Graph500's own "
+          "undirected dedup rule; not directly comparable to a Graph500-spec TEPS number, but "
+          "still a real, meaningful edges-traversed count for this graph. See "
+          "GRAPH500_BENCHMARK.md section 4. ]]")
 
   A_csc = A_csr.tocsc(copy=True)
   A_csc = A_csc.sorted_indices()
@@ -443,6 +496,7 @@ def main():
       "channels": channels,
       "rounds_completed": rounds_completed,
       "max_rounds": max_rounds,
+      "matrix_symmetric": is_symmetric,
   }
 
   # one-shot transfers (not per-round) -- single min/max/avg cycle counts,
@@ -459,17 +513,70 @@ def main():
           f"avg={cycles.mean():.1f}")
 
   print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
+  phase_max_by_name = {}
   for name, start_slot, end_slot in PHASES:
     # cycles per round, per PE -- shape (P*P, profiled_rounds)
     cycles = ts[:, :, end_slot] - ts[:, :, start_slot]
     per_round_min = cycles.min(axis=0)
     per_round_max = cycles.max(axis=0)
     per_round_avg = cycles.mean(axis=0)
+    phase_max_by_name[name] = per_round_max
     row[f"{name}_min_cycles"] = ";".join(str(int(v)) for v in per_round_min)
     row[f"{name}_max_cycles"] = ";".join(str(int(v)) for v in per_round_max)
     row[f"{name}_avg_cycles"] = ";".join(f"{v:.1f}" for v in per_round_avg)
     print(f"  {name:>18s}: min={per_round_min.tolist()} "
           f"max={per_round_max.tolist()} avg={np.round(per_round_avg, 1).tolist()}")
+
+  # Graph500-style search time (GRAPH500_BENCHMARK.md section 3): seed h2d
+  # (worst-case PE) + every profiled round's on-device phases (worst-case
+  # PE per phase, summed) -- h2d_matrix/d2h stay excluded for now, see the
+  # doc's placeholder sections.
+  device_time_cycles = sum(int(phase_max_by_name[name].sum()) for name in SEARCH_TIME_PHASES)
+  search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles
+  row["search_time_cycles"] = search_time_cycles
+  print(f"[[ search_time_cycles (h2d_seed + device rounds, GRAPH500_BENCHMARK.md section 3): "
+        f"{search_time_cycles} ]]")
+
+  # m (edges traversed, GRAPH500_BENCHMARK.md section 4): needs the final
+  # visited vector, which nothing else in this script actually decodes
+  # (only its d2h transfer time is measured above) -- decode it now, same
+  # helper test_iterative.py/plot_bfs_tree.py already use.
+  visited_hwl = oned_to_hwl_colmajor(height, width, blk, visited_buf_1d, np.float32)
+  visited = extract_diag_result(n, blk, P, visited_hwl)
+  coo = A_csr.tocoo()
+  if is_symmetric:
+    # Graph500's own rule: dedup each undirected edge to one direction
+    # (self-loops, if any, satisfy col == row and are kept once).
+    m = int(np.sum(visited[coo.row] & (coo.col <= coo.row)))
+    m_convention = "undirected_dedup"
+  else:
+    # directed graph, no mirror edge to dedup against -- count every
+    # directed edge whose SOURCE (col, our row=dest/col=source convention)
+    # was visited, matching what the SpMV kernel actually examines: every
+    # visited vertex's out-edges get examined exactly once, the round it's
+    # in the active frontier (see bool_pe.csl's compute()).
+    m = int(np.sum(visited[coo.col]))
+    m_convention = "directed_source_visited"
+  row["visited_count"] = int(np.sum(visited))
+  row["m_edges_traversed"] = m
+  row["m_convention"] = m_convention
+  print(f"[[ visited_count = {row['visited_count']} / {n}, m_edges_traversed = {m} "
+        f"({m_convention}) ]]")
+
+  # GTEPS (GRAPH500_BENCHMARK.md section 6): m / search_time_seconds, in
+  # units of 10^9 edges/s -- the conventional Graph500-reporting unit
+  # (raw TEPS values run into the millions/billions and are unwieldy).
+  # search_time_cycles/h2d_matrix/d2h stay in scope-as-documented (section
+  # 2/3) -- only cycles -> seconds -> GTEPS is new here.
+  search_time_seconds = search_time_cycles / CLOCK_FREQ_HZ
+  gteps = m / search_time_seconds / 1e9 if search_time_seconds > 0 else float("nan")
+  row["clock_freq_hz"] = CLOCK_FREQ_HZ
+  row["search_time_seconds"] = search_time_seconds
+  row["gteps"] = gteps
+  print(f"[[ GTEPS = {m} edges ({m_convention}) / {search_time_seconds * 1e6:.2f} us "
+        f"(@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = {gteps:.6f} GTEPS ]]"
+        + ("" if is_symmetric else "  -- directed graph: not a Graph500-spec-comparable GTEPS, "
+                                    "see m_convention"))
 
   csv_path = args.csv
   if csv_path is None:
