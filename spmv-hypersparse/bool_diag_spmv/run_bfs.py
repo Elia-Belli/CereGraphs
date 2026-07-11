@@ -103,11 +103,14 @@ def parse_args():
   parser.add_argument("--out-timing", default=None,
                        help="timing plot output path (default: plots/timing/timing_<matrix>_"
                             "<grid>_src<N>_ch<C>.png)")
-  parser.add_argument("--show-parent-mismatch", action="store_true",
-                       help="also color-highlight (orange, tree plot only) nodes where our "
+  parser.add_argument("--no-show-parent-mismatch", dest="show_parent_mismatch",
+                       action="store_false",
+                       help="don't color-highlight (orange, tree plot only) nodes where our "
                             "parent choice differs from scipy's own breadth_first_order pick -- "
-                            "EXPECTED whenever a node has multiple valid predecessors (see "
-                            "bfs_tree_plot.invalid_parents()'s docstring), not a bug")
+                            "on by default. These are EXPECTED whenever a node has multiple "
+                            "valid predecessors (see bfs_tree_plot.invalid_parents()'s "
+                            "docstring), not a bug")
+  parser.set_defaults(show_parent_mismatch=True)
   return parser.parse_args()
 
 
