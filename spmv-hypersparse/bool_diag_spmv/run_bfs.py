@@ -55,8 +55,8 @@ import plot_bfs_timing
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode_phase_row,
                          read_tic_toc_delta)
 from bfs_tree_plot import build_digraph, invalid_parents, render_tree_comparison
-from device_io import (csl_compile_core, derive_visited_from_parent, dist_x_to_diag_hwl,
-                        extract_parent_result, hwl_to_oned_colmajor)
+from device_io import (csl_compile_core, derive_visited_from_parent, extract_parent_result,
+                        hwl_to_oned_colmajor, single_source_seed_pe)
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
@@ -200,9 +200,10 @@ def main():
   # single-source seed -- a real BFS workload, not run_host_driven_bfs.py's
   # random ~50%-density stress frontier (which would mask most rounds'
   # costs behind one giant first round, and wouldn't be a single tree).
-  x_bool0 = np.zeros(n, dtype=bool)
-  x_bool0[source] = True
-  x_hwl0 = dist_x_to_diag_hwl(n, x_bool0, blk, P)
+  # Only the one diagonal PE owning `source` needs a real host write -- see
+  # single_source_seed_pe()'s own docstring for why every other PE's x_buf
+  # is already provably zero.
+  seed_px, seed_py, seed_local_x = single_source_seed_pe(source, blk, P)
 
   fabric_offset_x = 1
   fabric_offset_y = 1
@@ -310,8 +311,7 @@ def main():
     print("timing h2d: seed x upload (Graph500-style per-search cost)...")
     runner.launch("f_tic", nonblock=True)
 
-  x_buf_1d = hwl_to_oned_colmajor(height, width, blk, x_hwl0, np.float32)
-  runner.memcpy_h2d(sym_x_buf, x_buf_1d, 0, 0, width, height, blk,
+  runner.memcpy_h2d(sym_x_buf, seed_local_x, seed_px, seed_py, 1, 1, blk,
                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                      order=MemcpyOrder.COL_MAJOR, nonblock=False)
 

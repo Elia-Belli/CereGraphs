@@ -63,6 +63,35 @@ def dist_x_to_diag_hwl(n, x_bool, blk, P):
   return x_hwl
 
 
+def single_source_seed_pe(source, blk, P):
+  """For a genuinely single-source BFS seed (exactly one true bit, at
+  `source`), return (px, py, local_x) for the ONE diagonal PE that owns
+  it -- px=py=source//blk (diagonal: column==row), local_x a length-blk
+  float32 array with a single 1.0 at local index source%blk. Pair with a
+  1x1-region memcpy_h2d instead of dist_x_to_diag_hwl's full (P,P,blk)
+  rectangle: every OTHER diagonal PE's x_buf is provably already zero
+  (bool_pe.csl's reduce_done() sets x_buf[i] = newly every round including
+  the last, and the loop's own termination condition, nz_total == 0, is a
+  non-negative sum over every diagonal PE's own nz_local flag -- which is
+  1.0 iff that PE's own x_buf had any nonzero entry -- so nz_total == 0
+  provably means every diagonal PE's x_buf is all-zero at the moment
+  f_spmv_iter() returns; combined with x_buf's zero state at kernel load,
+  this holds for the very first search too), and non-diagonal PEs never
+  need a host write at all regardless (every PE's x_buf is unconditionally
+  overwritten by that round's own column-broadcast, in
+  visited_bcast_done(), before compute() ever reads it).
+
+  Only valid for this single-source, f_spmv_iter case -- NOT for
+  run_host_driven_bfs.py's multi-source frontier (several diagonal PEs can
+  be genuinely live at once there) or run_single_spmv.py's one-shot
+  f_spmv (which never touches x_buf itself, so has no such self-zeroing
+  invariant)."""
+  p = source // blk
+  local_x = np.zeros(blk, dtype=np.float32)
+  local_x[source % blk] = 1.0
+  return p, p, local_x
+
+
 # Extract the diagonal PEs' y_buf (the only ones holding a meaningful final
 # result) and reassemble into the length-n boolean output vector.
 def extract_diag_result(n, blk, P, y_hwl):

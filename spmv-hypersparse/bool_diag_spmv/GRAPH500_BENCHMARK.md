@@ -264,3 +264,51 @@ fix, so its own numbers moved too (e.g. on `data/rmat4.4x4.lb.mtx`,
 What's left is everything in section 5 above: only the clock-frequency
 calibration caveat remains open; root selection and `d2h` are both
 resolved.
+
+## 7. `h2d_seed` optimization: one PE, not the whole grid
+
+**The old approach**: `dist_x_to_diag_hwl()` built a dense `(P, P, blk)`
+host array (real data only at diagonal positions, zero elsewhere) and
+`memcpy_h2d` wrote the *entire* `P x P` grid, every search -- even though a
+single-source seed has exactly one nonzero bit, landing in exactly one
+diagonal PE's block.
+
+**Why the other `P-1` diagonal PEs never needed that write at all**: traced
+through `bool_pe.csl`'s `reduce_done()`, which sets `x_buf[i] = newly` at
+every diagonal PE, every round including the last. The loop's own
+termination condition (`nz_total == 0`) is a **non-negative sum** over
+every diagonal PE's own `nz_local` flag (1.0 iff that PE's own `x_buf` had
+any nonzero entry that round) -- a non-negative sum can only be zero if
+every term is zero, so `nz_total == 0` *provably* means every diagonal
+PE's entire `x_buf` is all-zero at the moment `f_spmv_iter()` returns
+control to the host. Combined with `x_buf`'s zero state at kernel load,
+this holds even for the very first search. Non-diagonal PEs never needed a
+host write in the first place, single- or multi-source: every PE's
+`x_buf` is unconditionally overwritten by that round's own column-
+broadcast (`visited_bcast_done()`) before `compute()` ever reads it.
+
+**Fixed**: `device_io.single_source_seed_pe(source, blk, P)` returns just
+`(px, py, local_x)` for the one owning diagonal PE (`px = py = source //
+blk`, a length-`blk` array with a single 1.0), and both `run_bfs.py` and
+`run_graph500.py` now do a `1x1`-region `memcpy_h2d` instead of the
+full-grid one. Confirmed via the SDK's own `sdkruntimepybind` docs and its
+bundled `gemv-06-routes-1` tutorial that a non-origin `(px, py)` with
+`w=1, h=1` is a normal, documented way to target exactly one PE (`px` =
+column, `py` = row).
+
+**Only valid for this single-source, `f_spmv_iter` case** -- NOT for
+`run_host_driven_bfs.py`'s multi-source frontier (several diagonal PEs can
+be genuinely live at once there, needs the general `dist_x_to_diag_hwl`
+path) or `run_single_spmv.py`'s one-shot `f_spmv` (never touches `x_buf`
+itself, so has no such self-zeroing invariant).
+
+**Verified**: 0 correctness failures before and after, on both the 4x4/16-
+vertex fixture and `data/rmat_s8_e4.mtx` (256 vertices, 8x8 grid). Cycle
+savings were modest in testing (e.g. 4x4 grid: `h2d_seed` max 1485 -> 1401
+cycles) -- a fixed per-transfer configure/FSM/teardown cost dominates at
+these small payload sizes, the same effect noted elsewhere in this
+codebase for the termination relay (see `bool_pe.csl`'s own TODO on
+`reduce_fadds` overhead). Still strictly less data moved and less
+host-side array construction (previously `O(P^2)`, now `O(1)`), and the
+more architecturally correct amount of work regardless of whether it shows
+up as a large cycle win at these particular grid sizes.
