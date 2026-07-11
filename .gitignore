@@ -4,6 +4,7 @@ out_wse3_iterative/
 out_plot/
 out_wse3_bfs/
 out_wse3_iter/
+out_wse3_graph500/
 
 simfab_traces/
 wio_flows*

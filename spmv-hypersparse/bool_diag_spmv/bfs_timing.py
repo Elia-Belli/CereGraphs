@@ -114,3 +114,64 @@ def read_tic_toc_delta(runner, sym_tsc_start, sym_tsc_end, height, width):
   tic = _read(sym_tsc_start)
   toc = _read(sym_tsc_end)
   return toc - tic
+
+
+def decode_phase_row(ts_hwl_u32, height, width, max_rounds, rounds_completed, verbose=True):
+  """Decode one search's ts_buf into per-phase min/max/avg CSV columns
+  (semicolon-joined per-round strings, same shape run_bfs.py has always
+  logged) plus each phase's straggler-PE-max summed across rounds for
+  SEARCH_TIME_PHASES -- the on-device portion of GRAPH500_BENCHMARK.md
+  section 3's search_time_cycles (h2d_seed is added by the caller, since
+  it's measured outside this function's tsc bracket). Shared by run_bfs.py
+  (one search, verbose=True) and run_graph500.py (64 searches, verbose=False
+  to avoid flooding stdout with a full phase breakdown per search).
+
+  Returns (row_cols, device_time_cycles, profiled_rounds)."""
+  profiled_rounds = min(rounds_completed, max_rounds)
+  if rounds_completed > max_rounds:
+    print(f"[[ WARNING: BFS ran {rounds_completed} rounds but max_rounds={max_rounds} -- "
+          f"only the first {max_rounds} rounds were timestamped; bump max_rounds to "
+          "profile the rest ]]")
+
+  ts = decode_round_timestamps(ts_hwl_u32, height, width, max_rounds)
+  ts = ts[:, :, :profiled_rounds, :].reshape(height * width, profiled_rounds, NUM_TS_SLOTS)
+
+  row_cols = {}
+  phase_max_by_name = {}
+  for name, start_slot, end_slot in PHASES:
+    cycles = ts[:, :, end_slot] - ts[:, :, start_slot]
+    per_round_min = cycles.min(axis=0)
+    per_round_max = cycles.max(axis=0)
+    per_round_avg = cycles.mean(axis=0)
+    phase_max_by_name[name] = per_round_max
+    row_cols[f"{name}_min_cycles"] = ";".join(str(int(v)) for v in per_round_min)
+    row_cols[f"{name}_max_cycles"] = ";".join(str(int(v)) for v in per_round_max)
+    row_cols[f"{name}_avg_cycles"] = ";".join(f"{v:.1f}" for v in per_round_avg)
+    if verbose:
+      print(f"  {name:>18s}: min={per_round_min.tolist()} "
+            f"max={per_round_max.tolist()} avg={np.round(per_round_avg, 1).tolist()}")
+
+  device_time_cycles = sum(int(phase_max_by_name[name].sum()) for name in SEARCH_TIME_PHASES)
+  return row_cols, device_time_cycles, profiled_rounds
+
+
+def compute_m_and_gteps(A_coo, device_visited, is_symmetric, search_time_cycles,
+                         clock_freq_hz=CLOCK_FREQ_HZ):
+  """m (edges traversed) + GTEPS for one search, per GRAPH500_BENCHMARK.md
+  sections 4/5. A_coo is the caller's A_csr.tocoo() -- passed in rather than
+  recomputed here since run_graph500.py calls this once per search against
+  the SAME static matrix.
+
+  is_symmetric picks the counting convention (see GRAPH500_BENCHMARK.md
+  section 4): Graph500's own undirected dedup rule, or -- for a directed
+  --infile_mtx -- the "edges out of every visited source" convention, still
+  real algorithmic work but not a Graph500-spec-comparable number."""
+  if is_symmetric:
+    m = int(np.sum(device_visited[A_coo.row] & (A_coo.col <= A_coo.row)))
+    m_convention = "undirected_dedup"
+  else:
+    m = int(np.sum(device_visited[A_coo.col]))
+    m_convention = "directed_source_visited"
+  search_time_seconds = search_time_cycles / clock_freq_hz
+  gteps = m / search_time_seconds / 1e9 if search_time_seconds > 0 else float("nan")
+  return m, m_convention, search_time_seconds, gteps

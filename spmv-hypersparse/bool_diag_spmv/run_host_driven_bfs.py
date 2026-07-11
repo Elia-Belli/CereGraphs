@@ -269,7 +269,7 @@ def main():
     print("COMPILE ONLY: EXIT")
     return
 
-  runner = SdkRuntime(dirname, cmaddr=args.cmaddr)
+  runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_trace=True)
 
   sym_x_buf = runner.get_id("x_buf")
   sym_y_buf = runner.get_id("y_buf")

@@ -68,6 +68,20 @@ what's genuinely done versus what's still a stub.
   `run_bfs.py` calls automatically; also runnable standalone
   (`plot_timing_row()`) to re-plot an existing `bfs_timing.csv` row without
   re-running the device.
+- `run_graph500.py` — the full Graph500-shaped benchmark: one compile, one
+  matrix upload (timed once as construction, excluded from every search),
+  then `--num-searches` (default 64, per the spec) single-source BFS
+  searches from distinct random roots (`--seed` for reproducible sampling,
+  `--sources` for an explicit list), each timed individually. Per-search
+  rows go to `graph500_searches.csv`; one summary row per benchmark run
+  (`harmonic_mean_gteps`, `min`/`median`/`max_gteps`, `construction_time_seconds`)
+  goes to `graph500_summary.csv`. Each search re-uploads only its seed
+  `x_buf` — `bool_pe.csl`'s `start_spmv()` already resets
+  `visited_buf`/`rounds_completed`/`parent_local_buf`/`ts_round` on every
+  fresh `f_spmv_iter()` call, so no other host-side reset is needed. Per-
+  search scipy correctness checking is on by default (`--nocorrectness` to
+  skip). See `GRAPH500_BENCHMARK.md` for the full methodology and current
+  status.
 - `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test on
   `../data/rmat4.4x4.lb.mtx` at a 4x4 grid, for WSE-2 and WSE-3 respectively.
   Unlike `original_spmv`/`bfs_spmv`, both scripts compile the *same* `src/` —
@@ -75,6 +89,10 @@ what's genuinely done versus what's still a stub.
   architectures, so there's no separate `src_wse3/` tree here.
 - `commands_wse3_iterative.sh` — same compile as `commands_wse3.sh`, but runs
   `run_host_driven_bfs.py` instead of `run_single_spmv.py`.
+- `commands_wse3_graph500.sh` — same compile as `commands_wse3.sh`, but runs
+  `run_graph500.py` (16 searches over the same tiny 4x4 fixture, kept small
+  purely so this stays a fast smoke test — see `GRAPH500_BENCHMARK.md` for a
+  real-scale run).
 
 ### `run_bfs.py` vs. the two test scripts
 
@@ -89,7 +107,11 @@ correct. Neither does a real single-source BFS run. `run_bfs.py` is the
 separate, user-facing "run an actual BFS and show me the result" tool —
 its own `--nocorrectness` check is a single-source scipy cross-check, not
 `run_host_driven_bfs.py`'s stress test, which stays its own script rather
-than being folded in.
+than being folded in. `run_graph500.py` reuses that same per-search scipy
+check across many roots in one compiled session, rather than adding a
+fourth, separate correctness mechanism — see `GRAPH500_BENCHMARK.md` for
+why it's the right tool once you want an actual GTEPS number instead of
+one root's tree.
 
 ## Design: why the diagonal, and why `<collectives_2d>`
 

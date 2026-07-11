@@ -52,8 +52,8 @@ from scipy.io import mmread
 from scipy.sparse.csgraph import breadth_first_order
 
 import plot_bfs_timing
-from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, PHASES, SEARCH_TIME_PHASES,
-                         decode_round_timestamps, read_tic_toc_delta)
+from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode_phase_row,
+                         read_tic_toc_delta)
 from bfs_tree_plot import build_digraph, invalid_parents, render_tree_comparison
 from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
                         extract_parent_result, hwl_to_oned_colmajor, oned_to_hwl_colmajor)
@@ -238,7 +238,7 @@ def main():
     print("COMPILE ONLY: EXIT")
     return
 
-  runner = SdkRuntime(dirname, cmaddr=args.cmaddr)
+  runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_trace=True)
 
   sym_x_buf = runner.get_id("x_buf")
   sym_visited_buf = runner.get_id("visited_buf")
@@ -424,15 +424,6 @@ def main():
         args.show_parent_mismatch, infile_mtx, np_cols, np_rows, out_tree)
 
   if need_timing:
-    profiled_rounds = min(rounds_completed, max_rounds)
-    if rounds_completed > max_rounds:
-      print(f"[[ WARNING: BFS ran {rounds_completed} rounds but --max-rounds={max_rounds} -- "
-            f"only the first {max_rounds} rounds were timestamped; bump --max-rounds to "
-            "profile the rest ]]")
-
-    ts = decode_round_timestamps(ts_hwl_u32, height, width, max_rounds)
-    ts = ts[:, :, :profiled_rounds, :].reshape(height * width, profiled_rounds, NUM_TS_SLOTS)
-
     row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "infile_mtx": os.path.basename(infile_mtx),
@@ -454,41 +445,25 @@ def main():
       print(f"  {name:>18s}: min={int(cycles.min())} max={int(cycles.max())} "
             f"avg={cycles.mean():.1f}")
 
+    row_cols, device_time_cycles, profiled_rounds = decode_phase_row(
+        ts_hwl_u32, height, width, max_rounds, rounds_completed)
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
-    phase_max_by_name = {}
-    for name, start_slot, end_slot in PHASES:
-      cycles = ts[:, :, end_slot] - ts[:, :, start_slot]
-      per_round_min = cycles.min(axis=0)
-      per_round_max = cycles.max(axis=0)
-      per_round_avg = cycles.mean(axis=0)
-      phase_max_by_name[name] = per_round_max
-      row[f"{name}_min_cycles"] = ";".join(str(int(v)) for v in per_round_min)
-      row[f"{name}_max_cycles"] = ";".join(str(int(v)) for v in per_round_max)
-      row[f"{name}_avg_cycles"] = ";".join(f"{v:.1f}" for v in per_round_avg)
-      print(f"  {name:>18s}: min={per_round_min.tolist()} "
-            f"max={per_round_max.tolist()} avg={np.round(per_round_avg, 1).tolist()}")
+    row.update(row_cols)
 
-    device_time_cycles = sum(int(phase_max_by_name[name].sum()) for name in SEARCH_TIME_PHASES)
     search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles
     row["search_time_cycles"] = search_time_cycles
     print(f"[[ search_time_cycles (h2d_seed + device rounds, GRAPH500_BENCHMARK.md section 3): "
           f"{search_time_cycles} ]]")
 
     coo = A_csr.tocoo()
-    if is_symmetric:
-      m = int(np.sum(device_visited[coo.row] & (coo.col <= coo.row)))
-      m_convention = "undirected_dedup"
-    else:
-      m = int(np.sum(device_visited[coo.col]))
-      m_convention = "directed_source_visited"
+    m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(
+        coo, device_visited, is_symmetric, search_time_cycles)
     row["visited_count"] = int(np.sum(device_visited))
     row["m_edges_traversed"] = m
     row["m_convention"] = m_convention
     print(f"[[ visited_count = {row['visited_count']} / {n}, m_edges_traversed = {m} "
           f"({m_convention}) ]]")
 
-    search_time_seconds = search_time_cycles / CLOCK_FREQ_HZ
-    gteps = m / search_time_seconds / 1e9 if search_time_seconds > 0 else float("nan")
     row["clock_freq_hz"] = CLOCK_FREQ_HZ
     row["search_time_seconds"] = search_time_seconds
     row["gteps"] = gteps

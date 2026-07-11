@@ -2,9 +2,16 @@
 
 This is a separate document from `README.md` on purpose: it's about the
 *benchmark methodology* (what counts as "the BFS time," how TEPS is
-defined) rather than the kernel's own design. Scope right now is narrow —
-get a real TEPS number out of `run_bfs.py` — so **construction and
-readback are left as explicit placeholders below**, not fully resolved.
+defined) rather than the kernel's own design.
+
+Two scripts implement this methodology, at different scope:
+- `run_bfs.py`: single search, single compile + launch, plus a tree plot
+  and verbose per-phase breakdown -- the deep-dive tool for one root.
+- `run_graph500.py`: the full spec-shaped sweep -- one compile, one matrix
+  upload (construction, timed once), then N single-source searches (default
+  64) from distinct random roots, each timed individually and combined via
+  the harmonic mean (section 1). This is what section 6 below now reports
+  against.
 
 ## 1. What Graph500 actually defines
 
@@ -58,20 +65,20 @@ reported alongside.
 
 ## 2. Mapping onto `bool_diag_spmv`
 
-`run_bfs.py` already measures four separate things. Here's how each
-one maps onto the Kernel 1 / Kernel 2 split above:
+Here's how each measured piece maps onto the Kernel 1 / Kernel 2 split
+above:
 
-| `run_bfs.py` component | Graph500 analogue | Status |
+| Component | Graph500 analogue | Status |
 |---|---|---|
-| `h2d_matrix` (`mat_rows_buf`, `mat_col_idx/loc/len_buf`, `y_rows_init_buf`, `local_nnz*`) | **Kernel 1 (construction)** — built once, reused across searches | **Placeholder** — measured, logged, but not yet folded into any TEPS number |
-| `h2d_seed` (`x_buf`, the search root) | Part of Kernel 2 — "immediately prior to visiting the search root" | **In scope now** |
-| on-device BFS rounds (`visited_bcast`, `vertical_bcast`, `local_compute`, `reduce`, `local_term_cond`, `relay_*`, all from `ts_buf`/`record_ts()`) | Kernel 2 itself — the actual `run_bfs()` | **In scope now** |
-| `d2h` (`visited_buf` + `parent_local_buf` readback) | Part of Kernel 2 — "output has been written to memory" | **Placeholder** — measured, logged, but not yet folded into any TEPS number |
+| `h2d_matrix` (`mat_rows_buf`, `mat_col_idx/loc/len_buf`, `y_rows_init_buf`, `local_nnz*`) | **Kernel 1 (construction)** — built once, reused across searches | **Resolved in `run_graph500.py`** — uploaded exactly once per benchmark run, timed separately, excluded from every search's own time (in `run_bfs.py`, which always does one compile + one search, this is logged per-run but not part of `search_time_cycles` either) |
+| `h2d_seed` (`x_buf`, the search root) | Part of Kernel 2 — "immediately prior to visiting the search root" | **In scope** |
+| on-device BFS rounds (`visited_bcast`, `vertical_bcast`, `local_compute`, `reduce`, `local_term_cond`, `relay_*`, all from `ts_buf`/`record_ts()`) | Kernel 2 itself — the actual `run_bfs()` | **In scope** |
+| `d2h` (`visited_buf` + `parent_local_buf` readback) | Part of Kernel 2 — "output has been written to memory" | **Placeholder** — measured, logged (both scripts), but not yet folded into `search_time_cycles`/GTEPS |
 
-The immediate priority is the middle two rows — get a real per-search
-device time and a real TEPS number out of them. `h2d_matrix` and `d2h`
-stay as separately-logged CSV columns for now; whether/how they eventually
-join the TEPS denominator is an open question below, not decided yet.
+`d2h` is the one remaining open item: it's real per-search cost (Graph500's
+own rule times it as part of the search), but folding it in changes every
+existing GTEPS number, so it's deferred until that's a deliberate decision,
+not a side effect of this doc update.
 
 ## 3. Current "search time" definition (cycles, in scope now)
 
@@ -148,40 +155,59 @@ kernel, in whichever round that vertex is in the active frontier (see
 `compute()` in `bool_pe.csl`) — so this counts real, meaningful
 algorithmic work for a directed graph, it's just **not** a Graph500-spec-
 comparable number (the spec has no defined `m` for directed input at all).
-`run_bfs.py` picks the formula automatically based on
-`matrix_symmetric` and records which one was used in the `m_convention`
-column (`"undirected_dedup"` or `"directed_source_visited"`).
+Both `run_bfs.py` and `run_graph500.py` pick the formula automatically
+based on `matrix_symmetric` and record which one was used in the
+`m_convention` column (`"undirected_dedup"` or `"directed_source_visited"`).
 
 ## 5. Known deviations from the full Graph500 protocol (not addressed yet)
 
-- **One search, not 64.** `run_bfs.py` runs a single `--source` per
-  invocation. The harmonic-mean-over-64-searches step doesn't apply until
-  multiple searches per compiled matrix are actually run and aggregated.
+- **Root selection isn't restricted to the giant connected component.**
+  `run_graph500.py` samples roots uniformly from vertices with at least one
+  outgoing edge (any out-degree > 0), not from the giant component
+  specifically. On `data/rmat_s8_e4.mtx` this surfaced two roots landing in
+  tiny (2-vertex) disconnected components, each with `m=1` and GTEPS three
+  orders of magnitude below the rest -- harmonic mean is (correctly)
+  extremely sensitive to this, dragging the reported harmonic-mean GTEPS
+  well below the median for that run. This is real, not a bug: it's exactly
+  what harmonic mean is supposed to do with a disproportionately slow/tiny
+  search. Whether to additionally restrict sampling to the giant component
+  (closer to what real Graph500 reference generators effectively guarantee
+  by construction) is an open methodology question, not yet decided.
 - **Clock frequency is an assumed constant, not calibrated.** `CLOCK_FREQ_HZ
-  = 875 MHz` in `run_bfs.py` converts `search_time_cycles` ->
-  `search_time_seconds` for TEPS, but isn't calibrated against this
-  simulator run in any way -- same "not an absolute hardware-calibrated
-  figure" caveat this repo's other tsc-based timing already carries (see
-  `bool_pe.csl`'s own tsc comment). Revisit if a real reference frequency
-  for the simulator/hardware being targeted becomes available.
-- **`h2d_matrix`/`d2h` placeholder status** (section 2) — needs a decision
-  once the core TEPS number is working: do they belong in the denominator
-  at all for a single-compile/many-searches workload, and if so, amortized
-  how?
+  = 875 MHz` converts `search_time_cycles` -> `search_time_seconds` for
+  TEPS, but isn't calibrated against this simulator run in any way -- same
+  "not an absolute hardware-calibrated figure" caveat this repo's other
+  tsc-based timing already carries (see `bool_pe.csl`'s own tsc comment).
+  Revisit if a real reference frequency for the simulator/hardware being
+  targeted becomes available.
+- **`d2h` placeholder status** (section 2) — needs a decision once the
+  core TEPS number has settled: does readback belong in the denominator,
+  and if so, amortized how?
 
 ## 6. Current status
 
-**Implemented, end to end**: `run_bfs.py` logs `search_time_cycles`,
-`m_edges_traversed`, `m_convention`, `visited_count`, `matrix_symmetric`,
-`clock_freq_hz`, `search_time_seconds`, and `gteps` (GTEPS -- 10^9
-edges/s, the conventional Graph500-reporting unit) for every run. `m`/
-`gteps` are always real, meaningful numbers for whatever graph you give it
-(directed or undirected, see section 4) -- `m_convention` records which
-formula was used, and only `"undirected_dedup"` (i.e. `matrix_symmetric`
-True) is directly comparable to a Graph500-spec TEPS number.
-`"directed_source_visited"` is real algorithmic-work-done information, not
-a lesser or invalid result, just a different (and, for this kernel,
-arguably more natural) counting convention. What's left is everything in
-section 5 above: running all 64 searches instead of 1, deciding
-whether/how `h2d_matrix`/`d2h` join the denominator, and (if it ever
-matters) a calibrated clock frequency instead of the assumed 875 MHz.
+**Implemented, end to end**: `run_graph500.py` runs the full spec-shaped
+sweep -- one compile, one matrix upload (timed once, excluded from every
+search), then N single-source searches (default 64) from distinct random
+roots, each producing `search_time_cycles`, `m_edges_traversed`,
+`m_convention`, `visited_count`, `matrix_symmetric`, `search_time_seconds`,
+and `gteps` (one row per search, appended to `graph500_searches.csv`), plus
+one summary row (`graph500_summary.csv`) with `harmonic_mean_gteps` (the
+spec's own aggregation rule, section 1), `min_gteps`, `median_gteps`,
+`max_gteps`, and `construction_time_seconds`. Between searches, no explicit
+host-side reset is needed beyond re-uploading `x_buf` -- `bool_pe.csl`'s
+`start_spmv()` already reinitializes `visited_buf`/`rounds_completed`/
+`parent_local_buf`/`ts_round` on every fresh `f_spmv_iter()` call (see its
+own comments). Verified against `data/rmat_s8_e4.mtx` (256 vertices, 8x8
+grid): 64/64 searches passed their per-search scipy correctness check
+(`--nocorrectness` to skip, on by default).
+
+`run_bfs.py` remains the single-search deep-dive tool (tree plot, verbose
+per-phase breakdown, `--show-parent-mismatch`) and still logs its own
+`search_time_cycles`/`gteps` for that one search into `bfs_timing.csv` --
+useful for drilling into one specific root's phase breakdown, not for the
+spec's own 64-search aggregate.
+
+What's left is everything in section 5 above: the giant-component root-
+selection question, `d2h`'s denominator status, and (if it ever matters) a
+calibrated clock frequency instead of the assumed 875 MHz.
