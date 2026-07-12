@@ -52,8 +52,8 @@ from scipy.io import mmread
 from scipy.sparse.csgraph import breadth_first_order
 
 import plot_bfs_timing
-from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode_phase_row,
-                         read_tic_toc_delta)
+from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode_pe_phase_cycles,
+                         decode_phase_row, read_tic_toc_delta, save_pe_phase_cycles)
 from bfs_tree_plot import build_digraph, invalid_parents, render_tree_comparison
 from device_io import (csl_compile_core, derive_visited_from_parent, extract_parent_result,
                         hwl_to_oned_colmajor, single_source_seed_pe)
@@ -111,6 +111,15 @@ def parse_args():
                             "valid predecessors (see bfs_tree_plot.invalid_parents()'s "
                             "docstring), not a bug")
   parser.set_defaults(show_parent_mismatch=True)
+
+  parser.add_argument("--dump-pe-timing", action="store_true",
+                       help="save the full per-PE-per-round-per-phase cycle grid to a .npz file "
+                            "(default off -- diagnostic only, for plot_pe_heatmap.py; not part "
+                            "of the default tree/timing/correctness reports)")
+  parser.add_argument("--pe-timing-out", default=None,
+                       help="path for --dump-pe-timing's .npz output (default: plots/heatmap/"
+                            "<matrix>_<grid>_src<N>/<matrix>_<grid>_src<N>.npz -- the same "
+                            "per-run folder plot_pe_heatmap.py renders its PNGs into)")
   return parser.parse_args()
 
 
@@ -449,6 +458,36 @@ def main():
         ts_hwl_u32, height, width, max_rounds, rounds_completed)
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
     row.update(row_cols)
+
+    if args.dump_pe_timing:
+      phase_cycles, _ = decode_pe_phase_cycles(ts_hwl_u32, height, width, max_rounds,
+                                                rounds_completed)
+      matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
+      run_id = f"{matrix_stem}_{np_cols}x{np_rows}_src{source}"
+      # lives inside plots/heatmap/<run_id>/ -- the same per-run folder
+      # plot_pe_heatmap.py renders its PNGs into (it derives that folder
+      # from wherever this .npz actually is, see its default_run_dir()),
+      # so the raw data and its plots stay together as one self-contained
+      # bundle rather than scattered across two top-level directories.
+      pe_timing_out = args.pe_timing_out or os.path.join(
+          os.path.dirname(os.path.abspath(__file__)), "plots", "heatmap", run_id, f"{run_id}.npz")
+      save_pe_phase_cycles(pe_timing_out, phase_cycles, {
+          "infile_mtx": os.path.basename(infile_mtx),
+          "pe_grid": f"{np_cols}x{np_rows}",
+          "source": source,
+          "rounds_completed": rounds_completed,
+          "max_rounds": max_rounds,
+          "profiled_rounds": profiled_rounds,
+      }, structural_grids={
+          # host-side partition structure, computed by preprocess_bool.py
+          # before any device interaction -- for checking by eye whether a
+          # phase's per-PE imbalance (e.g. local_compute) actually tracks
+          # the matrix's own sparsity distribution across PEs.
+          "local_nnz": local_nnz[:, :, 0].astype(np.int64),
+          "local_nnz_cols": local_nnz_cols[:, :, 0].astype(np.int64),
+          "local_nnz_rows": local_nnz_rows[:, :, 0].astype(np.int64),
+      })
+      print(f"saved per-PE timing grid to {pe_timing_out}")
 
     search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles + int(d2h_cycles.max())
     row["search_time_cycles"] = search_time_cycles

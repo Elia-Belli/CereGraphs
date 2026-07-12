@@ -240,6 +240,10 @@ var visited_buf = @zeros([blk]f32);
 // aggregation point at (MID, MID): itself a diagonal PE, and the position
 // that minimizes each phase's worst-case chain latency (max(root, P-1-root)
 // hops, per <collectives_2d>'s own linear-chain reduce implementation).
+// The middle two phases (row-reduce, row-broadcast) are only ever real
+// work for row MID -- every other row's own copy would combine/broadcast
+// data nobody reads, so term_col_done() has them skip straight to the
+// last phase instead (see its own comment).
 const P: u16 = @get_rectangle().width;
 const MID: u16 = P / 2;
 
@@ -548,28 +552,49 @@ task reduce_done() void {
                         1, term_col_done_task_id);
 }
 
-// TODO: at most ONE PE per column (the diagonal) ever has a nonzero
-// nz_local -- every other PE in the column still pays a real @fadds
-// (receive into RAMP, add zero, re-emit), because reduce_fadds can't know
-// in advance that it's the only sender. A hand-rolled pass-through route
-// (bypass RAMP entirely at non-sender PEs, same trick <layout>'s row/column
-// broadcast pattern uses) could turn this phase into a plain send instead
-// of a full reduce. Deferred: the fixed per-call configure/FSM/teardown
-// overhead every phase pays regardless of hop count is likely the bigger
-// cost here, and hand-rolling routes reintroduces exactly the complexity
-// <collectives_2d> was adopted to avoid (see the module docstring above) --
-// only worth doing if profiling shows this phase is an actual bottleneck.
+// Column-reduce (phase A, above) is genuinely needed from every row: each
+// column's diagonal lives at a different row, so every row's contribution
+// is real for SOME column. Row-reduce/row-broadcast (phases B/C) are
+// different -- root=MID means only row MID's own copy of nz_col/nz_total
+// is ever real; every OTHER row's mpi_x.reduce_fadds/broadcast call was
+// previously wasted protocol overhead (fixed configure/FSM/teardown cost,
+// paid for a result nobody reads -- see the per-PE heatmap findings in
+// GRAPH500_BENCHMARK.md section 8, which is what motivated this). So only
+// row MID does phases B/C for real; every other row skips straight to
+// phase D (mpi_y.broadcast, needed by everyone -- delivers the final
+// answer down every column) and simply waits there. This is safe because
+// mpi_x (phases B/C) and mpi_y (phase D) use entirely separate fabric
+// queues/colors (see their own instantiation above: {2,4} vs {3,5}), so
+// row MID being mid-FSM in mpi_x doesn't block it from later joining
+// mpi_y's phase D, and a non-root broadcast() participant genuinely
+// blocks on its own fabric queue waiting for real data -- it doesn't
+// require the root to have already called broadcast() first.
 task term_col_done() void {
     // only ever activated from reduce_done()'s is_iterative-only relay
     // start -- safe to record unconditionally.
     record_ts(ts_round, TS_TERM_COL_DONE);
     // column-reduce done: row MID of every column now holds that column's
-    // diagonal flag in nz_col. Row-reduce along row MID next, combining
-    // all P columns' flags into nz_total at (MID, MID).
-    mpi_x.reduce_fadds(MID, @ptrcast([*]f32, &nz_col), @ptrcast([*]f32, &nz_total),
-                        1, term_row_done_task_id);
+    // diagonal flag in nz_col.
+    if (prow_id == MID) {
+        // real row-reduce along row MID, combining all P columns' flags
+        // into nz_total at (MID, MID).
+        mpi_x.reduce_fadds(MID, @ptrcast([*]f32, &nz_col), @ptrcast([*]f32, &nz_total),
+                            1, term_row_done_task_id);
+    } else {
+        // nothing real to contribute to phases B/C -- record zero-duration
+        // entries for the slots those phases would have used (so the
+        // timing/heatmap tooling reports the now-literally-true ~0 cost
+        // here, rather than stale leftover ts_buf slots from a prior
+        // round) and join phase D directly, where we'll correctly block
+        // until row MID's real nz_total is ready.
+        record_ts(ts_round, TS_TERM_ROW_DONE);
+        record_ts(ts_round, TS_TERM_ROW_BCAST_DONE);
+        mpi_y.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_col_bcast_done_task_id);
+    }
 }
 
+// only ever reached by row MID (the only row whose term_col_done() above
+// calls the reduce_fadds this is the callback for).
 task term_row_done() void {
     record_ts(ts_round, TS_TERM_ROW_DONE);
     // row-reduce done: (MID, MID) now holds nz_total = sum over all P rows'
@@ -577,10 +602,12 @@ task term_row_done() void {
     mpi_x.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_row_bcast_done_task_id);
 }
 
+// only ever reached by row MID, same reason as term_row_done() above.
 task term_row_bcast_done() void {
     record_ts(ts_round, TS_TERM_ROW_BCAST_DONE);
-    // ...then down every column, so literally every PE ends up with the
-    // same nz_total.
+    // ...then down every column (row MID joining the same phase D call
+    // every other row already issued directly from term_col_done() above),
+    // so literally every PE ends up with the same nz_total.
     mpi_y.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_col_bcast_done_task_id);
 }
 

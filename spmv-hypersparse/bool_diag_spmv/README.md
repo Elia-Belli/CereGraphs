@@ -63,11 +63,44 @@ what's genuinely done versus what's still a stub.
   and its real transfer-time cost). See "`run_bfs.py` vs. the two test
   scripts" below for why this is a separate thing from
   `run_host_driven_bfs.py`, and `GRAPH500_BENCHMARK.md` for the GTEPS
-  methodology.
+  methodology. `--dump-pe-timing` (off by default) additionally saves the
+  full per-PE-per-round-per-phase cycle grid to a `.npz` file, inside
+  `plots/heatmap/<matrix>_<grid>_src<N>/` -- the same per-run folder
+  `plot_pe_heatmap.py` renders its PNGs into, so the raw data and its
+  plots stay together as one self-contained bundle. A deeper diagnostic
+  than the aggregate min/max/avg the CSV logs, for seeing exactly which
+  PEs are the straggler(s) for a given phase.
 - `plot_bfs_timing.py` — the per-round stacked-bar timing chart
   `run_bfs.py` calls automatically; also runnable standalone
   (`plot_timing_row()`) to re-plot an existing `bfs_timing.csv` row without
   re-running the device.
+- `plot_pe_heatmap.py` — reads a `--dump-pe-timing` `.npz` and renders
+  per-PE cycle-cost heatmaps into their own subfolder,
+  `plots/heatmap/<matrix>_<grid>_src<N>/`: one `round_<r>.png` per
+  profiled round (the round number is always in the title), plus one
+  `summary_avg.png` overview (mean over all rounds -- typical cost, not
+  one worst round). Rounds are kept separate rather than aggregated by
+  default because which PEs are active in a given round is itself a
+  function of the graph's structure and the chosen `--source`, not just
+  the communication protocol -- comparing rounds directly is how you tell
+  those two effects apart. Default phase selection is
+  `bfs_timing.LEAF_PHASES`, each with its own independent color scale
+  (`local_compute` and `local_term_cond` differ by an order of magnitude);
+  `--phase name1,name2,...` or `--relay` (shorthand for the 4-phase
+  termination relay's sub-phases) instead select a specific subset and
+  share ONE color scale across them, for direct magnitude comparison.
+  Also renders `sparsity.png` -- the matrix's own per-PE partition counts
+  (`local_nnz`/`local_nnz_cols`/`local_nnz_rows`, fixed for the whole run,
+  no round axis) -- next to the timing heatmaps, to check by eye whether a
+  phase's imbalance actually tracks the matrix's own sparsity distribution
+  (it does for `local_compute`: its worst PE matches `local_nnz`'s worst
+  PE exactly) or comes from somewhere else (the termination relay's cost
+  does not correlate with sparsity at all -- see section 8). Diagonal PEs
+  are outlined and the relay's aggregation point (`(MID, MID)`) is
+  starred; `--cmap` picks any matplotlib colormap (default `magma`).
+  Standalone only -- never touches the device, purely a re-plot of
+  already-saved data. See `GRAPH500_BENCHMARK.md` section 8 for what this
+  revealed about the termination relay's cost.
 - `run_graph500.py` — the full Graph500-shaped benchmark: one compile, one
   matrix upload (timed once as construction, excluded from every search),
   then `--num-searches` (default 64, per the spec) single-source BFS

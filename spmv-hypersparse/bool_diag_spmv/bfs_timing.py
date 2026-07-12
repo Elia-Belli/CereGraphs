@@ -7,6 +7,8 @@
   could silently drift out of sync.
 """
 
+import os
+
 import numpy as np
 
 # must match bool_pe.csl's TS_* constants / NUM_TS_SLOTS exactly -- these are
@@ -44,6 +46,14 @@ PHASES = [
 # to top -- PHASES minus relay_total (which would double-count its own 4
 # relay_* sub-phases if also drawn as its own segment).
 LEAF_PHASES = [name for name, _, _ in PHASES if name != "relay_total"]
+
+# the 4-phase termination relay's own sub-phases (see bool_pe.csl's module
+# docstring) -- broken out so callers (plot_pe_heatmap.py's --relay) can
+# compare just these four on a shared cycle scale, distinct from
+# LEAF_PHASES' full-algorithm overview (which intentionally keeps each
+# phase's own independent scale, since e.g. local_compute and
+# local_term_cond differ by an order of magnitude).
+RELAY_PHASES = ["relay_col_reduce", "relay_row_reduce", "relay_row_bcast", "relay_col_bcast"]
 
 # on-device phases that make up the Graph500-style "search time" (see
 # GRAPH500_BENCHMARK.md section 3) -- relay_total is used directly instead
@@ -153,6 +163,49 @@ def decode_phase_row(ts_hwl_u32, height, width, max_rounds, rounds_completed, ve
 
   device_time_cycles = sum(int(phase_max_by_name[name].sum()) for name in SEARCH_TIME_PHASES)
   return row_cols, device_time_cycles, profiled_rounds
+
+
+def decode_pe_phase_cycles(ts_hwl_u32, height, width, max_rounds, rounds_completed):
+  """Like decode_phase_row, but keeps the full (height, width) PE-grid shape
+  instead of collapsing it to min/max/avg -- for per-PE diagnostics (e.g.
+  a heatmap of which PEs are a phase's stragglers, see plot_pe_heatmap.py),
+  not the aggregate CSV log.
+
+  Returns (phase_cycles, profiled_rounds): phase_cycles is a dict of
+  {phase_name: (profiled_rounds, height, width) int64 array}, one entry per
+  PHASES tuple."""
+  profiled_rounds = min(rounds_completed, max_rounds)
+  ts = decode_round_timestamps(ts_hwl_u32, height, width, max_rounds)
+  ts = ts[:, :, :profiled_rounds, :]  # (height, width, profiled_rounds, NUM_TS_SLOTS)
+
+  phase_cycles = {}
+  for name, start_slot, end_slot in PHASES:
+    cycles = ts[:, :, :, end_slot] - ts[:, :, :, start_slot]  # (height, width, profiled_rounds)
+    phase_cycles[name] = np.transpose(cycles, (2, 0, 1))  # (profiled_rounds, height, width)
+  return phase_cycles, profiled_rounds
+
+
+def save_pe_phase_cycles(path, phase_cycles, metadata, structural_grids=None):
+  """Save one run's full per-PE-per-round-per-phase cycle grid to a single
+  self-contained .npz file, one file per run -- NOT appended across runs the
+  way bfs_timing.csv/graph500_searches.csv are. A heatmap needs the cycle
+  cost back as a (height, width) grid per phase/round; a CSV would force
+  either a wide format that doesn't scale with PE count or a long/tidy
+  format that has to be pivoted back into a grid every time it's read,
+  neither of which numpy's own binary round-trip needs. `metadata` is a
+  dict of small scalars/strings (infile_mtx, pe_grid, source,
+  rounds_completed, ...) saved alongside the arrays in the same file --
+  read back via load_pe_phase_cycles() in plot_pe_heatmap.py.
+
+  `structural_grids`: optional dict of additional (height, width) 2D
+  arrays that aren't per-round timing at all -- e.g. run_bfs.py passes the
+  matrix's own per-PE partition counts (local_nnz/local_nnz_cols/
+  local_nnz_rows from preprocess_bool.py) here, so plot_pe_heatmap.py's
+  sparsity.png can be checked by eye against the timing heatmaps for
+  correlation (e.g. does local_compute's imbalance actually track
+  local_nnz's imbalance, or is it something else)."""
+  os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+  np.savez_compressed(path, **phase_cycles, **(structural_grids or {}), **metadata)
 
 
 def compute_m_and_gteps(A_coo, device_visited, is_symmetric, search_time_cycles,

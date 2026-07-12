@@ -312,3 +312,152 @@ codebase for the termination relay (see `bool_pe.csl`'s own TODO on
 host-side array construction (previously `O(P^2)`, now `O(1)`), and the
 more architecturally correct amount of work regardless of whether it shows
 up as a large cycle win at these particular grid sizes.
+
+## 8. Per-PE relay cost investigation
+
+Profiling on `data/rmat_s8_e4.mtx` (8x8 grid) showed the 4-phase
+termination relay (section 3) at 46-54% of a round's total time -- over
+half. Digging into *why* required per-PE data, not just the aggregate
+min/max/avg `bfs_timing.csv` already logs.
+
+**Tooling**: `run_bfs.py --dump-pe-timing` saves the full `(round, height,
+width)` cycle grid per phase to a single `.npz` file (via
+`bfs_timing.decode_pe_phase_cycles()`/`save_pe_phase_cycles()`), inside
+`plots/heatmap/<matrix>_<grid>_src<N>/` -- one file per run, not appended
+like the CSVs, since a heatmap needs the grid shape back, not a long/tidy
+or wide CSV that has to be pivoted every time, and living in the same
+folder as the PNGs it feeds keeps raw data and plots together as one
+self-contained bundle. `plot_pe_heatmap.py` reads it back and renders
+per-PE heatmaps (magma by default, `--cmap` for any other matplotlib
+colormap; diagonal outlined, the relay's `(MID, MID)` aggregation point
+starred) into that same folder -- one `round_<r>.png` per profiled round
+(not aggregated by default: which PEs are active in a given round depends
+on the graph's own structure and the chosen `--source`, not just the
+protocol, so per-round is what separates those two effects) plus a
+`summary_avg.png` overview (mean over rounds -- typical cost, not one
+worst round). `--relay` selects just the 4-phase
+termination relay's own sub-phases (`bfs_timing.RELAY_PHASES`) with a
+SHARED color scale across them, for comparing their magnitudes directly
+(the default per-phase-own-scale view is right for a whole-algorithm
+overview, but hides exactly this comparison, which is what motivated
+adding it).
+
+**A real measurement caveat, not just a data-format one**: PEs are never
+explicitly barrier-synchronized between phases. Tracing `<collectives_2d>/
+pe.csl` (the actual `reduce_fadds`/`broadcast` implementation, not just
+`bool_pe.csl`'s call sites): the user callback (our `term_col_done` etc.)
+only fires once a `C_LOCK` task is BOTH unblocked (this PE's own FSM
+reached its `Callback` state) AND activated (this PE actually received an
+incoming teardown wavelet -- see `teardown_handler_0`/`_1`). The teardown
+cascade itself (`teardown_reduce_network()`) is a separate, asymmetric,
+multi-hop propagation from the chain's two physical endpoints inward,
+converging at the root, then reflecting back out past it -- a DIFFERENT
+topology than the actual data-reduce chain. So every phase's measured
+"issue-to-done" interval conflates three things: real data movement,
+waiting on an upstream dependency, and this teardown/re-arm handshake --
+and since the relay phases carry a payload of exactly one `f32`, (1) is
+negligible there, meaning almost all of the observed variance is (2)+(3),
+not "real work happening at that PE." Fully separating these would require
+instrumenting `<collectives_2d>` itself (a fork, for profiling purposes
+only) -- not attempted; the heatmaps below are "total per-call wall-clock
+cost at this PE, teardown-inclusive," not "local compute time."
+
+**What the heatmaps actually showed** (`rmat_s8_e4.mtx`, 8x8, source=0) --
+reproducible, structured patterns, not noise:
+- `local_term_cond`: diagonal uniformly maxed, everywhere else uniformly
+  ~0 -- exactly matches the code (only diagonal PEs run the masking loop).
+  Confirms the instrumentation is trustworthy for genuine per-PE work.
+- `local_compute`: worst PE data-dependent (e.g. (0,0) at 9359 cycles) --
+  real partition-size imbalance, unrelated to the collective protocol.
+- `visited_bcast`: the diagonal (sender/root) is fast; **every other PE in
+  the grid is uniformly ~1521**, regardless of position -- a flat
+  per-receiver protocol tax, not a hop-distance gradient.
+- `relay_row_bcast` / `relay_col_bcast`: a sharp, clean split -- one side
+  of the root (`MID`) is uniformly cheap, the other uniformly expensive,
+  every round. This is `<collectives_2d>`'s `POS_DIR` (EAST/SOUTH) vs
+  `NEG_DIR` (WEST/NORTH) asymmetry showing up directly: broadcasting
+  toward the positive direction from the root costs meaningfully more than
+  toward the negative direction.
+- `relay_row_reduce`: elevated cost concentrated near columns close to
+  `MID` (the root) across many different rows -- consistent with the root
+  position needing extra switch-handling (receiving from both directions)
+  that edge positions don't pay.
+- `--relay`'s shared-scale view confirms `relay_col_reduce` is the clear
+  outlier of the four relay sub-phases on this matrix/grid (avg worst-PE
+  4404 cycles, vs 2943-3299 for the other three) -- consistent with
+  section 3's earlier round-by-round table, now visible directly in one
+  image instead of read off separate independently-scaled panels.
+- `sparsity.png` (the matrix's own per-PE `local_nnz`/`local_nnz_cols`/
+  `local_nnz_rows`, from `preprocess_bool.py`, saved alongside the timing
+  grids for exactly this comparison) confirms the split cleanly: PE (0,0)
+  is `local_nnz`'s worst PE (~180, vs a handful elsewhere) *and*
+  `local_compute`'s worst PE (9359 cycles) -- real work correlating with
+  real sparsity, as expected. The termination relay's own hotspots (e.g.
+  `relay_col_reduce`'s worst PE at (3,0)) do **not** line up with
+  `sparsity.png` at all -- confirming (independently of the protocol-level
+  tracing above) that the relay's cost is structural/positional
+  (`<collectives_2d>` routing), not workload-dependent.
+
+**Status**: tooling in place and verified; the directional (`POS_DIR` vs
+`NEG_DIR`) asymmetry in the two relay broadcast phases is the most
+concrete, actionable lead surfaced so far, if this gets picked back up --
+not yet investigated further or acted on.
+
+## 9. Row-MID-only relay: implemented, correct, but not a latency win
+
+Phases B/C (row-reduce, row-broadcast, both `mpi_x`, root=column `MID`) are
+only ever *meaningful* for row `MID` -- every other row's own copy
+combines/broadcasts data nobody reads (see section 8's per-PE heatmap
+findings, which first surfaced this). Since `mpi_x` (phases B/C) and
+`mpi_y` (phases A/D) use entirely separate fabric queues/colors (`{2,4}`
+vs `{3,5}`, see their own instantiation in `bool_pe.csl`), row `MID` being
+mid-FSM in `mpi_x` doesn't block it from also participating in `mpi_y`'s
+phase D once it gets there, and a non-root `broadcast()` call genuinely
+blocks on its own fabric queue waiting for real data -- it doesn't require
+the root to have already called `broadcast()` first.
+
+**Implemented** in `term_col_done()`: only `prow_id == MID` now calls
+phases B/C's `mpi_x.reduce_fadds`/(via `term_row_done`/
+`term_row_bcast_done`) `mpi_x.broadcast`; every other row instead records
+zero-duration timestamps for those slots (so the timing tooling reports
+the now-literally-true ~0 cost there, not stale leftover `ts_buf` values)
+and joins phase D (`mpi_y.broadcast`, needed by everyone) directly, where
+it correctly blocks until row `MID`'s real answer arrives.
+
+**Verified correct** at three scales, 0 mismatches each time:
+`data/rmat4.4x4.lb.mtx` (4x4), `data/rmat_s8_e4.mtx` (8x8),
+`data/rmat_s12_e4.mtx` (16x16, n=4096).
+
+**The honest result, from directly comparing the same matrix/grid/source
+before and after** (`rmat_s12_e4.mtx`, 16x16, per-round averages):
+
+| phase | before | after |
+|---|---|---|
+| `relay_row_reduce` | 4272.2, 6025.2, 4414.7, 3529.7, 3541.2 | 360.6, 522.4, 381.3, 279.6, 280.9 |
+| `relay_row_bcast` | 5424.8, 7055.8, 5257.5, 4887.0, 4893.7 | 337.3, 471.8, 332.3, 249.7, 250.0 |
+| `relay_col_bcast` | 5896.3, 24901.8, 8830.5, 3500.8, 3505.0 | 14900.4, 36993.5, 17794.0, 11393.2, 11414.1 |
+| **`relay_total`** | 24707.1, 69155.5, 30043.3, 18669.2, 18695.7 | 24712.1, 69160.5, 30048.3, 18674.2, 18700.7 |
+
+`relay_row_reduce`/`relay_row_bcast` collapsed (~10-20x) exactly as
+expected -- 15 of 16 rows now genuinely do ~0 there. But `relay_col_bcast`
+absorbed almost exactly that difference (the skipped rows arrive at phase
+D early and simply wait longer there instead), and `relay_total` is
+unchanged within noise (~5 cycles) at every scale tested (4x4/8x8/16x16).
+
+**Why**: row `MID`'s own phase B/C work runs entirely on its own physical
+row wires, independent of every other row (that's what "separate fabric
+queues/colors" means physically, not just logically) -- so it was never
+waiting on anyone else, and removing everyone else's wasted work can't
+shorten a critical path it was never part of. The round's latency is, and
+was always, bounded by row `MID` alone.
+
+**What this change actually buys**: real wasted computation eliminated on
+15/16 (or 3/4, at 4x4) rows every round -- less real work done on
+hardware that was previously computing and transmitting values nobody
+ever reads, which matters for power/resource usage even though it doesn't
+show up as round-latency here. It does **not** address the directional
+(`POS_DIR`/`NEG_DIR`) asymmetry from section 8, which remains the more
+promising lead for an actual latency reduction, since `relay_total` is
+still dominated by row `MID`'s own real work being paid twice (once in the
+expensive direction for reduce, again for broadcast) rather than by
+wasted work on other rows.
