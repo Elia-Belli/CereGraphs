@@ -92,12 +92,26 @@ def single_source_seed_pe(source, blk, P):
   return p, p, local_x
 
 
-# Extract the diagonal PEs' y_buf (the only ones holding a meaningful final
-# result) and reassemble into the length-n boolean output vector.
+# Extract the diagonal PEs' y_bitmap_reduced (the only ones holding a
+# meaningful final result) and reassemble into the length-n boolean output
+# vector.
 def extract_diag_result(n, blk, P, y_hwl):
   parts = [y_hwl[(p, p)] for p in range(P)]
   y_pad = np.concatenate(parts)
   return y_pad[0:n] > 0.0
+
+
+def unpack_bitmap_to_dense(height, width, blk, bitmap_hwl):
+  """bitmap_hwl: (height, width, bitmap_words) uint32, bit k of word (k>>5)
+  at bit position (k&31) -- bool_pe.csl's y_bitmap/y_bitmap_reduced layout
+  exactly (see its own declaration comment there). Returns a dense
+  (height, width, blk) float32 array (0.0/1.0), matching the dtype
+  extract_diag_result already assumes, so callers can feed the result
+  straight into extract_diag_result unchanged."""
+  dense = np.zeros((height, width, blk), dtype=np.float32)
+  for k in range(blk):
+    dense[:, :, k] = ((bitmap_hwl[:, :, k >> 5] >> (k & 31)) & 1).astype(np.float32)
+  return dense
 
 
 def extract_parent_result(n, blk, P, parent_hwl):

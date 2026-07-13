@@ -71,7 +71,7 @@ layout {
     } // while px
 
     @export_name("x_buf", [*]f32, true);
-    @export_name("y_buf", [*]f32, true);
+    @export_name("y_bitmap_reduced", [*]u32, true);
     @export_name("visited_buf", [*]f32, true);
     @export_name("rounds_completed", [*]u16, true);
     @export_name("parent_local_buf", [*]u16, true);

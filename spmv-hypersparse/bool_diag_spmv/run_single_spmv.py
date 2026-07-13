@@ -7,12 +7,14 @@
     - y = OR_j (A[i,j] AND x[j]),
     - the PE grid must be square so every row/column has a diagonal PE.
 
-  The input vector x is seeded only at the diagonal PEs (host memcpy); 
+  The input vector x is seeded only at the diagonal PEs (host memcpy);
   1. Phase 1: (<collectives_2d> mpi_y.broadcast) distributes each column's x-block from
-    its diagonal PE to the rest of the column. 
-  2. Phase 2: (mpi_x.reduce_fadds) reduces every row's local boolean contributions to that row's diagonal PE,
-    which ends up holding the row's final result. 
-  The host reads back the full PE rectangle and keeps only the diagonal entries.
+    its diagonal PE to the rest of the column.
+  2. Phase 2: (mpi_x.reduce_or) OR-reduces every row's local boolean contributions (packed
+    as a bitmap, y_bitmap) to that row's diagonal PE, which ends up holding the row's final
+    result in y_bitmap_reduced.
+  The host reads back the full PE rectangle, unpacks the bitmap, and keeps only the
+  diagonal entries.
 
   How to compile and run
      python run_single_spmv.py --arch=wse2 --num_pe_cols=4 --num_pe_rows=4 --channels=1
@@ -28,7 +30,7 @@ import time
 import numpy as np
 from cmd_parser import parse_args
 from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
-                        hwl_to_oned_colmajor, oned_to_hwl_colmajor)
+                        hwl_to_oned_colmajor, unpack_bitmap_to_dense)
 from preprocess_bool import preprocess
 from scipy.io import mmread
 
@@ -137,6 +139,9 @@ def main():
   # blk = per-PE dense vector chunk size = ceil(n / P), same on both axes
   # since the matrix and grid are both square.
   blk = math.ceil(n / P)
+  # bitmap_words: matches bool_pe.csl's BITMAP_WORDS = ceil(blk/32) exactly --
+  # y_bitmap_reduced is packed this way, see device_io.unpack_bitmap_to_dense.
+  bitmap_words = (blk + 31) // 32
 
   np.random.seed(0)
   x_bool = (np.random.rand(n) < 0.5)
@@ -207,7 +212,7 @@ def main():
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_simfab_trace=True)
 
   sym_x_buf = runner.get_id("x_buf")
-  sym_y_buf = runner.get_id("y_buf")
+  sym_y_bitmap_reduced = runner.get_id("y_bitmap_reduced")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
   sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
   sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
@@ -272,9 +277,10 @@ def main():
   print("step 2: spmv")
   runner.launch("f_spmv", nonblock=False)
 
-  print("step 3: fetch the output vector y (f32, meaningful only at the diagonal PEs)")
-  y_1d = np.zeros(height * width * blk, np.float32)
-  runner.memcpy_d2h(y_1d, sym_y_buf, 0, 0, width, height, blk,
+  print("step 3: fetch the output bitmap y_bitmap_reduced (u32 words, meaningful only at "
+        "the diagonal PEs), unpack to dense")
+  y_bitmap_1d = np.zeros(height * width * bitmap_words, np.uint32)
+  runner.memcpy_d2h(y_bitmap_1d, sym_y_bitmap_reduced, 0, 0, width, height, bitmap_words,
                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                      order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
@@ -283,7 +289,8 @@ def main():
   end = time.time()
   print(f"*** Run done in {end-start}s")
 
-  y_hwl = oned_to_hwl_colmajor(height, width, blk, y_1d, np.float32)
+  y_bitmap_hwl = np.reshape(y_bitmap_1d, (height, width, bitmap_words), order="F")
+  y_hwl = unpack_bitmap_to_dense(height, width, blk, y_bitmap_hwl)
   y_wse = extract_diag_result(n, blk, P, y_hwl)
 
   verify_result(y_ref, y_wse)

@@ -19,8 +19,8 @@
   stop.
 
   Parent tracking (which vertex discovered a given node) can't go through
-  reduce_fadds -- it's a sum, not a selection -- so it's tracked per-PE
-  BEFORE the reduce instead (see compute() in bool_pe.csl): every PE knows
+  the row-reduce -- it's a combine (OR), not a selection -- so it's tracked
+  per-PE BEFORE the reduce instead (see compute() in bool_pe.csl): every PE knows
   exactly which of its own local columns touched which local row this
   round, and -- gated on that row not being visited yet, which is what
   makes this a genuine one-hop-closer BFS parent rather than merely a
@@ -36,12 +36,13 @@
   discovered set) is bit-identical between running f_spmv_iter once and
   calling single-shot f_spmv from the host in a loop that applies the
   identical visited-mask and stops the same way; (2) the terminating
-  round's RAW (unmasked) y_buf is also bit-identical -- NOT the masked
-  x_buf, which the loop's own stop condition forces to all-zero on both
-  sides regardless of correctness, so comparing it would be vacuous; y_buf
-  is genuinely data-dependent (it can be nonzero, full of entries that
-  happen to already be in visited_buf) and is where a bug in the terminating
-  round's own SpMV computation would actually show up; (3) rounds_completed
+  round's RAW (unmasked) y_bitmap_reduced (unpacked to dense) is also
+  bit-identical -- NOT the masked x_buf, which the loop's own stop condition
+  forces to all-zero on both sides regardless of correctness, so comparing
+  it would be vacuous; y_bitmap_reduced is genuinely data-dependent (it can
+  be nonzero, full of entries that happen to already be in visited_buf) and
+  is where a bug in the terminating round's own SpMV computation would
+  actually show up; (3) rounds_completed
   (a host-visible counter, purely for this test) shows the device stopped at
   exactly the same round the host independently computed, not some other
   round; (4) the assembled parent vector matches a host-side reference that
@@ -71,7 +72,8 @@ from datetime import datetime, timezone
 import numpy as np
 from cmd_parser import parse_args
 from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
-                        extract_parent_result, hwl_to_oned_colmajor, oned_to_hwl_colmajor)
+                        extract_parent_result, hwl_to_oned_colmajor, oned_to_hwl_colmajor,
+                        unpack_bitmap_to_dense)
 from preprocess_bool import preprocess
 from scipy.io import mmread
 
@@ -207,6 +209,9 @@ def main():
   # blk = per-PE dense vector chunk size = ceil(n / P), same on both axes
   # since the matrix and grid are both square.
   blk = math.ceil(n / P)
+  # bitmap_words: matches bool_pe.csl's BITMAP_WORDS = ceil(blk/32) exactly --
+  # y_bitmap_reduced is packed this way, see device_io.unpack_bitmap_to_dense.
+  bitmap_words = (blk + 31) // 32
 
   np.random.seed(0)
   x_bool0 = np.random.rand(n) < 0.5
@@ -273,7 +278,7 @@ def main():
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_simfab_trace=True)
 
   sym_x_buf = runner.get_id("x_buf")
-  sym_y_buf = runner.get_id("y_buf")
+  sym_y_bitmap_reduced = runner.get_id("y_bitmap_reduced")
   sym_visited_buf = runner.get_id("visited_buf")
   sym_rounds_completed = runner.get_id("rounds_completed")
   sym_parent_local_buf = runner.get_id("parent_local_buf")
@@ -345,6 +350,18 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     return oned_to_hwl_colmajor(height, width, blk, buf_1d, np.float32)
 
+  def read_y_bitmap_reduced():
+    # y_bitmap_reduced is packed (bitmap_words u32 words per PE), not dense
+    # (blk f32 per PE) like read_buf's other callers (x_buf/visited_buf) --
+    # read it at its own native size, then unpack to the dense float shape
+    # read_buf's callers already expect (see extract_diag_result).
+    buf_1d = np.zeros(height * width * bitmap_words, np.uint32)
+    runner.memcpy_d2h(buf_1d, sym_y_bitmap_reduced, 0, 0, width, height, bitmap_words,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
+    bitmap_hwl = np.reshape(buf_1d, (height, width, bitmap_words), order="F")
+    return unpack_bitmap_to_dense(height, width, blk, bitmap_hwl)
+
   def read_rounds_completed():
     # every PE increments its own copy in lockstep (the 4-phase relay makes
     # them all agree each round before any of them decides to continue), so
@@ -358,7 +375,7 @@ def main():
     return int(np.reshape(buf_1d, (height, width, 1), order="F")[(0, 0, 0)])
 
   def read_parent_local_buf():
-    # unlike x_buf/y_buf/visited_buf, parent_local_buf is meaningful at
+    # unlike x_buf/y_bitmap_reduced/visited_buf, parent_local_buf is meaningful at
     # EVERY PE (not just the diagonal) -- read back the full rectangle,
     # same u16-over-u32-wire convention as read_rounds_completed above.
     buf_1d = np.zeros(height * width * blk, np.uint32)
@@ -387,11 +404,11 @@ def main():
   # whether anything upstream is even correct. It's still useful as an
   # invariant check (the relay's stop decision better actually agree with
   # x_buf's content), just not as a host comparison. The real comparison
-  # uses y_buf -- the RAW, unmasked SpMV result for the terminating round,
-  # which is genuinely data-dependent (it can easily be nonzero, full of
-  # entries that all happen to already be in visited_buf).
+  # uses y_bitmap_reduced -- the RAW, unmasked SpMV result for the
+  # terminating round, which is genuinely data-dependent (it can easily be
+  # nonzero, full of entries that all happen to already be in visited_buf).
   device_new_last = extract_diag_result(n, blk, P, read_buf(sym_x_buf))
-  device_last_raw = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
+  device_last_raw = extract_diag_result(n, blk, P, read_y_bitmap_reduced())
   device_visited = extract_diag_result(n, blk, P, read_buf(sym_visited_buf))
   device_rounds_run = read_rounds_completed()
   device_parent = extract_parent_result(n, blk, P, read_parent_local_buf())
@@ -405,7 +422,7 @@ def main():
   frontier_bool = x_bool0  # this round's active input, for update_parent_reference
   visited = x_bool0.copy()  # f_spmv_iter seeds visited_buf from the initial x_buf too
   host_parent = np.full(n, -1, dtype=np.int64)
-  host_last_raw = None  # the terminating round's raw y_buf -- the real comparison target
+  host_last_raw = None  # the terminating round's raw y_bitmap_reduced -- the real comparison target
   host_new_last = None
   per_round_popcount = []
   host_rounds_run = 0
@@ -413,7 +430,7 @@ def main():
     update_parent_reference(host_parent, A_csr, frontier_bool, visited)
     seed_x(x_hwl)
     runner.launch("f_spmv", nonblock=False)
-    host_last_raw = extract_diag_result(n, blk, P, read_buf(sym_y_buf))
+    host_last_raw = extract_diag_result(n, blk, P, read_y_bitmap_reduced())
     host_new_last = host_last_raw & ~visited
     visited |= host_new_last
     host_rounds_run += 1
@@ -446,7 +463,7 @@ def main():
             and (n_mismatch_parent == 0) and rounds_match and invariant_ok)
   n_with_parent = int(np.sum(device_parent >= 0))
   print(f"[[ visited mismatches: {n_mismatch_visited} / {n} ]]")
-  print(f"[[ last-round RAW (unmasked y_buf) mismatches: {n_mismatch_last_raw} / {n} ]]")
+  print(f"[[ last-round RAW (unmasked y_bitmap_reduced) mismatches: {n_mismatch_last_raw} / {n} ]]")
   print(f"[[ parent mismatches: {n_mismatch_parent} / {n} ({n_with_parent} assigned a parent) ]]")
   print(f"[[ rounds completed: device={device_rounds_run}, host={host_rounds_run} "
         f"({'match' if rounds_match else 'MISMATCH'}) ]]")
