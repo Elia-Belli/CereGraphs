@@ -124,43 +124,54 @@ var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
 //                                bcast end / vertical x_buf bcast start)
 //   2 TS_COMPUTE_ENTRY       -- entry of compute() (vertical bcast end /
 //                                local compute start)
-//   3 TS_COMPUTE_EXPAND_ENTRY -- between compute()'s compact boolean
+//   3 TS_COMPUTE_RESET_DONE  -- between compute()'s buffer resets
+//                                (y_flags/parent_compact -- one entry per
+//                                local nnz row -- and y_local_buf/y_buf --
+//                                one entry per blk row, dense regardless of
+//                                sparsity) and the actual compact boolean
+//                                multiply -- isolates the resets (whose
+//                                cost tracks blk, not local sparsity) from
+//                                the sparse work itself (see bfs_timing.py's
+//                                local_compute_reset)
+//   4 TS_COMPUTE_EXPAND_ENTRY -- between compute()'s compact boolean
 //                                multiply (writes y_flags/parent_compact,
 //                                one entry per local nnz row) and its dense
 //                                expansion (writes y_local_buf, one entry
 //                                per blk row) -- splits local_compute into
-//                                "compact compute" vs "expansion" so the two
-//                                can be compared (see bfs_timing.py's
+//                                "reset" / "compact compute" / "expansion"
+//                                so the three can be compared (see
+//                                bfs_timing.py's local_compute_reset/
 //                                local_compute_compact/local_compute_expand)
-//   4 TS_REDUCE_ISSUE        -- before mpi_x.reduce_fadds in compute()
+//   5 TS_REDUCE_ISSUE        -- before mpi_x.reduce_fadds in compute()
 //                                (expansion end / reduce start)
-//   5 TS_REDUCE_DONE         -- entry of reduce_done() (reduce end / local
+//   6 TS_REDUCE_DONE         -- entry of reduce_done() (reduce end / local
 //                                term-condition start)
-//   6 TS_RELAY_ISSUE         -- before mpi_y.broadcast(nz_local) in
+//   7 TS_RELAY_ISSUE         -- before mpi_y.broadcast(nz_local) in
 //                                reduce_done() (local term-cond end /
 //                                relay phase A start)
-//   7 TS_TERM_COL_DONE       -- entry of term_col_done() (relay phase A
+//   8 TS_TERM_COL_DONE       -- entry of term_col_done() (relay phase A
 //                                [col-bcast, rooted at each column's own
 //                                diagonal -- was a col-reduce] end / phase
 //                                B start)
-//   8 TS_TERM_ROW_DONE       -- entry of term_row_done() (relay phase B
+//   9 TS_TERM_ROW_DONE       -- entry of term_row_done() (relay phase B
 //                                [row-reduce] end / phase C start)
-//   9 TS_TERM_ROW_BCAST_DONE -- entry of term_row_bcast_done() (relay
+//   10 TS_TERM_ROW_BCAST_DONE -- entry of term_row_bcast_done() (relay
 //                                phase C [row-bcast] end / phase D start)
-//   10 TS_TERM_COL_BCAST_DONE -- entry of term_col_bcast_done() (relay
+//   11 TS_TERM_COL_BCAST_DONE -- entry of term_col_bcast_done() (relay
 //                                phase D [col-bcast] end / relay total end)
 const TS_VBCAST_ISSUE: u16 = 0;
 const TS_VBCAST_DONE: u16 = 1;
 const TS_COMPUTE_ENTRY: u16 = 2;
-const TS_COMPUTE_EXPAND_ENTRY: u16 = 3;
-const TS_REDUCE_ISSUE: u16 = 4;
-const TS_REDUCE_DONE: u16 = 5;
-const TS_RELAY_ISSUE: u16 = 6;
-const TS_TERM_COL_DONE: u16 = 7;
-const TS_TERM_ROW_DONE: u16 = 8;
-const TS_TERM_ROW_BCAST_DONE: u16 = 9;
-const TS_TERM_COL_BCAST_DONE: u16 = 10;
-const NUM_TS_SLOTS: u16 = 11;
+const TS_COMPUTE_RESET_DONE: u16 = 3;
+const TS_COMPUTE_EXPAND_ENTRY: u16 = 4;
+const TS_REDUCE_ISSUE: u16 = 5;
+const TS_REDUCE_DONE: u16 = 6;
+const TS_RELAY_ISSUE: u16 = 7;
+const TS_TERM_COL_DONE: u16 = 8;
+const TS_TERM_ROW_DONE: u16 = 9;
+const TS_TERM_ROW_BCAST_DONE: u16 = 10;
+const TS_TERM_COL_BCAST_DONE: u16 = 11;
+const NUM_TS_SLOTS: u16 = 12;
 
 // flat [max_rounds][NUM_TS_SLOTS][3]u16, row-major (round slowest, then
 // slot, then the 3 raw timestamp words) -- see record_ts() for the index
@@ -438,6 +449,10 @@ task compute() void {
     while (i < blk) : (i += 1) {
         y_local_buf[i] = 0.0;
         y_buf[i] = 0.0;
+    }
+
+    if (is_iterative) {
+        record_ts(ts_round, TS_COMPUTE_RESET_DONE);
     }
 
     // Phase 3 Local boolean multiply: for every locally-nonzero column c with

@@ -44,12 +44,16 @@
   show; communication is a remainder, not a directly-measured quantity).
 
   A fourth panel, to the right of h2d/rounds/d2h, breaks local_compute down
-  further into its own two sub-phases (local_compute_compact -- the compact
-  boolean multiply over y_flags/parent_compact -- vs local_compute_expand --
-  expanding that compact result to the dense y_local_buf, see bool_pe.csl's
-  compute() and TS_COMPUTE_EXPAND_ENTRY) as grouped per-round bars, same
-  min/avg tick convention, to see which of the two actually dominates
-  local_compute's cost.
+  further into its own three consecutive sub-phases (local_compute_reset --
+  zeroing y_flags/parent_compact/y_local_buf/y_buf, whose cost tracks blk,
+  not local sparsity; local_compute_compact -- the compact boolean multiply
+  over y_flags/parent_compact; local_compute_expand -- expanding that
+  compact result to the dense y_local_buf; see bool_pe.csl's compute() and
+  TS_COMPUTE_RESET_DONE/TS_COMPUTE_EXPAND_ENTRY) as grouped per-round bars,
+  same min/avg tick convention, to see which of the three actually
+  dominates local_compute's cost -- in particular, whether "compact" time
+  is genuinely the sparse multiply or actually the (sparsity-independent)
+  buffer reset.
 
   This module is importable (plot_timing_row(row, out_path)) -- run_bfs.py
   calls it directly after appending a row, so one run_bfs.py invocation
@@ -135,14 +139,16 @@ def hue_shades(base_hex, n):
 
 H2D_COLORS = dict(zip(H2D_PARTS, hue_shades(H2D_BASE_HEX, len(H2D_PARTS))))
 
-# local_compute_compact/local_compute_expand are local_compute's own two
-# halves, not a separate categorical identity -- shades of local_compute's
-# own yellow (same hue-family convention as H2D_COLORS above), compact first
-# (lighter, happens first) then expand (darker, happens second).
-COMPUTE_SPLIT_PARTS = ["local_compute_compact", "local_compute_expand"]
+# local_compute_reset/local_compute_compact/local_compute_expand are
+# local_compute's own three consecutive parts, not a separate categorical
+# identity -- shades of local_compute's own yellow (same hue-family
+# convention as H2D_COLORS above), light->dark in chronological order
+# (reset happens first, then the compact multiply, then the expansion).
+COMPUTE_SPLIT_PARTS = ["local_compute_reset", "local_compute_compact", "local_compute_expand"]
 COMPUTE_SPLIT_COLORS = dict(zip(
     COMPUTE_SPLIT_PARTS, hue_shades(ROUND_SEGMENT_COLORS["local_compute"], len(COMPUTE_SPLIT_PARTS))))
 COMPUTE_SPLIT_LABELS = {
+    "local_compute_reset": "buffer reset (y_local_buf/y_buf, tracks blk)",
     "local_compute_compact": "compact multiply (y_flags)",
     "local_compute_expand": "dense expansion (y_local_buf)",
 }
@@ -259,7 +265,7 @@ def plot_timing_row(row, out_path):
   h2d_w_in = per_bar_w_in * len(H2D_PARTS)
   d2h_w_in = per_bar_w_in * 1.3  # a little extra breathing room for one bar alone
   round_w_in = max(0.95 * rounds_completed, 3.0)
-  compute_split_w_in = max(1.1 * rounds_completed, 3.2)
+  compute_split_w_in = max(1.4 * rounds_completed, 3.6)
   fig, (ax_h2d, ax_rounds, ax_d2h, ax_compute) = plt.subplots(
       1, 4, figsize=(h2d_w_in + round_w_in + d2h_w_in + compute_split_w_in, 6.5),
       gridspec_kw={"width_ratios": [h2d_w_in, round_w_in, d2h_w_in, compute_split_w_in],
@@ -329,13 +335,17 @@ def plot_timing_row(row, out_path):
   ax_rounds.set_xticks(rounds)
   ax_rounds.set_xticklabels([f"round {r}" for r in rounds])
 
-  # Fourth panel: local_compute's own compact-vs-expand split, grouped bars
-  # (not stacked -- these are two independent measurements, not parts of one
-  # total) -- same max-height + min/avg-tick convention as the rest.
-  compute_split_bar_width = 0.35
-  group_offset = compute_split_bar_width * 0.55
+  # Fourth panel: local_compute's own reset/compact/expand split, grouped
+  # bars (not stacked -- these are independent measurements, not parts of
+  # one total) -- same max-height + min/avg-tick convention as the rest.
+  # Offsets are computed generically (N bars centered on the round's x
+  # position) rather than hardcoded for 2, since this split has grown once
+  # already (compact/expand -> reset/compact/expand) and may again.
+  n_split_parts = len(COMPUTE_SPLIT_PARTS)
+  compute_split_bar_width = 0.6 / n_split_parts
+  split_offsets = (np.arange(n_split_parts) - (n_split_parts - 1) / 2) * compute_split_bar_width
   for i, part in enumerate(COMPUTE_SPLIT_PARTS):
-    xpos = rounds + (group_offset if i == 1 else -group_offset)
+    xpos = rounds + split_offsets[i]
     heights = compute_split_stats[part]["max"]
     color = COMPUTE_SPLIT_COLORS[part]
     ax_compute.bar(xpos, heights, width=compute_split_bar_width, color=color, edgecolor=SURFACE,
@@ -368,6 +378,7 @@ def plot_timing_row(row, out_path):
 
   ax_h2d.set_ylabel("cycles")
   ax_compute.set_ylabel("cycles")
+  reset_total = int(compute_split_stats["local_compute_reset"]["max"].sum())
   compact_total = int(compute_split_stats["local_compute_compact"]["max"].sum())
   expand_total = int(compute_split_stats["local_compute_expand"]["max"].sum())
   sum_rounds = int(round_duration.sum())
@@ -378,8 +389,8 @@ def plot_timing_row(row, out_path):
                "(bar height = round_duration_cycles, straggler PE span)\n"
                f"round bars sum to {sum_rounds} cycles vs total_runtime_cycles={total_runtime_cycles} "
                f"({diff_pct:+.1f}% -- gap is the first round's one-time fabric fill delay)\n"
-               f"local_compute split: compact multiply sums to {compact_total} cycles, "
-               f"dense expansion to {expand_total} cycles across all rounds",
+               f"local_compute split: reset sums to {reset_total} cycles, compact multiply to "
+               f"{compact_total} cycles, dense expansion to {expand_total} cycles across all rounds",
                fontsize=10)
   for ax in (ax_h2d, ax_rounds, ax_d2h, ax_compute):
     ax.spines["top"].set_visible(False)

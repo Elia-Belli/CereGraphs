@@ -17,29 +17,35 @@ import numpy as np
 TS_VBCAST_ISSUE = 0
 TS_VBCAST_DONE = 1
 TS_COMPUTE_ENTRY = 2
-TS_COMPUTE_EXPAND_ENTRY = 3
-TS_REDUCE_ISSUE = 4
-TS_REDUCE_DONE = 5
-TS_RELAY_ISSUE = 6
-TS_TERM_COL_DONE = 7
-TS_TERM_ROW_DONE = 8
-TS_TERM_ROW_BCAST_DONE = 9
-TS_TERM_COL_BCAST_DONE = 10
-NUM_TS_SLOTS = 11
+TS_COMPUTE_RESET_DONE = 3
+TS_COMPUTE_EXPAND_ENTRY = 4
+TS_REDUCE_ISSUE = 5
+TS_REDUCE_DONE = 6
+TS_RELAY_ISSUE = 7
+TS_TERM_COL_DONE = 8
+TS_TERM_ROW_DONE = 9
+TS_TERM_ROW_BCAST_DONE = 10
+TS_TERM_COL_BCAST_DONE = 11
+NUM_TS_SLOTS = 12
 
 # (name, start slot, end slot) -- each phase is literally end-minus-start of
 # two of the raw captures above; relay_total spans all four relay phases at
 # once rather than being their sum, as a direct (not accumulated) check.
-# local_compute_compact/local_compute_expand are local_compute's own two
-# halves (split at TS_COMPUTE_EXPAND_ENTRY, see bool_pe.csl's compute()) --
-# both purely diagnostic sub-phases, deliberately absent from
-# SEARCH_TIME_PHASES below so they don't double-count local_compute's own
-# contribution to device_time_cycles.
+# local_compute_reset/local_compute_compact/local_compute_expand are
+# local_compute's own three consecutive parts (split at
+# TS_COMPUTE_RESET_DONE/TS_COMPUTE_EXPAND_ENTRY, see bool_pe.csl's
+# compute()) -- all three purely diagnostic sub-phases, deliberately absent
+# from SEARCH_TIME_PHASES below so they don't double-count local_compute's
+# own contribution to device_time_cycles. local_compute_reset exists
+# because its cost tracks blk (dense y_local_buf/y_buf zeroing), not local
+# sparsity -- separating it out is what makes local_compute_compact an
+# honest measure of the sparse multiply itself.
 PHASES = [
     ("visited_bcast", TS_VBCAST_ISSUE, TS_VBCAST_DONE),
     ("vertical_bcast", TS_VBCAST_DONE, TS_COMPUTE_ENTRY),
     ("local_compute", TS_COMPUTE_ENTRY, TS_REDUCE_ISSUE),
-    ("local_compute_compact", TS_COMPUTE_ENTRY, TS_COMPUTE_EXPAND_ENTRY),
+    ("local_compute_reset", TS_COMPUTE_ENTRY, TS_COMPUTE_RESET_DONE),
+    ("local_compute_compact", TS_COMPUTE_RESET_DONE, TS_COMPUTE_EXPAND_ENTRY),
     ("local_compute_expand", TS_COMPUTE_EXPAND_ENTRY, TS_REDUCE_ISSUE),
     ("reduce", TS_REDUCE_ISSUE, TS_REDUCE_DONE),
     ("local_term_cond", TS_REDUCE_DONE, TS_RELAY_ISSUE),
@@ -70,6 +76,7 @@ _SLOT_NAMES = {
     TS_VBCAST_ISSUE: "ts_vbcast_issue",
     TS_VBCAST_DONE: "ts_vbcast_done",
     TS_COMPUTE_ENTRY: "ts_compute_entry",
+    TS_COMPUTE_RESET_DONE: "ts_compute_reset_done",
     TS_COMPUTE_EXPAND_ENTRY: "ts_compute_expand_entry",
     TS_REDUCE_ISSUE: "ts_reduce_issue",
     TS_REDUCE_DONE: "ts_reduce_done",
