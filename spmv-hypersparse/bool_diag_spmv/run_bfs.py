@@ -20,7 +20,9 @@
      counts (bfs_timing.py/record_ts()), h2d/d2h transfer cycles, and a
      Graph500-style GTEPS estimate (see GRAPH500_BENCHMARK.md) -- appended
      as one row to bfs_timing.csv, plus the per-round stacked-bar plot
-     (plot_bfs_timing.py) saved to plots/timing/.
+     (plot_bfs_timing.py) and a companion local_compute-split bar plot
+     (plot_bfs_timing.plot_compute_split_row, compact multiply vs dense
+     expansion) both saved to plots/timing/.
 
   Replaces plot_bfs_tree.py and bench_timing.py (deleted -- this script
   does both, without the double compile+launch cost of running them
@@ -554,10 +556,14 @@ def main():
       writer.writerow(row)
     print(f"appended timing row to {csv_path}")
 
+    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
     out_timing = args.out_timing or plot_bfs_timing.default_out_path(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots"), row["infile_mtx"],
-        row["pe_grid"], row["source"], row["channels"])
+        plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
     plot_bfs_timing.plot_timing_row(row, out_timing)
+
+    out_compute_split = plot_bfs_timing.default_compute_split_out_path(
+        plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
+    plot_bfs_timing.plot_compute_split_row(row, out_compute_split)
 
 
 if __name__ == "__main__":
