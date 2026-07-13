@@ -1,0 +1,66 @@
+// Standalone, isolated correctness test for collectives_2d/pe.csl's new
+// reduce_or() (bitwise OR-reduce) -- stage 2a of the bitmap work (see
+// GRAPH500_BENCHMARK.md / the bitmap-branch plan). No matrix/BFS logic at
+// all: each PE seeds a random u32 test buffer, mpi_x.reduce_or() OR-combines
+// each ROW toward a compile-time-chosen root column (mpi_x is the row-wise
+// collectives instance, same convention as bool_pe.csl), and the host
+// compares the root's result against a plain numpy bitwise-OR reduction.
+// Only the x-dimension is instantiated (c2d.get_params gracefully omits y
+// entirely when y_colors/y_entrypoints aren't passed) -- this test doesn't
+// need a second dimension.
+
+param pcols: u16;
+param prows: u16;
+param count: u16;   // number of u32 words per PE (mirrors bool_pe.csl's BITMAP_WORDS)
+param root: u16;    // row-reduce root column index (varied across compiles by the driver)
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width = pcols,
+    .height = prows,
+    });
+
+// local repo copy -- see bool_pe.csl's own import comment for why. Lives
+// directly in src/ (a sibling of bool_pe.csl/layout_bool.csl), NOT its own
+// subdirectory -- CSL resolves relative @import_module paths relative to
+// the top-level compiled file's directory, and pe.csl's own internal
+// "./collectives_2d/ctrl_wavelet.csl" import (see collectives_2d/pe.csl)
+// is written relative to src/, so any entry point importing pe.csl must
+// also live in src/ itself for that nested import to resolve -- confirmed
+// empirically (a one-level-deeper test_reduce_or/ subdirectory broke it).
+const c2d = @import_module("./collectives_2d/params.csl");
+
+layout {
+    @set_rectangle(pcols, prows);
+
+    var px: u16 = 0;
+    while (px < pcols) : (px += 1) {
+        const memcpy_params = memcpy.get_params(px);
+
+        var py: u16 = 0;
+        while (py < prows) : (py += 1) {
+            // y_colors/y_entrypoints are never actually used (pe_reduce_or_test.csl
+            // only instantiates mpi_x) but params.csl's pack_ids() eagerly
+            // evaluates @get_local_task_id(0) as its "absent" placeholder when a
+            // dimension isn't requested, and task IDs must be in [8,31) -- so
+            // real (if unused) y params are required just to avoid that eager
+            // comptime failure, not because y is actually wired up.
+            const c2d_params = c2d.get_params(px, py, .{
+                .x_colors = .{ @get_color(0), @get_color(1) },
+                .x_entrypoints = .{ @get_local_task_id(14), @get_local_task_id(15) },
+                .y_colors = .{ @get_color(4), @get_color(5) },
+                .y_entrypoints = .{ @get_local_task_id(16), @get_local_task_id(17) },
+            });
+            @set_tile_code(px, py, "pe_reduce_or_test.csl", .{
+                .memcpy_params = memcpy_params,
+                .c2d_params = c2d_params,
+                .count = count,
+                .root = root,
+            });
+        } // while py
+    } // while px
+
+    @export_name("send_buf", [*]u32, true);
+    @export_name("recv_buf", [*]u32, true);
+
+    @export_name("f_run", fn()void);
+}

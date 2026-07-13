@@ -100,7 +100,12 @@ const reduce_fabins = [2]fabin_dsd { data_0_fabin, data_1_fabin };
 const reduce_fabouts = [2]fabout_dsd { data_0_fabout, data_1_fabout };
 
 // Struct that describes a current network configuration
-const Ftype = enum(u16) { broadcast, scatter, gather, reduce_fadds };
+// reduce_or: bitwise OR-reduce, added for bool_diag_spmv's bitmap work --
+// see reduce_or()/transfer_data_reduce_or() below. Mirrors reduce_fadds's
+// FSM/DSR/teardown machinery exactly (none of that is arithmetic-specific);
+// only the actual combine op differs (@or16 instead of @fadds), which is
+// why it needs its own Ftype tag, not a variant of reduce_fadds.
+const Ftype = enum(u16) { broadcast, scatter, gather, reduce_fadds, reduce_or };
 const Network_Config = struct {
   root: u16,
   count: u16,
@@ -110,6 +115,10 @@ const Network_Config = struct {
 // This array is used as a placeholder value for `mem1d_dsd`s. DSDs require
 // tensor_access to point to a valid piece of memory, so we use this
 var invalid_u32 = @zeros([1]u32);
+// Same, but u16-typed -- reduce_or operates on 16-bit elements (CSL has no
+// @or32; @or16/@and16/@xor16 are 16-bit only), so its own mem1d_dsd needs a
+// u16 base address, not invalid_u32's u32 one. See transfer_data_reduce_or().
+var invalid_u16 = @zeros([1]u16);
 
 // The state of our finite state machine. This type just groups together
 // global state so that it is in a single place that is easier to keep
@@ -305,6 +314,42 @@ fn reduce_fadds(root: u16, send_buf: [*]f32, recv_buf: [*]f32, count: u16, callb
   start_data_transfer();
 }
 
+// Bitwise OR-reduce -- see the Ftype.reduce_or comment above for why this
+// is a separate function rather than a reduce_fadds variant. `count` keeps
+// the same meaning reduce_fadds/broadcast already give it (number of u32
+// words) -- the caller never needs to think in 16-bit halves; that
+// doubling happens only inside transfer_data_reduce_or().
+fn reduce_or(root: u16, send_buf: [*]u32, recv_buf: [*]u32, count: u16, callback: local_task_id) void {
+
+  // WARNING: block LOCK in the beginning and only
+  // unblock LOCK when the operation finishes
+  @block(C_LOCK);
+
+  @assert(lib_initialized);
+  cur_network_cfg = Network_Config {
+    .root = root,
+    .count = count,
+    .type = Ftype.reduce_or
+  };
+  // send_buf/recv_buf are already u32 -- no @ptrcast needed (unlike
+  // reduce_fadds, which takes f32 and casts at this same boundary).
+  fsm_state = FSM_State {
+    .send_buf = send_buf,
+    .recv_buf = recv_buf,
+    .state = StateEnum.Configure_network,
+    .callback = callback,
+    .counter = 0
+  };
+  // all ops must clear filter and switch first
+  clear_filter_and_switch();
+  // reconfigure the routing and switch on C0 and C1, then start the FSM --
+  // configure_reduce_network() is pure routing/color config, no arithmetic
+  // dependence, reused unchanged from reduce_fadds.
+  configure_reduce_network(DATA_COLOR_0);
+  configure_reduce_network(DATA_COLOR_1);
+  start_data_transfer();
+}
+
 
 // initiate_teardowns() is called when the operation {broadcast, gather, scatter,
 // reduce_adds} finishes the data transfer.
@@ -322,6 +367,11 @@ fn initiate_teardowns() void {
       teardown_gather_network();
     },
     Ftype.reduce_fadds => {
+      teardown_reduce_network();
+    },
+    Ftype.reduce_or => {
+      // same teardown as reduce_fadds -- pure control-wavelet/color
+      // bookkeeping, no arithmetic dependence.
       teardown_reduce_network();
     }
   }
@@ -844,6 +894,11 @@ task fsm() void {
 }
 
 var mem = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> invalid_u32[i] });
+// u16-typed sibling of `mem`, for reduce_or (CSL's @or16 operates on 16-bit
+// elements; `mem`'s element width is tied to invalid_u32's u32 type, so a
+// separate placeholder avoids assuming @set_dsd_base_addr can silently
+// retarget element width). See transfer_data_reduce_or().
+var mem16 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> invalid_u16[i] });
 var fabout = @get_dsd(fabout_dsd,
                       if (@is_arch("wse3")) .{ .extent = 1, .output_queue = COLOR_0_OQ }
                       else .{ .extent = 1, .fabric_color = DATA_COLOR_0, .output_queue = COLOR_0_OQ });
@@ -1011,12 +1066,32 @@ fn fabin_to_mem(m: mem1d_dsd, f: fabin_dsd) void {
   //@mov32(m, f, .{ .async = true, .activate = ACTIVATE_FSM_TASK_ID });
 }
 
+// reduce_or's counterpart of fabin_to_mem -- @mov16 instead of @mov32.
+// @mov32 moving a u16-element (mem16) DSD would move count16 32-bit words
+// (i.e. 2x count16 16-bit elements' worth of bytes) instead of count16
+// 16-bit elements -- confirmed as the actual bug behind reduce_or's fabric
+// stall (P=2 "passed" only because the resulting over-read/over-write
+// happened not to corrupt anything observable at that tiny scale; P=3
+// exposed a genuine protocol-level hang).
+fn fabin_to_mem16(m: mem1d_dsd, f: fabin_dsd) void {
+  @load_to_dsr(dest_dsr, m);
+  @load_to_dsr(src1_dsr, f, .{ .async = true, .activate = ACTIVATE_FSM_TASK_ID });
+  @mov16(dest_dsr, src1_dsr, .{.async=true} );
+}
+
 // Same as `fabin_to_mem`
 fn mem_to_fabout(f: fabout_dsd, m: mem1d_dsd) void {
   @load_to_dsr(dest_dsr, f, .{ .async = true, .activate = ACTIVATE_FSM_TASK_ID });
   @load_to_dsr(src1_dsr, m);
   @mov32(dest_dsr, src1_dsr, .{.async=true} );
   //@mov32(f, m, .{ .async = true, .activate = ACTIVATE_FSM_TASK_ID });
+}
+
+// reduce_or's counterpart of mem_to_fabout -- @mov16, see fabin_to_mem16.
+fn mem_to_fabout16(f: fabout_dsd, m: mem1d_dsd) void {
+  @load_to_dsr(dest_dsr, f, .{ .async = true, .activate = ACTIVATE_FSM_TASK_ID });
+  @load_to_dsr(src1_dsr, m);
+  @mov16(dest_dsr, src1_dsr, .{.async=true} );
 }
 
 // Same as `fabin_to_mem`
@@ -1048,6 +1123,23 @@ fn fadds_mem_fabin_mem(dst: mem1d_dsd, src0: fabin_dsd, src1: mem1d_dsd) void {
   @load_to_dsr(src1_dsr, src1);
   @fadds(dest_dsr, src0_dsr, src1_dsr, .{.async=true} );
   //@fadds(dst, src0, src1, .{ .async = true, .activate = ACTIVATE_FSM_TASK_ID });
+}
+
+// reduce_or's counterparts to fadds_fabout_fabin_mem/fadds_mem_fabin_mem --
+// identical structure, @or16 instead of @fadds. Operands are u16-element
+// DSDs (see transfer_data_reduce_or()), matching @or16's native width.
+fn or16_fabout_fabin_mem(dst: fabout_dsd, src0: fabin_dsd, src1: mem1d_dsd) void {
+  @load_to_dsr(dest_dsr, dst, .{ .async = true, .activate = ACTIVATE_FSM_TASK_ID });
+  @load_to_dsr(src0_dsr, src0, .{ .async = true});
+  @load_to_dsr(src1_dsr, src1);
+  @or16(dest_dsr, src0_dsr, src1_dsr, .{.async=true} );
+}
+
+fn or16_mem_fabin_mem(dst: mem1d_dsd, src0: fabin_dsd, src1: mem1d_dsd) void {
+  @load_to_dsr(dest_dsr, dst);
+  @load_to_dsr(src0_dsr, src0, .{ .async = true, .activate = ACTIVATE_FSM_TASK_ID });
+  @load_to_dsr(src1_dsr, src1);
+  @or16(dest_dsr, src0_dsr, src1_dsr, .{.async=true} );
 }
 
 // Same as `fabin_to_mem`
@@ -1199,6 +1291,105 @@ fn transfer_data_reduce() void {
   }
 }
 
+// Bitwise-OR counterpart of transfer_data_reduce() -- same structure and
+// branching (root/non-root, first-pass ingestion vs combine vs own-copy
+// merge, extreme-PE-vs-middle-PE special cases), @or16 instead of @fadds.
+// CSL has no @or32, only @or16 (16-bit elements) -- so every DSD driving an
+// OR op here counts 16-bit halves (count16 = count*2), not the caller's
+// u32-word count, and uses mem16 (u16-typed) instead of mem (u32-typed).
+// The fabric-side reduce_pos/neg_fabin/fabout DSDs are queue-bound, not
+// memory-address-typed, so they're reused completely unchanged from the
+// reduce_fadds path, just re-lengthed to count16 instead of count -- no
+// simd_mode packing needed (tried, reverted -- see fabin_to_mem16/
+// mem_to_fabout16's own comment for the actual bug and fix, which was
+// @mov32 vs @mov16 on the plain-move helpers, not fabric SIMD packing).
+fn transfer_data_reduce_or() void {
+
+  const count = cur_network_cfg.count;
+  const count16 = count * 2;
+  const root = cur_network_cfg.root;
+
+  reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, count16);
+  reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, count16);
+
+  reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, count16);
+  reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, count16);
+
+  mem16 = @set_dsd_length(mem16, count16);
+
+  // If we are the root on the first pass through the FSM, we receive/aggregate
+  // data from *other* PEs
+  if (pe_id == root and fsm_state.counter == 0) {
+    mem16 = @set_dsd_base_addr(mem16, @ptrcast([*]u16, fsm_state.recv_buf));
+
+    switch (pe_id) {
+      0 => {
+        fabin_to_mem16(mem16, reduce_pos_fabin);
+      },
+      (NUM_PES - 1) => {
+        fabin_to_mem16(mem16, reduce_neg_fabin);
+      },
+      else => {
+        // WSE3 does not support 2 FABIN source operands.
+        // Instead of "mem16 = reduce_pos_fabin + reduce_neg_fabin", we can do
+        // "mem16 = reduce_pos_fabin"
+        // "mem16 = reduce_neg_fabin OR mem16"
+        fabin_to_mem16(mem16, reduce_pos_fabin);
+      }
+    }
+    // We need another run through the FSM so that we can add in our own local
+    // copy of the data
+    fsm_state.counter += 1;
+  } else if (pe_id == root and fsm_state.counter == 1) {
+    // fsm_state.counter = 1
+    // - pe_id = 0 or (NUM_PES - 1) skips this branch and execute next branch
+    // - pe_id = [1, (NUM_PES - 1)) executes this branch
+    // "mem16 = reduce_neg_fabin OR mem16"
+    mem16 = @set_dsd_base_addr(mem16, @ptrcast([*]u16, fsm_state.recv_buf));
+    switch (pe_id) {
+      0 => {
+        @activate(ACTIVATE_FSM_TASK_ID);
+      },
+      (NUM_PES - 1) => {
+        @activate(ACTIVATE_FSM_TASK_ID);
+      },
+      else => {
+        or16_mem_fabin_mem(mem16, reduce_neg_fabin, mem16);
+      }
+    }
+    fsm_state.counter += 1;
+  } else if (pe_id == root) {
+    // fsm_state.counter = 2
+    // Add in our own local copy of the data
+    mem16 = @set_dsd_length(mem16, count16);
+    const src = @set_dsd_base_addr(mem16, @ptrcast([*]u16, fsm_state.send_buf));
+    const dst = @set_dsd_base_addr(mem16, @ptrcast([*]u16, fsm_state.recv_buf));
+    // all operands are mem1d
+    @load_to_dsr(dest_dsr, dst);
+    @load_to_dsr(src0_dsr, dst);
+    @load_to_dsr(src1_dsr, src);
+    @or16(dest_dsr, src0_dsr, src1_dsr);
+    fsm_state.state = StateEnum.Callback;
+    @activate(ACTIVATE_FSM_TASK_ID);
+
+  } else {
+
+    // If we are not the root, we simply need to figure out which DSDs to use,
+    // then send/receive data through the appropriate ones
+    mem16 = @set_dsd_base_addr(mem16, @ptrcast([*]u16, fsm_state.send_buf));
+    if (pe_id == 0) {
+      mem_to_fabout16(reduce_pos_fabout, mem16);
+    } else if (pe_id == NUM_PES - 1) {
+      mem_to_fabout16(reduce_neg_fabout, mem16);
+    } else if (pe_id < root) {
+      or16_fabout_fabin_mem(reduce_pos_fabout, reduce_neg_fabin, mem16);
+    } else {
+      or16_fabout_fabin_mem(reduce_neg_fabout, reduce_pos_fabin, mem16);
+    }
+    fsm_state.state = StateEnum.Callback;
+  }
+}
+
 // Function that dispatches appropriate type of data-transfer function depending
 // on the type of collective communication primitive being used
 fn transfer_data() void {
@@ -1211,6 +1402,11 @@ fn transfer_data() void {
     },
     Ftype.gather => {
       transfer_data_gather();
+    },
+    Ftype.reduce_or => {
+      // named explicitly rather than folded into the else below --
+      // two reduce variants silently sharing one else branch is a footgun.
+      transfer_data_reduce_or();
     },
     else => {
       transfer_data_reduce();
@@ -1270,8 +1466,8 @@ comptime {
 var num_tds: u16 = 0;
 
 fn teardown_handler_0() void {
-  if (cur_network_cfg.type == Ftype.reduce_fadds ){
-    // reduce op uses C0 and C1
+  if (cur_network_cfg.type == Ftype.reduce_fadds or cur_network_cfg.type == Ftype.reduce_or) {
+    // both reduce ops use C0 and C1
     num_tds += 1;
     if (num_tds == 2){ // receive TD from C0 and C1
        num_tds = 0; // reset num_tds
@@ -1286,8 +1482,8 @@ fn teardown_handler_0() void {
 }
 
 fn teardown_handler_1() void {
-  // only reduce op uses C0 and C1
-  @assert(cur_network_cfg.type == Ftype.reduce_fadds );
+  // only reduce ops use C0 and C1
+  @assert(cur_network_cfg.type == Ftype.reduce_fadds or cur_network_cfg.type == Ftype.reduce_or);
   num_tds += 1;
   if (num_tds == 2){ // receive TD from C0 and C1
     num_tds = 0; // reset num_tds
