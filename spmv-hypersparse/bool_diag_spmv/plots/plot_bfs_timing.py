@@ -43,6 +43,14 @@
   (local_term_cond is a diagonal-only fixed cost with little PE variance to
   show; communication is a remainder, not a directly-measured quantity).
 
+  A fourth panel, to the right of h2d/rounds/d2h, breaks local_compute down
+  further into its own two sub-phases (local_compute_compact -- the compact
+  boolean multiply over y_flags/parent_compact -- vs local_compute_expand --
+  expanding that compact result to the dense y_local_buf, see bool_pe.csl's
+  compute() and TS_COMPUTE_EXPAND_ENTRY) as grouped per-round bars, same
+  min/avg tick convention, to see which of the two actually dominates
+  local_compute's cost.
+
   This module is importable (plot_timing_row(row, out_path)) -- run_bfs.py
   calls it directly after appending a row, so one run_bfs.py invocation
   produces the plot without a separate manual step. It's also runnable
@@ -51,14 +59,6 @@
   How to run (from bool_diag_spmv/, or use --csv's own default: ../results/bfs_timing.csv)
      python3 plots/plot_bfs_timing.py --csv results/bfs_timing.csv --row -1
      python3 plots/plot_bfs_timing.py --csv results/bfs_timing.csv --infile_mtx rand600.mtx --pe_grid 8x8
-
-  plot_compute_split_row(row, out_path) is a second, separate plot from the
-  same CSV row: local_compute's own two sub-phases (local_compute_compact --
-  the compact boolean multiply over y_flags/parent_compact -- vs
-  local_compute_expand -- expanding that compact result to the dense
-  y_local_buf, see bool_pe.csl's compute()) as grouped per-round bars, each
-  with min/max/avg indicators, to see which of the two actually dominates
-  local_compute's cost. run_bfs.py renders both plots after every run.
 """
 
 import argparse
@@ -191,13 +191,6 @@ def default_out_path(plots_dir, matrix, pe_grid, source, channels):
   return os.path.join(timing_dir, f"timing_{matrix_stem}_{pe_grid}_src{source}_ch{channels}.png")
 
 
-def default_compute_split_out_path(plots_dir, matrix, pe_grid, source, channels):
-  matrix_stem = os.path.splitext(matrix)[0]
-  timing_dir = os.path.join(plots_dir, "timing")
-  return os.path.join(
-      timing_dir, f"compute_split_{matrix_stem}_{pe_grid}_src{source}_ch{channels}.png")
-
-
 def plot_timing_row(row, out_path):
   """row: a dict with the same keys bfs_timing.csv's header has (either
   read back via csv.DictReader, or the in-memory dict run_bfs.py just
@@ -225,6 +218,22 @@ def plot_timing_row(row, out_path):
   # ordered within the bar, see module docstring.
   communication = np.clip(round_duration - local_compute - local_term_cond, 0.0, None)
 
+  # local_compute's own two sub-phases (see TS_COMPUTE_EXPAND_ENTRY in
+  # bool_pe.csl) -- rendered as their own grouped-bar panel below, not part
+  # of the stacked round bars above (they're a breakdown of local_compute's
+  # own segment, not an additional cost).
+  compute_split_stats = {}
+  for part in COMPUTE_SPLIT_PARTS:
+    part_max = parse_cycle_list(row[f"{part}_max_cycles"]).astype(float)
+    assert len(part_max) == rounds_completed, (
+        f"{part}_max_cycles has {len(part_max)} entries, expected "
+        f"rounds_completed={rounds_completed}")
+    compute_split_stats[part] = {
+        "max": part_max,
+        "min": parse_cycle_list(row[f"{part}_min_cycles"]).astype(float),
+        "avg": parse_cycle_list_float(row[f"{part}_avg_cycles"]),
+    }
+
   h2d_min = {p: int(row[f"{p}_min_cycles"]) for p in H2D_PARTS}
   h2d_max = {p: int(row[f"{p}_max_cycles"]) for p in H2D_PARTS}
   d2h_min, d2h_max = int(row["d2h_min_cycles"]), int(row["d2h_max_cycles"])
@@ -250,12 +259,17 @@ def plot_timing_row(row, out_path):
   h2d_w_in = per_bar_w_in * len(H2D_PARTS)
   d2h_w_in = per_bar_w_in * 1.3  # a little extra breathing room for one bar alone
   round_w_in = max(0.95 * rounds_completed, 3.0)
-  fig, (ax_h2d, ax_rounds, ax_d2h) = plt.subplots(
-      1, 3, figsize=(h2d_w_in + round_w_in + d2h_w_in, 6.5),
-      gridspec_kw={"width_ratios": [h2d_w_in, round_w_in, d2h_w_in], "wspace": 0.08})
+  compute_split_w_in = max(1.1 * rounds_completed, 3.2)
+  fig, (ax_h2d, ax_rounds, ax_d2h, ax_compute) = plt.subplots(
+      1, 4, figsize=(h2d_w_in + round_w_in + d2h_w_in + compute_split_w_in, 6.5),
+      gridspec_kw={"width_ratios": [h2d_w_in, round_w_in, d2h_w_in, compute_split_w_in],
+                   "wspace": 0.1})
 
   bar_width = 0.62
-  candidate_labels = []  # (ax, text_obj, xpos, segment_bottom, segment_top) -- fit-checked below
+  # (ax, text_obj, xpos, segment_bottom, segment_top, bar_w) -- fit-checked
+  # below; bar_w travels with each label since the compute-split panel uses
+  # its own, narrower bar width than the h2d/round/d2h panels.
+  candidate_labels = []
 
   def add_solo_bar(ax, xpos, height, tick_y, color, label):
     ax.bar([xpos], [height], width=bar_width, color=color, edgecolor=SURFACE,
@@ -264,7 +278,7 @@ def plot_timing_row(row, out_path):
             color=TEXT_PRIMARY, linewidth=1.4, solid_capstyle="butt", zorder=3)
     txt = ax.text(xpos, height / 2, f"{int(height)}", ha="center", va="center",
                   fontsize=7, color="white", fontweight="bold", zorder=4)
-    candidate_labels.append((ax, txt, xpos, 0.0, height))
+    candidate_labels.append((ax, txt, xpos, 0.0, height, bar_width))
 
   for i, part in enumerate(H2D_PARTS):
     add_solo_bar(ax_h2d, i, h2d_max[part], h2d_min[part], H2D_COLORS[part], part)
@@ -302,7 +316,7 @@ def plot_timing_row(row, out_path):
       txt = ax_rounds.text(r, bottom[r] + heights[r] / 2, f"{int(heights[r])}",
                             ha="center", va="center", fontsize=7, color="white",
                             fontweight="bold", zorder=4)
-      candidate_labels.append((ax_rounds, txt, r, bottom[r], total_heights[r]))
+      candidate_labels.append((ax_rounds, txt, r, bottom[r], total_heights[r], bar_width))
 
     if name == "local_compute":
       # local_compute is always the first-stacked segment (bottom == 0
@@ -315,6 +329,27 @@ def plot_timing_row(row, out_path):
   ax_rounds.set_xticks(rounds)
   ax_rounds.set_xticklabels([f"round {r}" for r in rounds])
 
+  # Fourth panel: local_compute's own compact-vs-expand split, grouped bars
+  # (not stacked -- these are two independent measurements, not parts of one
+  # total) -- same max-height + min/avg-tick convention as the rest.
+  compute_split_bar_width = 0.35
+  group_offset = compute_split_bar_width * 0.55
+  for i, part in enumerate(COMPUTE_SPLIT_PARTS):
+    xpos = rounds + (group_offset if i == 1 else -group_offset)
+    heights = compute_split_stats[part]["max"]
+    color = COMPUTE_SPLIT_COLORS[part]
+    ax_compute.bar(xpos, heights, width=compute_split_bar_width, color=color, edgecolor=SURFACE,
+                   linewidth=1, label=COMPUTE_SPLIT_LABELS[part], zorder=2)
+    for r in rounds:
+      add_stat_ticks(ax_compute, xpos[r], compute_split_stats[part]["min"][r],
+                      compute_split_stats[part]["avg"][r], compute_split_bar_width)
+      txt = ax_compute.text(xpos[r], heights[r] / 2, f"{int(heights[r])}", ha="center", va="center",
+                            fontsize=7, color="white", fontweight="bold", zorder=4)
+      candidate_labels.append((ax_compute, txt, xpos[r], 0.0, heights[r], compute_split_bar_width))
+
+  ax_compute.set_xticks(rounds)
+  ax_compute.set_xticklabels([f"round {r}" for r in rounds])
+
   # measure-first pass: a label only survives if its rendered bounding box
   # actually fits inside its own segment's rectangle (with a little
   # padding) -- otherwise remove it and let the legend + color carry
@@ -322,16 +357,19 @@ def plot_timing_row(row, out_path):
   fig.canvas.draw()
   renderer = fig.canvas.get_renderer()
   pad_px = 2.0
-  for ax, txt, xpos, seg_bottom, seg_top in candidate_labels:
+  for ax, txt, xpos, seg_bottom, seg_top, w in candidate_labels:
     bbox = txt.get_window_extent(renderer=renderer)
-    (x0_disp, y0_disp) = ax.transData.transform((xpos - bar_width / 2, seg_bottom))
-    (x1_disp, y1_disp) = ax.transData.transform((xpos + bar_width / 2, seg_top))
+    (x0_disp, y0_disp) = ax.transData.transform((xpos - w / 2, seg_bottom))
+    (x1_disp, y1_disp) = ax.transData.transform((xpos + w / 2, seg_top))
     fits_w = (bbox.width + 2 * pad_px) <= (x1_disp - x0_disp)
     fits_h = (bbox.height + 2 * pad_px) <= (y1_disp - y0_disp)
     if not (fits_w and fits_h):
       txt.remove()
 
   ax_h2d.set_ylabel("cycles")
+  ax_compute.set_ylabel("cycles")
+  compact_total = int(compute_split_stats["local_compute_compact"]["max"].sum())
+  expand_total = int(compute_split_stats["local_compute_expand"]["max"].sum())
   sum_rounds = int(round_duration.sum())
   diff_pct = 100.0 * (total_runtime_cycles - sum_rounds) / total_runtime_cycles
   fig.suptitle(f"Per-round phase timing -- {matrix}, {pe_grid} grid, source={source}, "
@@ -339,9 +377,11 @@ def plot_timing_row(row, out_path):
                f"n={row['n']}, nnz={row['nnz']}, {rounds_completed} rounds "
                "(bar height = round_duration_cycles, straggler PE span)\n"
                f"round bars sum to {sum_rounds} cycles vs total_runtime_cycles={total_runtime_cycles} "
-               f"({diff_pct:+.1f}% -- gap is the first round's one-time fabric fill delay)",
+               f"({diff_pct:+.1f}% -- gap is the first round's one-time fabric fill delay)\n"
+               f"local_compute split: compact multiply sums to {compact_total} cycles, "
+               f"dense expansion to {expand_total} cycles across all rounds",
                fontsize=10)
-  for ax in (ax_h2d, ax_rounds, ax_d2h):
+  for ax in (ax_h2d, ax_rounds, ax_d2h, ax_compute):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["left"].set_color(BASELINE)
@@ -358,117 +398,20 @@ def plot_timing_row(row, out_path):
   fig.patch.set_facecolor(SURFACE)
 
   handles, labels = [], []
-  for ax in (ax_h2d, ax_rounds, ax_d2h):
+  for ax in (ax_h2d, ax_rounds, ax_d2h, ax_compute):
     h, l = ax.get_legend_handles_labels()
     handles += h
     labels += l
   handles += STAT_TICK_HANDLES
   labels += [h.get_label() for h in STAT_TICK_HANDLES]
   fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, fontsize=8,
-             bbox_to_anchor=(0.5, -0.02))
-  plt.tight_layout(rect=[0, 0.16, 1, 0.94])
+             bbox_to_anchor=(0.5, -0.04))
+  plt.tight_layout(rect=[0, 0.18, 1, 0.90])
 
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=200, bbox_inches="tight")
   plt.close(fig)
   print(f"saved timing plot to {out_path}")
-
-
-def plot_compute_split_row(row, out_path):
-  """Companion to plot_timing_row: local_compute's own two sub-phases
-  (local_compute_compact -- the compact boolean multiply over
-  y_flags/parent_compact -- vs local_compute_expand -- expanding that
-  result to the dense y_local_buf, see bool_pe.csl's compute() and
-  TS_COMPUTE_EXPAND_ENTRY) as grouped per-round bars, each bar height =
-  that sub-phase's max cycles across PEs (same convention as the round
-  segments above), with min/avg tick indicators (see add_stat_ticks). A
-  direct visual answer to "does local_compute spend more time in the
-  compact multiply or the dense expansion?" -- not a replacement for
-  plot_timing_row's full-round overview."""
-  rounds_completed = int(row["rounds_completed"])
-  matrix = row["infile_mtx"]
-  pe_grid = row["pe_grid"]
-  source = row["source"]
-  channels = row["channels"]
-  rounds = np.arange(rounds_completed)
-
-  stats = {}
-  for part in COMPUTE_SPLIT_PARTS:
-    part_max = parse_cycle_list(row[f"{part}_max_cycles"]).astype(float)
-    assert len(part_max) == rounds_completed, (
-        f"{part}_max_cycles has {len(part_max)} entries, expected "
-        f"rounds_completed={rounds_completed}")
-    stats[part] = {
-        "max": part_max,
-        "min": parse_cycle_list(row[f"{part}_min_cycles"]).astype(float),
-        "avg": parse_cycle_list_float(row[f"{part}_avg_cycles"]),
-    }
-
-  bar_width = 0.35
-  group_offset = bar_width * 0.55
-  fig_w = max(1.6 * rounds_completed, 4.0)
-  fig, ax = plt.subplots(figsize=(fig_w, 5.5))
-
-  candidate_labels = []
-  for i, part in enumerate(COMPUTE_SPLIT_PARTS):
-    xpos = rounds + (group_offset if i == 1 else -group_offset)
-    heights = stats[part]["max"]
-    color = COMPUTE_SPLIT_COLORS[part]
-    ax.bar(xpos, heights, width=bar_width, color=color, edgecolor=SURFACE,
-           linewidth=1, label=COMPUTE_SPLIT_LABELS[part], zorder=2)
-    for r in rounds:
-      add_stat_ticks(ax, xpos[r], stats[part]["min"][r], stats[part]["avg"][r], bar_width)
-      txt = ax.text(xpos[r], heights[r] / 2, f"{int(heights[r])}", ha="center", va="center",
-                    fontsize=7, color="white", fontweight="bold", zorder=4)
-      candidate_labels.append((ax, txt, xpos[r], 0.0, heights[r]))
-
-  ax.set_xticks(rounds)
-  ax.set_xticklabels([f"round {r}" for r in rounds])
-  ax.set_ylabel("cycles")
-
-  fig.canvas.draw()
-  renderer = fig.canvas.get_renderer()
-  pad_px = 2.0
-  for a, txt, xpos, seg_bottom, seg_top in candidate_labels:
-    bbox = txt.get_window_extent(renderer=renderer)
-    (x0_disp, y0_disp) = a.transData.transform((xpos - bar_width / 2, seg_bottom))
-    (x1_disp, y1_disp) = a.transData.transform((xpos + bar_width / 2, seg_top))
-    fits_w = (bbox.width + 2 * pad_px) <= (x1_disp - x0_disp)
-    fits_h = (bbox.height + 2 * pad_px) <= (y1_disp - y0_disp)
-    if not (fits_w and fits_h):
-      txt.remove()
-
-  compact_total = int(stats["local_compute_compact"]["max"].sum())
-  expand_total = int(stats["local_compute_expand"]["max"].sum())
-  fig.suptitle(f"local_compute split -- {matrix}, {pe_grid} grid, source={source}, "
-               f"channels={channels}\n"
-               f"n={row['n']}, nnz={row['nnz']}, {rounds_completed} rounds "
-               "(bar height = max across PEs that round)\n"
-               f"compact multiply sums to {compact_total} cycles, dense expansion to "
-               f"{expand_total} cycles across all rounds",
-               fontsize=10)
-
-  ax.spines["top"].set_visible(False)
-  ax.spines["right"].set_visible(False)
-  ax.spines["left"].set_color(BASELINE)
-  ax.spines["bottom"].set_color(BASELINE)
-  ax.tick_params(colors=TEXT_MUTED)
-  ax.yaxis.grid(True, color=GRIDLINE, linewidth=1, zorder=0)
-  ax.set_axisbelow(True)
-  ax.set_facecolor(SURFACE)
-  fig.patch.set_facecolor(SURFACE)
-
-  handles, labels = ax.get_legend_handles_labels()
-  handles += STAT_TICK_HANDLES
-  labels += [h.get_label() for h in STAT_TICK_HANDLES]
-  fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False, fontsize=8,
-             bbox_to_anchor=(0.5, -0.05))
-  plt.tight_layout(rect=[0, 0.14, 1, 0.92])
-
-  os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-  plt.savefig(out_path, dpi=200, bbox_inches="tight")
-  plt.close(fig)
-  print(f"saved compute-split plot to {out_path}")
 
 
 def parse_args():
@@ -525,10 +468,6 @@ def main():
   out_path = args.out or default_out_path(
       plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
   plot_timing_row(row, out_path)
-
-  compute_split_out_path = default_compute_split_out_path(
-      plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
-  plot_compute_split_row(row, compute_split_out_path)
 
 
 if __name__ == "__main__":
