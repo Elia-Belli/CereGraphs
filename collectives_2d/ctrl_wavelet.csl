@@ -1,0 +1,51 @@
+// A library that allows users to encode up to 2 commands into control wavelets
+// Commands are (NOP, ADVANCE, RESET, and TEARDOWN), all available with and
+// without the NO_CE bit.
+// This library does not support sentinel colors, or commands slots 2 through 7.
+
+// Each command is 3 bits { no_ce:1 bit, command type: 2 bits }
+
+// Index of NO_CE_BIT within a command
+const CMD_NO_CE_BIT_INDEX = 2;
+
+// Indices of commands 0 and 1 within a 32-bit control wavelet
+const CMD0_INDEX = 22;
+const CMD1_INDEX = 25;
+
+// Types of control wavelet commands
+const Cmd = enum(u32) { Nop = 0, Advance = 1, Reset = 2, Teardown = 3 };
+
+fn get_cmd(cmd_params: anytype) u32 {
+  var cmd: u32 = 0;
+
+  // The NO_CE bit is totally independent of the command type, so we can just
+  // go ahead and set it if needed
+  if (@has_field(cmd_params, "no_ce")) {
+    if (cmd_params.no_ce) {
+      cmd |= (1 << CMD_NO_CE_BIT_INDEX);
+    }
+  }
+
+  // Set the appropriate bits for each command type
+  cmd |= @as(u32, cmd_params.type);
+  return cmd;
+}
+
+// Right now, we only support 2 control-wavelet commands. Each command is
+// identically structured, just stored at different bit-indices within the
+// wavelet
+fn wavelet(params: anytype) u32 {
+
+  var w: u32 = 0;
+
+  if (@has_field(params, "cmd0")) {
+    const cmd0 = get_cmd(params.cmd0);
+    w |= (cmd0 << CMD0_INDEX);
+  }
+  if (@has_field(params, "cmd1")) {
+    const cmd1 = get_cmd(params.cmd1);
+    w |= (cmd1 << CMD1_INDEX);
+  }
+
+  return w;
+}
