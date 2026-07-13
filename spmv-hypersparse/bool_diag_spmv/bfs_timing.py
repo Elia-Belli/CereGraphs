@@ -112,7 +112,14 @@ PHASE_ROOT_KIND = {
     "visited_bcast": "diagonal",
     "vertical_bcast": "diagonal",
     "reduce": "diagonal",
-    "relay_col_reduce": "mid",
+    # relay_col_reduce's root changed from "mid" to "diagonal" when its
+    # underlying primitive changed from mpi_y.reduce_fadds(MID, ...) to
+    # mpi_y.broadcast(pcol_id, ...) -- see bool_pe.csl's reduce_done() and
+    # its own comment on why (only the diagonal PE ever has real data, so
+    # this moves it instead of reducing it). Name kept for continuity with
+    # existing CSV columns/heatmaps -- it's still "phase A" of the relay,
+    # just a different primitive now.
+    "relay_col_reduce": "diagonal",
     "relay_row_reduce": "mid",
     "relay_row_bcast": "mid",
     "relay_col_bcast": "mid",

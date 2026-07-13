@@ -128,11 +128,13 @@ var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
 //                                (local compute end / reduce start)
 //   4 TS_REDUCE_DONE         -- entry of reduce_done() (reduce end / local
 //                                term-condition start)
-//   5 TS_RELAY_ISSUE         -- before mpi_y.reduce_fadds(nz_local) in
+//   5 TS_RELAY_ISSUE         -- before mpi_y.broadcast(nz_local) in
 //                                reduce_done() (local term-cond end /
 //                                relay phase A start)
 //   6 TS_TERM_COL_DONE       -- entry of term_col_done() (relay phase A
-//                                [col-reduce] end / phase B start)
+//                                [col-bcast, rooted at each column's own
+//                                diagonal -- was a col-reduce] end / phase
+//                                B start)
 //   7 TS_TERM_ROW_DONE       -- entry of term_row_done() (relay phase B
 //                                [row-reduce] end / phase C start)
 //   8 TS_TERM_ROW_BCAST_DONE -- entry of term_row_bcast_done() (relay
@@ -230,11 +232,14 @@ var visited_buf = @zeros([blk]f32);
 // us per-row (mpi_x) or per-column (mpi_y) primitives, never "the
 // diagonal" directly, so reaching from one diagonal PE to another always
 // means relaying through a full row AND a full column. That forces a
-// 4-phase relay -- column-reduce, row-reduce, row-broadcast,
-// column-broadcast -- rooted at MID on both axes, which lands the
-// aggregation point at (MID, MID): itself a diagonal PE, and the position
-// that minimizes each phase's worst-case chain latency (max(root, P-1-root)
-// hops, per <collectives_2d>'s own linear-chain reduce implementation).
+// 4-phase relay -- column-broadcast (rooted at each column's own diagonal,
+// not MID -- only the diagonal ever has real data, so this moves it rather
+// than reducing it), row-reduce, row-broadcast, column-broadcast (these
+// last three still rooted at MID on both axes) -- which lands the
+// aggregation point at (MID, MID): itself a diagonal PE, and (for the
+// three MID-rooted phases) the position that minimizes each phase's
+// worst-case chain latency (max(root, P-1-root) hops, per <collectives_2d>'s
+// own linear-chain implementation).
 // The middle two phases (row-reduce, row-broadcast) are only ever real
 // work for row MID -- every other row's own copy would combine/broadcast
 // data nobody reads, so term_col_done() has them skip straight to the
@@ -242,12 +247,15 @@ var visited_buf = @zeros([blk]f32);
 const P: u16 = @get_rectangle().width;
 const MID: u16 = P / 2;
 
-// nz_local: this round's local "did I find anything new" flag 
-// nz_col: after the column-reduce, meaningful only at row MID
+// nz_local: this round's local "did I find anything new" flag, real only
+// at the diagonal PE (pcol_id == prow_id) -- every other row's own value
+// is always 0, so phase 6 (below) is a broadcast, not a reduce: nothing
+// to sum, just move the diagonal's one real value to the rest of the
+// column. After that broadcast, every row's own nz_local holds the same
+// (that column's) shared value -- no separate nz_col buffer needed.
 // nz_total: after the row-reduce, meaningful only at (MID, MID)
 var nz_local = @zeros([1]f32);
-var nz_col = @zeros([1]f32);
-var nz_total = @zeros([1]f32); // termination conditionl
+var nz_total = @zeros([1]f32); // termination condition
 
 // rounds_completed: host-visible counter of how many rounds f_spmv_iter
 // actually ran this call, purely for verifying early termination actually
@@ -510,17 +518,27 @@ task reduce_done() void {
     rounds_completed[0] += 1;
     record_ts(ts_round, TS_RELAY_ISSUE);
 
-    // Phase 6: start termination check relay
-    mpi_y.reduce_fadds(MID, @ptrcast([*]f32, &nz_local), @ptrcast([*]f32, &nz_col),
-                        1, term_col_done_task_id);
+    // Phase 6: start termination check relay -- broadcast (not reduce)
+    // rooted at pcol_id (this column's own diagonal PE), not MID: only the
+    // diagonal ever has a real nz_local, so there's nothing to actually sum,
+    // just a value to move. Functionally equivalent to the old
+    // reduce_fadds(MID, ...) (every row ends up with the same value either
+    // way) but considerably cheaper -- reduce_fadds is the only
+    // <collectives_2d> primitive that needs BOTH fabric colors (see its own
+    // module comment), and its teardown is a two-stage, every-PE-sends
+    // handshake, versus broadcast's single-PE-sends/everyone-else-waits
+    // teardown (compare collectives_2d/pe.csl's teardown_reduce_network()
+    // and teardown_broadcast_network()).
+    mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &nz_local), 1, term_col_done_task_id);
 }
 
 
-// Column-reduce (phase A, above) is needed from every row: each
-// column's diagonal lives at a different row
+// Column-broadcast (phase A, above) is needed from every column: each
+// column's diagonal lives at a different row, and every column's own value
+// must reach row MID.
 
 // Only row MID does phases B/C for real, every other row skips straight to
-// phase D and simply waits there. 
+// phase D and simply waits there.
 
 // This is safe because mpi_x (phases B/C) and mpi_y (phase D) use separate fabric
 // queues/colors, so row MID being mid-FSM in mpi_x doesn't block it from later joining
@@ -530,11 +548,12 @@ task reduce_done() void {
 task term_col_done() void {
 
     record_ts(ts_round, TS_TERM_COL_DONE);
-    // column-reduce done: row MID holds local term condition from every diagonal
+    // column-bcast done: every row now holds this column's shared value in
+    // its own nz_local (phase 6's broadcast overwrote it in place)
 
     if (prow_id == MID) {
         // Phase 7: reduce the local term conditions on the (MID, MID) PE
-        mpi_x.reduce_fadds(MID, @ptrcast([*]f32, &nz_col), @ptrcast([*]f32, &nz_total),
+        mpi_x.reduce_fadds(MID, @ptrcast([*]f32, &nz_local), @ptrcast([*]f32, &nz_total),
                             1, term_row_done_task_id);
     } else {
         // Non-MID PEs skip to Phase 9:
