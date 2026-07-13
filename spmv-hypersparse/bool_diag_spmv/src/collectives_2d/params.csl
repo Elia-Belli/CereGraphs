@@ -1,0 +1,93 @@
+// Compile-time component of the `collectives_2d` library
+
+// This is a hack, but currently the only way to read from anonymous fields
+const anon_fields = [4]comptime_string {
+  "0", "1", "2", "3"
+};
+
+const PackedIds = struct {
+  DATA_COLOR_0: color,
+  DATA_COLOR_1: color,
+  ACTIVATE_FSM_TASK_ID: local_task_id,
+  C_LOCK: local_task_id,
+  present: bool,
+};
+
+fn pack_ids(ids: anytype, color_field: comptime_string,
+            entrypt_field: comptime_string) PackedIds {
+
+  // If the user has not asked for `x_colors` + `x_entrypoints` or `y_colors` + `y_entrypoints`,
+  // we simply return a struct with a `present = false` field: this particular dimension of the
+  // library will not be usable. Other fields are initialized to default values.
+  if (!@has_field(ids, color_field)) {
+    return .{ .DATA_COLOR_0 = @get_color(0),
+              .DATA_COLOR_1 = @get_color(0),
+              .ACTIVATE_FSM_TASK_ID = @get_local_task_id(0),
+              .C_LOCK = @get_local_task_id(0),
+              .present = false };
+  } else if (!@has_field(ids, entrypt_field)) {
+    return .{ .DATA_COLOR_0 = @get_color(0),
+              .DATA_COLOR_1 = @get_color(0),
+              .ACTIVATE_FSM_TASK_ID = @get_local_task_id(0),
+              .C_LOCK = @get_local_task_id(0),
+              .present = false };
+  }
+
+  const colors   = @field(ids, color_field);
+  const entrypts = @field(ids, entrypt_field);
+  return .{
+    .DATA_COLOR_0 = @field(colors, anon_fields[0]),
+    .DATA_COLOR_1 = @field(colors, anon_fields[1]),
+    .ACTIVATE_FSM_TASK_ID = @field(entrypts, anon_fields[0]),
+    .C_LOCK = @field(entrypts, anon_fields[1]),
+    .present = true
+  };
+}
+
+const DimParams = struct {
+  ids: PackedIds,
+  POS_DIR: direction,
+  NEG_DIR: direction,
+  pe_min: bool,
+  pe_max: bool,
+  NUM_PES: u16,
+  DIM_ID: comptime_int,
+};
+
+const Params = struct {
+  x: DimParams,
+  y: DimParams,
+};
+
+// This is a user-facing function that is called at compile-time to obtain
+// the relevant parameter struct for a given PE without including the
+// actual Px and Py values (and generating a lot of ELF files)
+fn get_params(Px: u16, Py: u16, ids: anytype) Params {
+
+  const x_ids = pack_ids(ids, "x_colors", "x_entrypoints");
+  const y_ids = pack_ids(ids, "y_colors", "y_entrypoints");
+
+  const width = @get_rectangle().width;
+  const height = @get_rectangle().height;
+
+  return .{
+    .x = .{
+      .ids = x_ids,
+      .POS_DIR = EAST,
+      .NEG_DIR = WEST,
+      .pe_min = (Px == 0),
+      .pe_max = (Px == (width - 1)),
+      .NUM_PES = width,
+      .DIM_ID = 0, // x-dimension has an ID of 0
+    },
+    .y = .{
+      .ids = y_ids,
+      .POS_DIR = SOUTH,
+      .NEG_DIR = NORTH,
+      .pe_min = (Py == 0),
+      .pe_max = (Py == (height - 1)),
+      .NUM_PES = height,
+      .DIM_ID = 1, // y-dimension has an ID of 1
+    },
+  };
+}

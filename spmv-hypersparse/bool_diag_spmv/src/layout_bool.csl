@@ -39,7 +39,9 @@ const memcpy = @import_module("<memcpy/get_params>", .{
     .height = prows,
     });
 
-const c2d = @import_module("<collectives_2d/params>");
+// local repo copy, not the container's <collectives_2d> -- see bool_pe.csl's
+// own import comment for why (stage 2 bitmap work, experimenting freely).
+const c2d = @import_module("./collectives_2d/params.csl");
 
 layout {
     @set_rectangle(pcols, prows);

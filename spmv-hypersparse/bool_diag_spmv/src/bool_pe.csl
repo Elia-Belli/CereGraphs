@@ -1,6 +1,9 @@
-// Boolean-semiring SpMV, one iteration, using the <collectives_2d> stdlib
-// instead of hand-rolled fabric routing (see gemv-collectives_2d/pe.csl for
-// the reference pattern this follows).
+// Boolean-semiring SpMV, one iteration, using collectives_2d (a local, in-tree
+// copy -- see src/collectives_2d/, vendored from the container's <collectives_2d>
+// stdlib so stage 2 of the bitmap work can add an OR-reduce without touching
+// the system-wide module other kernels/examples import) instead of
+// hand-rolled fabric routing (see gemv-collectives_2d/pe.csl for the
+// reference pattern this follows).
 //
 // The matrix A (n-by-n, boolean) is partitioned into a P-by-P grid of PEs
 // using the SAME hypersparse compressed-column format as hypersparse_spmv
@@ -206,14 +209,20 @@ fn record_ts(round: u16, slot: u16) void {
 
 // queues/dsr_ids mirror gemm-collectives_2d/pe.csl -- they don't conflict
 // with memcpy's queue 0.
-const mpi_x = @import_module("<collectives_2d/pe>", .{
+//
+// Local repo copy (bool_diag_spmv/src/collectives_2d/), not the container's
+// <collectives_2d> -- vendored in-tree so stage 2 of the bitmap work (an
+// OR-reduce, and whatever broadcast adjustments it needs) can be
+// experimented on freely without touching the system-wide stdlib module
+// that other kernels/examples also import.
+const mpi_x = @import_module("./collectives_2d/pe.csl", .{
     .dim_params = c2d_params.x,
     .queues = [2]u16{2, 4},
     .dest_dsr_ids = [1]u16{1},
     .src0_dsr_ids = [1]u16{1},
     .src1_dsr_ids = [1]u16{1},
     });
-const mpi_y = @import_module("<collectives_2d/pe>", .{
+const mpi_y = @import_module("./collectives_2d/pe.csl", .{
     .dim_params = c2d_params.y,
     .queues = [2]u16{3, 5},
     .dest_dsr_ids = [1]u16{2},
