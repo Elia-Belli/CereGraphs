@@ -13,20 +13,20 @@
       local_nnz*) is uploaded to the device exactly ONCE,
       timed separately as "construction" -- never part of any search's own
       time, same as Graph500's own Kernel 1.
-    - each search re-uploads only x_buf (the new root's one-hot seed) and
+    - each search re-uploads only x_bitmap (the new root's one-hot seed) and
       re-launches f_spmv_iter. bool_pe.csl's start_spmv() already resets
-      visited_buf/rounds_completed/parent_local_buf/ts_round itself on
+      visited_bitmap/rounds_completed/parent_local_buf/ts_round itself on
       EVERY fresh f_spmv_iter() call (see its own comments on why
       overwriting, not OR-ing, is safe for repeated launches in the same
       session) -- no separate host-side reset step is needed or sent.
-    - each search's own timed portion runs from seeding x_buf through
+    - each search's own timed portion runs from seeding x_bitmap through
       reading parent_local_buf back into host memory -- the reference
       implementation's own run_bfs(root, pred) signature makes the
       predecessor array the sole official output (no separate "visited"
       readback exists in the spec at all), so that's the only d2h transfer
       that needs to be part of search_time_cycles. visited is derived
       host-side from parent alone (device_io.derive_visited_from_parent) --
-      provably equivalent to reading visited_buf separately, see its own
+      provably equivalent to reading visited_bitmap separately, see its own
       docstring -- so no other readback is needed or timed.
 
   run_bfs.py remains the single-search deep-dive tool (tree plot, verbose
@@ -215,6 +215,7 @@ def main():
   local_nnz_rows = matrix_info["local_nnz_rows"]
 
   blk = -(-n // P)  # ceil(n / P)
+  bitmap_words = (blk + 31) // 32
 
   fabric_offset_x = 1
   fabric_offset_y = 1
@@ -252,7 +253,7 @@ def main():
 
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_simfab_trace=True)
 
-  sym_x_buf = runner.get_id("x_buf")
+  sym_x_bitmap = runner.get_id("x_bitmap")
   sym_parent_local_buf = runner.get_id("parent_local_buf")
   sym_rounds_completed = runner.get_id("rounds_completed")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
@@ -322,11 +323,11 @@ def main():
   for i, source in enumerate(sources):
     # single-source seed: only the ONE diagonal PE owning `source` ever
     # needs a real host write -- see single_source_seed_pe()'s own
-    # docstring for why every other PE's x_buf is already provably zero.
+    # docstring for why every other PE's x_bitmap is already provably zero.
     px, py, local_x = single_source_seed_pe(source, blk, P)
 
     runner.launch("f_tic", nonblock=True)
-    runner.memcpy_h2d(sym_x_buf, local_x, px, py, 1, 1, blk,
+    runner.memcpy_h2d(sym_x_bitmap, local_x, px, py, 1, 1, bitmap_words,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     runner.launch("f_toc", nonblock=False)  # blocks -> seed x h2d above is done
@@ -334,7 +335,7 @@ def main():
                                           height, width)
 
     # the only per-search "reset": bool_pe.csl's start_spmv() reinitializes
-    # visited_buf/rounds_completed/parent_local_buf/ts_round itself on every
+    # visited_bitmap/rounds_completed/parent_local_buf/ts_round itself on every
     # fresh f_spmv_iter() call -- see the module docstring above.
     runner.launch("f_spmv_iter", nonblock=False)
 

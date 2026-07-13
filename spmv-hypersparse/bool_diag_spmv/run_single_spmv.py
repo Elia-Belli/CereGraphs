@@ -30,7 +30,7 @@ import time
 import numpy as np
 from cmd_parser import parse_args
 from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
-                        hwl_to_oned_colmajor, unpack_bitmap_to_dense)
+                        hwl_to_oned_colmajor, pack_dense_to_bitmap, unpack_bitmap_to_dense)
 from preprocess_bool import preprocess
 from scipy.io import mmread
 
@@ -150,6 +150,7 @@ def main():
   y_ref = generate_boolean_reference(nrows, ncols, csrRowPtr, csrColInd, x_bool)
 
   x_hwl = dist_x_to_diag_hwl(n, x_bool, blk, P)
+  x_bitmap_hwl = pack_dense_to_bitmap(height, width, blk, x_hwl)
 
   # fabric-offsets = 1,1
   fabric_offset_x = 1
@@ -211,7 +212,7 @@ def main():
 
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_simfab_trace=True)
 
-  sym_x_buf = runner.get_id("x_buf")
+  sym_x_bitmap = runner.get_id("x_bitmap")
   sym_y_bitmap_reduced = runner.get_id("y_bitmap_reduced")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
   sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
@@ -269,8 +270,8 @@ def main():
                      streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
                      order=MemcpyOrder.COL_MAJOR, nonblock=True)
 
-  x_buf_1d = hwl_to_oned_colmajor(height, width, blk, x_hwl, np.float32)
-  runner.memcpy_h2d(sym_x_buf, x_buf_1d, 0, 0, width, height, blk,
+  x_bitmap_1d = hwl_to_oned_colmajor(height, width, bitmap_words, x_bitmap_hwl, np.uint32)
+  runner.memcpy_h2d(sym_x_bitmap, x_bitmap_1d, 0, 0, width, height, bitmap_words,
                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                      order=MemcpyOrder.COL_MAJOR, nonblock=True)
 

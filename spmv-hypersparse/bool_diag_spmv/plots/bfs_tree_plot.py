@@ -39,7 +39,7 @@ def compute_radial_layout(G, source):
   angle (a parent computed fresh via nx.bfs_tree(), guaranteed to be exactly
   one level up), not scipy_parent/device_parent directly -- both are
   genuine one-hop-closer BFS parents (bool_pe.csl's compute() gates parent
-  tracking on visited_buf so a row can only ever be assigned a parent
+  tracking on visited_bitmap so a row can only ever be assigned a parent
   during its own true discovery round -- see its module docstring), but
   nx.bfs_tree() is still used here as the canonical layout reference since
   it's independent of either implementation's own tie-break among multiple

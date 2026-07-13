@@ -212,12 +212,13 @@ def main():
   local_nnz_rows = matrix_info["local_nnz_rows"]
 
   blk = math.ceil(n / P)
+  bitmap_words = (blk + 31) // 32
 
   # single-source seed -- a real BFS workload, not run_host_driven_bfs.py's
   # random ~50%-density stress frontier (which would mask most rounds'
   # costs behind one giant first round, and wouldn't be a single tree).
   # Only the one diagonal PE owning `source` needs a real host write -- see
-  # single_source_seed_pe()'s own docstring for why every other PE's x_buf
+  # single_source_seed_pe()'s own docstring for why every other PE's x_bitmap
   # is already provably zero.
   seed_px, seed_py, seed_local_x = single_source_seed_pe(source, blk, P)
 
@@ -257,7 +258,7 @@ def main():
 
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_simfab_trace=True)
 
-  sym_x_buf = runner.get_id("x_buf")
+  sym_x_bitmap = runner.get_id("x_bitmap")
   sym_parent_local_buf = runner.get_id("parent_local_buf")
   sym_rounds_completed = runner.get_id("rounds_completed")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
@@ -321,7 +322,7 @@ def main():
     print("timing h2d: seed x upload (Graph500-style per-search cost)...")
     runner.launch("f_tic", nonblock=True)
 
-  runner.memcpy_h2d(sym_x_buf, seed_local_x, seed_px, seed_py, 1, 1, blk,
+  runner.memcpy_h2d(sym_x_bitmap, seed_local_x, seed_px, seed_py, 1, 1, bitmap_words,
                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                      order=MemcpyOrder.COL_MAJOR, nonblock=False)
 

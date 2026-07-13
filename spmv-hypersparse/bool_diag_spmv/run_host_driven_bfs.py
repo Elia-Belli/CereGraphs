@@ -8,7 +8,7 @@
   multiply -> reduce-to-diagonal) on-device, for as many rounds as real BFS
   convergence takes -- no fixed round count. At the diagonal PEs,
   reduce_done() masks each round's raw result against a cumulative
-  visited_buf before feeding it back as the next round's x -- only
+  visited_bitmap before feeding it back as the next round's x -- only
   genuinely new discoveries propagate, same as this file's own host-driven
   baseline below and bfs_spmv/run_bfs.py's host-side
   `new_mask = candidate & ~visited`. After masking, a 4-phase relay
@@ -32,15 +32,15 @@
   extract_parent_result() below, after memcpy_d2h reads back the full (not
   diagonal-only) parent_local_buf rectangle.
 
-  This script checks four things: (1) visited_buf (the cumulative
+  This script checks four things: (1) visited_bitmap (the cumulative
   discovered set) is bit-identical between running f_spmv_iter once and
   calling single-shot f_spmv from the host in a loop that applies the
   identical visited-mask and stops the same way; (2) the terminating
   round's RAW (unmasked) y_bitmap_reduced (unpacked to dense) is also
-  bit-identical -- NOT the masked x_buf, which the loop's own stop condition
+  bit-identical -- NOT the masked x_bitmap, which the loop's own stop condition
   forces to all-zero on both sides regardless of correctness, so comparing
   it would be vacuous; y_bitmap_reduced is genuinely data-dependent (it can
-  be nonzero, full of entries that happen to already be in visited_buf) and
+  be nonzero, full of entries that happen to already be in visited_bitmap) and
   is where a bug in the terminating round's own SpMV computation would
   actually show up; (3) rounds_completed
   (a host-visible counter, purely for this test) shows the device stopped at
@@ -49,7 +49,7 @@
   independently recomputes, for every round, the lowest-index active
   frontier member with a real edge to each not-yet-visited row (mirroring
   the device's own rule exactly -- see update_parent_reference()'s
-  docstring). Masked x_buf being genuinely all-zero at stop time
+  docstring). Masked x_bitmap being genuinely all-zero at stop time
   is checked too, as a sanity invariant rather than a host comparison. (The
   device side has no round cap at all -- runner.launch(..., nonblock=False)
   blocking on f_spmv_iter and returning is itself proof the on-device relay
@@ -72,7 +72,7 @@ from datetime import datetime, timezone
 import numpy as np
 from cmd_parser import parse_args
 from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
-                        extract_parent_result, hwl_to_oned_colmajor, oned_to_hwl_colmajor,
+                        extract_parent_result, hwl_to_oned_colmajor, pack_dense_to_bitmap,
                         unpack_bitmap_to_dense)
 from preprocess_bool import preprocess
 from scipy.io import mmread
@@ -110,7 +110,7 @@ def update_parent_reference(host_parent, A_csr, frontier_bool, visited):
   versions of this function had no such gate (matching an earlier, buggier
   version of compute() that could let an unrelated, much-later round's
   frontier member overwrite an already-visited row's parent whenever its
-  index happened to be lower) -- see visited_buf's role in bool_pe.csl's
+  index happened to be lower) -- see visited_bitmap's role in bool_pe.csl's
   module docstring for the on-device side of this fix.
   """
   frontier_idx = np.nonzero(frontier_bool)[0]
@@ -277,9 +277,9 @@ def main():
 
   runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_simfab_trace=True)
 
-  sym_x_buf = runner.get_id("x_buf")
+  sym_x_bitmap = runner.get_id("x_bitmap")
   sym_y_bitmap_reduced = runner.get_id("y_bitmap_reduced")
-  sym_visited_buf = runner.get_id("visited_buf")
+  sym_visited_bitmap = runner.get_id("visited_bitmap")
   sym_rounds_completed = runner.get_id("rounds_completed")
   sym_parent_local_buf = runner.get_id("parent_local_buf")
   sym_mat_rows_buf = runner.get_id("mat_rows_buf")
@@ -338,25 +338,18 @@ def main():
                      order=MemcpyOrder.COL_MAJOR, nonblock=True)
 
   def seed_x(x_hwl):
-    x_buf_1d = hwl_to_oned_colmajor(height, width, blk, x_hwl, np.float32)
-    runner.memcpy_h2d(sym_x_buf, x_buf_1d, 0, 0, width, height, blk,
+    x_bitmap_hwl = pack_dense_to_bitmap(height, width, blk, x_hwl)
+    x_bitmap_1d = hwl_to_oned_colmajor(height, width, bitmap_words, x_bitmap_hwl, np.uint32)
+    runner.memcpy_h2d(sym_x_bitmap, x_bitmap_1d, 0, 0, width, height, bitmap_words,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
-  def read_buf(sym):
-    buf_1d = np.zeros(height * width * blk, np.float32)
-    runner.memcpy_d2h(buf_1d, sym, 0, 0, width, height, blk,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
-    return oned_to_hwl_colmajor(height, width, blk, buf_1d, np.float32)
-
-  def read_y_bitmap_reduced():
-    # y_bitmap_reduced is packed (bitmap_words u32 words per PE), not dense
-    # (blk f32 per PE) like read_buf's other callers (x_buf/visited_buf) --
-    # read it at its own native size, then unpack to the dense float shape
-    # read_buf's callers already expect (see extract_diag_result).
+  def read_bitmap(sym):
+    # x_bitmap/visited_bitmap/y_bitmap_reduced are all packed the same way
+    # (bitmap_words u32 words per PE) -- read at native size, then unpack to
+    # the dense float shape callers already expect (see extract_diag_result).
     buf_1d = np.zeros(height * width * bitmap_words, np.uint32)
-    runner.memcpy_d2h(buf_1d, sym_y_bitmap_reduced, 0, 0, width, height, bitmap_words,
+    runner.memcpy_d2h(buf_1d, sym, 0, 0, width, height, bitmap_words,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     bitmap_hwl = np.reshape(buf_1d, (height, width, bitmap_words), order="F")
@@ -375,7 +368,7 @@ def main():
     return int(np.reshape(buf_1d, (height, width, 1), order="F")[(0, 0, 0)])
 
   def read_parent_local_buf():
-    # unlike x_buf/y_bitmap_reduced/visited_buf, parent_local_buf is meaningful at
+    # unlike x_bitmap/y_bitmap_reduced/visited_bitmap, parent_local_buf is meaningful at
     # EVERY PE (not just the diagonal) -- read back the full rectangle,
     # same u16-over-u32-wire convention as read_rounds_completed above.
     buf_1d = np.zeros(height * width * blk, np.uint32)
@@ -389,27 +382,27 @@ def main():
   t0 = time.time()
   seed_x(x_hwl0)
   runner.launch("f_spmv_iter", nonblock=False)
-  # x_buf ends the call holding the LAST round's masked new-discoveries (see
+  # x_bitmap ends the call holding the LAST round's masked new-discoveries (see
   # reduce_done() in bool_pe.csl -- it runs the mask/visited update on every
-  # round, including the last, so x_buf is never stale); visited_buf holds
+  # round, including the last, so x_bitmap is never stale); visited_bitmap holds
   # everything discovered across however many rounds actually ran. Getting
   # here at all (runner.launch above returned) already proves the device
   # terminated -- nonblock=False blocks until the device unblocks the cmd
   # stream, which only happens once the relay's nz_total goes to zero.
   #
-  # NOTE: device_new_last (masked x_buf) is NOT compared against the host
+  # NOTE: device_new_last (masked x_bitmap) is NOT compared against the host
   # below -- now that there's no round cap, the loop *only* stops once a
   # round's masked output is all-zero, so that vector is trivially zero on
   # BOTH sides by construction of the stop condition itself, regardless of
   # whether anything upstream is even correct. It's still useful as an
   # invariant check (the relay's stop decision better actually agree with
-  # x_buf's content), just not as a host comparison. The real comparison
+  # x_bitmap's content), just not as a host comparison. The real comparison
   # uses y_bitmap_reduced -- the RAW, unmasked SpMV result for the
   # terminating round, which is genuinely data-dependent (it can easily be
-  # nonzero, full of entries that all happen to already be in visited_buf).
-  device_new_last = extract_diag_result(n, blk, P, read_buf(sym_x_buf))
-  device_last_raw = extract_diag_result(n, blk, P, read_y_bitmap_reduced())
-  device_visited = extract_diag_result(n, blk, P, read_buf(sym_visited_buf))
+  # nonzero, full of entries that all happen to already be in visited_bitmap).
+  device_new_last = extract_diag_result(n, blk, P, read_bitmap(sym_x_bitmap))
+  device_last_raw = extract_diag_result(n, blk, P, read_bitmap(sym_y_bitmap_reduced))
+  device_visited = extract_diag_result(n, blk, P, read_bitmap(sym_visited_bitmap))
   device_rounds_run = read_rounds_completed()
   device_parent = extract_parent_result(n, blk, P, read_parent_local_buf())
   t_iter = time.time() - t0
@@ -420,7 +413,7 @@ def main():
   t0 = time.time()
   x_hwl = x_hwl0
   frontier_bool = x_bool0  # this round's active input, for update_parent_reference
-  visited = x_bool0.copy()  # f_spmv_iter seeds visited_buf from the initial x_buf too
+  visited = x_bool0.copy()  # f_spmv_iter seeds visited_bitmap from the initial x_bitmap too
   host_parent = np.full(n, -1, dtype=np.int64)
   host_last_raw = None  # the terminating round's raw y_bitmap_reduced -- the real comparison target
   host_new_last = None
@@ -430,7 +423,7 @@ def main():
     update_parent_reference(host_parent, A_csr, frontier_bool, visited)
     seed_x(x_hwl)
     runner.launch("f_spmv", nonblock=False)
-    host_last_raw = extract_diag_result(n, blk, P, read_y_bitmap_reduced())
+    host_last_raw = extract_diag_result(n, blk, P, read_bitmap(sym_y_bitmap_reduced))
     host_new_last = host_last_raw & ~visited
     visited |= host_new_last
     host_rounds_run += 1
@@ -458,7 +451,7 @@ def main():
   n_mismatch_last_raw = int(np.sum(device_last_raw != host_last_raw))
   n_mismatch_parent = int(np.sum(device_parent != host_parent))
   rounds_match = device_rounds_run == host_rounds_run
-  invariant_ok = not device_new_last.any()  # masked x_buf must be all-zero when stopped
+  invariant_ok = not device_new_last.any()  # masked x_bitmap must be all-zero when stopped
   passed = ((n_mismatch_visited == 0) and (n_mismatch_last_raw == 0)
             and (n_mismatch_parent == 0) and rounds_match and invariant_ok)
   n_with_parent = int(np.sum(device_parent >= 0))
@@ -467,7 +460,7 @@ def main():
   print(f"[[ parent mismatches: {n_mismatch_parent} / {n} ({n_with_parent} assigned a parent) ]]")
   print(f"[[ rounds completed: device={device_rounds_run}, host={host_rounds_run} "
         f"({'match' if rounds_match else 'MISMATCH'}) ]]")
-  print(f"[[ stop invariant (masked x_buf all-zero): "
+  print(f"[[ stop invariant (masked x_bitmap all-zero): "
         f"{'OK' if invariant_ok else 'VIOLATED -- ' + str(int(np.sum(device_new_last)))} ]]")
   print(f"[[ Result: {'PASS' if passed else 'FAIL'} ]]")
   if not passed:

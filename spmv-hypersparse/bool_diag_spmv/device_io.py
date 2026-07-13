@@ -23,6 +23,9 @@ def hwl_to_oned_colmajor(height: int, width: int, pe_length: int, A_hwl: np.ndar
         for h in range(height):
           A_1d[idx] = A_hwl[(h, w, l)]
           idx = idx + 1
+  elif A_hwl.dtype == np.uint32:
+    assert dtype == np.uint32, "only support dtype = u32 if A is u32"
+    A_1d = np.reshape(A_hwl, height * width * pe_length, order="F")
   elif A_hwl.dtype == np.uint16:
     assert dtype == np.uint32, "only support dtype = u32 if A is u16"
     A_1d = np.zeros(height * width * pe_length, dtype)
@@ -66,30 +69,49 @@ def dist_x_to_diag_hwl(n, x_bool, blk, P):
 def single_source_seed_pe(source, blk, P):
   """For a genuinely single-source BFS seed (exactly one true bit, at
   `source`), return (px, py, local_x) for the ONE diagonal PE that owns
-  it -- px=py=source//blk (diagonal: column==row), local_x a length-blk
-  float32 array with a single 1.0 at local index source%blk. Pair with a
-  1x1-region memcpy_h2d instead of dist_x_to_diag_hwl's full (P,P,blk)
-  rectangle: every OTHER diagonal PE's x_buf is provably already zero
-  (bool_pe.csl's reduce_done() sets x_buf[i] = newly every round including
-  the last, and the loop's own termination condition, nz_total == 0, is a
-  non-negative sum over every diagonal PE's own nz_local flag -- which is
-  1.0 iff that PE's own x_buf had any nonzero entry -- so nz_total == 0
-  provably means every diagonal PE's x_buf is all-zero at the moment
-  f_spmv_iter() returns; combined with x_buf's zero state at kernel load,
-  this holds for the very first search too), and non-diagonal PEs never
-  need a host write at all regardless (every PE's x_buf is unconditionally
-  overwritten by that round's own column-broadcast, in
-  visited_bcast_done(), before compute() ever reads it).
+  it -- px=py=source//blk (diagonal: column==row), local_x a length-
+  bitmap_words uint32 array with a single bit set at local index
+  source%blk (word (source%blk)>>5, bit position (source%blk)&31 --
+  bool_pe.csl's x_bitmap layout exactly). Pair with a 1x1-region
+  memcpy_h2d instead of dist_x_to_diag_hwl's full (P,P,blk) rectangle:
+  every OTHER diagonal PE's x_bitmap is provably already zero
+  (bool_pe.csl's reduce_done() sets x_bitmap[w] = newly_word every round
+  including the last, and the loop's own termination condition,
+  nz_total == 0, is a non-negative sum over every diagonal PE's own
+  nz_local flag -- which is 1.0 iff that PE's own x_bitmap had any nonzero
+  word -- so nz_total == 0 provably means every diagonal PE's x_bitmap is
+  all-zero at the moment f_spmv_iter() returns; combined with x_bitmap's
+  zero state at kernel load, this holds for the very first search too),
+  and non-diagonal PEs never need a host write at all regardless (every
+  PE's x_bitmap is unconditionally overwritten by that round's own
+  column-broadcast, in visited_bcast_done(), before compute() ever reads
+  it).
 
   Only valid for this single-source, f_spmv_iter case -- NOT for
   run_host_driven_bfs.py's multi-source frontier (several diagonal PEs can
   be genuinely live at once there) or run_single_spmv.py's one-shot
-  f_spmv (which never touches x_buf itself, so has no such self-zeroing
+  f_spmv (which never touches x_bitmap itself, so has no such self-zeroing
   invariant)."""
   p = source // blk
-  local_x = np.zeros(blk, dtype=np.float32)
-  local_x[source % blk] = 1.0
+  bitmap_words = (blk + 31) // 32
+  local_x = np.zeros(bitmap_words, dtype=np.uint32)
+  local_idx = source % blk
+  local_x[local_idx >> 5] = np.uint32(1) << (local_idx & 31)
   return p, p, local_x
+
+
+def pack_dense_to_bitmap(height, width, blk, dense_hwl):
+  """Inverse of unpack_bitmap_to_dense: dense_hwl is a (height, width, blk)
+  float32/bool array (0.0/1.0 or False/True); returns a (height, width,
+  bitmap_words) uint32 array packed the same way bool_pe.csl's
+  x_bitmap/y_bitmap/visited_bitmap are (bit k of word k>>5, bit position
+  k&31)."""
+  bitmap_words = (blk + 31) // 32
+  bitmap = np.zeros((height, width, bitmap_words), dtype=np.uint32)
+  bits = dense_hwl != 0
+  for k in range(blk):
+    bitmap[:, :, k >> 5] |= bits[:, :, k].astype(np.uint32) << (k & 31)
+  return bitmap
 
 
 # Extract the diagonal PEs' y_bitmap_reduced (the only ones holding a
@@ -132,23 +154,23 @@ def extract_parent_result(n, blk, P, parent_hwl):
 def derive_visited_from_parent(n, parent, source):
   """visited[v] == True iff parent[v] >= 0 or v is the source itself.
 
-  This is provably equivalent to reading back bool_pe.csl's visited_buf
+  This is provably equivalent to reading back bool_pe.csl's visited_bitmap
   directly, not an approximation: compute() only ever records a parent
   candidate for row v in the SAME round v's row-reduce first turns
-  visited_buf[v] nonzero (the visited_buf[dense_idx] == 0.0 gate in
+  visited_bitmap's bit v nonzero (the visited_bitmap bit-test gate in
   compute() -- see its own comment -- means every PE that contributes a hit
   to v's row-reduce in v's true discovery round also attempts to record a
   parent candidate that round), so parent_local_buf's row-min is non-
   PARENT_NONE exactly when v was ever discovered. The source is seeded
-  directly into visited_buf in start_spmv(), never through compute(), so it
-  never gets a parent recorded there -- callers already patch
+  directly into visited_bitmap in start_spmv(), never through compute(), so
+  it never gets a parent recorded there -- callers already patch
   parent[source] = source after extract_parent_result(), which this
   function's `v is the source` check also covers.
 
   This is also Graph500's own convention: the reference implementation's
   Kernel 2 output is exactly the predecessor array (pred[v] = -1 for
   unreached, pred[root] = root) -- there's no separate "visited" output at
-  all, so recovering it from parent instead of reading back visited_buf
+  all, so recovering it from parent instead of reading back visited_bitmap
   separately is not just an optimization, it's the more spec-faithful
   representation of "the output"."""
   visited = parent >= 0

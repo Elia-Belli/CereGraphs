@@ -14,10 +14,11 @@
 //
 // Communication is targeted at the grid diagonal (pcol_id == prow_id) rather
 // than a fixed corner:
-//   - phase 1: mpi_y.broadcast(root=pcol_id, x_buf, ...) -- every PE in a
-//     column receives the SAME x-block, sourced from that column's diagonal
-//     PE (row == pcol_id). Only the diagonal PE's x_buf is seeded with real
-//     data (host memcpy); everyone else's is overwritten by the broadcast.
+//   - phase 1: mpi_y.broadcast(root=pcol_id, x_bitmap, ...) -- every PE in a
+//     column receives the SAME x-block (packed as a bitmap), sourced from
+//     that column's diagonal PE (row == pcol_id). Only the diagonal PE's
+//     x_bitmap is seeded with real data (host memcpy); everyone else's is
+//     overwritten by the broadcast.
 //   - phase 2: mpi_x.reduce_or(root=prow_id, y_bitmap, y_bitmap_reduced, ...)
 //     -- every PE in a row sends its local boolean contribution (packed as
 //     a bitmap) toward that row's diagonal column (== prow_id), which ends
@@ -30,7 +31,7 @@
 // its own column.
 //
 // f_spmv_iter runs this without a host round trip, masking each round's raw
-// result against a cumulative visited_buf (see reduce_done()) before
+// result against a cumulative visited_bitmap (see reduce_done()) before
 // feeding it back as the next round's x -- i.e. only genuinely new
 // discoveries propagate, same as bfs_spmv/run_bfs.py's host-side
 // `new_mask = candidate & ~visited`. It stops once a 4-phase relay (see
@@ -51,7 +52,7 @@
 // round, which the row-reduce's aggregation would otherwise throw away.
 //
 // A candidate is only ever recorded for a row that ISN'T YET VISITED (see
-// the visited_buf[dense_idx] == 0.0 check in compute()) -- without that
+// the visited_bitmap bit-test in compute()) -- without that
 // gate, a row that was already visited several rounds ago could still get
 // touched by a later round's frontier (any node with a real structural
 // edge into it, however many hops away that node actually is), silently
@@ -60,14 +61,14 @@
 // can ever see a hit on a row before that row's actual global discovery
 // round (a hit at any PE immediately makes the row visited by the end of
 // that same round, via the row-reduce all PEs share), gating on
-// visited_buf restricts candidate recording to exactly a row's true
+// visited_bitmap restricts candidate recording to exactly a row's true
 // discovery round -- gives a genuine, textbook one-hop-closer BFS parent,
-// not merely a valid-but-arbitrary predecessor. This requires visited_buf
+// not merely a valid-but-arbitrary predecessor. This requires visited_bitmap
 // (otherwise meaningful only at the diagonal PE, see its own comment
 // below) to be distributed to every PE in the row before compute() runs
 // each round -- see visited_bcast_done()/term_col_bcast_done() below.
 //
-// Each PE keeps parent_local_buf, indexed identically to x_buf/y_bitmap
+// Each PE keeps parent_local_buf, indexed identically to x_bitmap/y_bitmap
 // (dense over its row-block), holding the lowest-global-index column it
 // has ever recorded for each local row ("lowest index" is the
 // deterministic tie-break for multiple local columns hitting the same row
@@ -97,7 +98,7 @@ const term_col_done_task_id: local_task_id = @get_local_task_id(12);
 const term_row_done_task_id: local_task_id = @get_local_task_id(13);
 const term_row_bcast_done_task_id: local_task_id = @get_local_task_id(18);
 const term_col_bcast_done_task_id: local_task_id = @get_local_task_id(19);
-// distributes visited_buf across each row before compute() runs -- see the
+// distributes visited_bitmap across each row before compute() runs -- see the
 // module docstring above and visited_bcast_done() below.
 const visited_bcast_done_task_id: local_task_id = @get_local_task_id(20);
 
@@ -123,9 +124,9 @@ var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
 // phase; where a task immediately re-issues the next collective with no
 // other work in between, its entry timestamp doubles as both the previous
 // phase's end and the next phase's start (see the call sites below):
-//   0 TS_VBCAST_ISSUE        -- before mpi_x.broadcast(visited_buf)
+//   0 TS_VBCAST_ISSUE        -- before mpi_x.broadcast(visited_bitmap)
 //   1 TS_VBCAST_DONE         -- entry of visited_bcast_done() (visited
-//                                bcast end / vertical x_buf bcast start)
+//                                bcast end / vertical x_bitmap bcast start)
 //   2 TS_COMPUTE_ENTRY       -- entry of compute() (vertical bcast end /
 //                                local compute start)
 //   3 TS_COMPUTE_RESET_DONE  -- between compute()'s buffer resets (y_bitmap
@@ -238,20 +239,6 @@ var local_nnz = @zeros([1]u16);
 var local_nnz_cols = @zeros([1]u16);
 var local_nnz_rows = @zeros([1]u16);
 
-// x_buf: this PE's dense column-block of x
-var x_buf = @zeros([blk]f32);
-
-// visited_buf: cumulative "ever discovered" bitmap for f_spmv_iter, indexed
-// identically to x_buf (same row/column block, dense f32). Real writes only ever
-// happen at the diagonal PE: seeded from the initial x_buf in start_spmv(),
-// OR'd with every round's genuinely-new discoveries in reduce_done(). Every
-// other PE in the row gets a fresh copy each round via visited_bcast_done()
-// (same "only the diagonal's copy is real, broadcast overwrites everyone
-// else's" convention x_buf already uses) -- compute() needs this at every
-// PE to gate parent tracking (see the module docstring above). Never used
-// or touched by plain f_spmv (see the is_iterative guards below).
-var visited_buf = @zeros([blk]f32);
-
 // Real termination check (see reduce_done()): <collectives_2d> only gives
 // us per-row (mpi_x) or per-column (mpi_y) primitives, never "the
 // diagonal" directly, so reaching from one diagonal PE to another always
@@ -287,7 +274,7 @@ var nz_total = @zeros([1]f32); // termination condition
 var rounds_completed = @zeros([1]u16);
 
 // y_bitmap: dense per-PE bitmap over this PE's row-block (bit k == row k of
-// blk, matching x_buf's own indexing), set by the local multiply below and
+// blk, matching x_bitmap's own indexing), set by the local multiply below and
 // fed directly into reduce_or as its send buffer -- see compute(). Replaces
 // the old compact-index y_flags/y_rows_init_buf scheme -- mat_rows_buf now
 // gives a dense row index directly (see preprocess_bool.py), so there is
@@ -302,6 +289,25 @@ var rounds_completed = @zeros([1]u16);
 // host-populated from real structural rows and therefore always < blk.
 // Never explicitly masked; true by construction.
 const BITMAP_WORDS: u16 = (blk + 31) / 32;
+
+// x_bitmap: this PE's dense column-block of x, packed the same way
+// y_bitmap is (bit k == column k of blk). Broadcast() is dtype-agnostic
+// (confirmed stage 2a), so this needs no @ptrcast at its broadcast call
+// sites -- just BITMAP_WORDS instead of blk as the element count.
+var x_bitmap = @zeros([BITMAP_WORDS]u32);
+
+// visited_bitmap: cumulative "ever discovered" set for f_spmv_iter, packed
+// the same way, indexed identically to x_bitmap (same row/column block).
+// Real writes only ever happen at the diagonal PE: seeded from the initial
+// x_bitmap in start_spmv(), OR'd with every round's genuinely-new
+// discoveries in reduce_done(). Every other PE in the row gets a fresh copy
+// each round via visited_bcast_done() (same "only the diagonal's copy is
+// real, broadcast overwrites everyone else's" convention x_bitmap already
+// uses) -- compute() needs this at every PE to gate parent tracking (see
+// the module docstring above). Never used or touched by plain f_spmv (see
+// the is_iterative guards below).
+var visited_bitmap = @zeros([BITMAP_WORDS]u32);
+
 var y_bitmap = @zeros([BITMAP_WORDS]u32);
 
 // y_bitmap_reduced: final row-block result after reduce_or, packed the same
@@ -334,18 +340,18 @@ const y_bitmap_reduced_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_bitmap_re
 const PARENT_NONE: u16 = 65535;
 
 // parent_local_buf: this PE's own candidate parent, dense over its
-// row-block like x_buf, PERSISTED across rounds (never reset
+// row-block like x_bitmap, PERSISTED across rounds (never reset
 // except at a fresh f_spmv_iter call in start_spmv()) -- holds the lowest
 // global vertex index this PE has EVER seen touch each local row, across
-// every round. Meaningful at EVERY PE (unlike x_buf/y_bitmap_reduced/
-// visited_buf, which only matter at the diagonal): different PEs in the same row cover
+// every round. Meaningful at EVERY PE (unlike x_bitmap/y_bitmap_reduced/
+// visited_bitmap, which only matter at the diagonal): different PEs in the same row cover
 // different column ranges, so the row's true parent is the min across all
 // P PEs in that row -- done host-side, see the module docstring above.
 var parent_local_buf = @zeros([blk]u16);
 
-var ptr_x_buf: [*]f32 = &x_buf;
+var ptr_x_bitmap: [*]u32 = &x_bitmap;
 var ptr_y_bitmap_reduced: [*]u32 = &y_bitmap_reduced;
-var ptr_visited_buf: [*]f32 = &visited_buf;
+var ptr_visited_bitmap: [*]u32 = &visited_bitmap;
 var ptr_rounds_completed: [*]u16 = &rounds_completed;
 var ptr_parent_local_buf: [*]u16 = &parent_local_buf;
 var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
@@ -398,11 +404,11 @@ fn start_spmv() void {
     // - Reset the visited as the new x
     // - Reset the parent_local_buf to PARENT_NONE
     if (is_iterative and pcol_id == prow_id) {
-        
-        var i: u16 = 0;
-        while (i < blk) : (i += 1) 
+
+        var w: u16 = 0;
+        while (w < BITMAP_WORDS) : (w += 1)
         {
-            visited_buf[i] = x_buf[i];
+            visited_bitmap[w] = x_bitmap[w];
         }
     }
     if (is_iterative) {
@@ -422,21 +428,21 @@ fn start_spmv() void {
         ts_round = rounds_completed[0];
         record_ts(ts_round, TS_VBCAST_ISSUE);
 
-        // Phase 1: broadcast visited blk along each row (needed for parent tracking) 
-        mpi_x.broadcast(prow_id, @ptrcast([*]u32, &visited_buf), blk, visited_bcast_done_task_id);
-    
+        // Phase 1: broadcast visited bitmap along each row (needed for parent tracking)
+        mpi_x.broadcast(prow_id, &visited_bitmap, BITMAP_WORDS, visited_bcast_done_task_id);
+
     } else {
-        // SpMV: just broadcast x_buf down the column
-        mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+        // SpMV: just broadcast x_bitmap down the column
+        mpi_y.broadcast(pcol_id, &x_bitmap, BITMAP_WORDS, compute_task_id);
     }
 }
 
 task visited_bcast_done() void {
 
     record_ts(ts_round, TS_VBCAST_DONE);
-    
-    // Phase 2: broadcast x_buf down the column
-    mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+
+    // Phase 2: broadcast x_bitmap down the column
+    mpi_y.broadcast(pcol_id, &x_bitmap, BITMAP_WORDS, compute_task_id);
 }
 
 // compute y = A*x, one iteration, boolean semiring, reduce to the diagonal
@@ -462,11 +468,7 @@ task compute() void {
         record_ts(ts_round, TS_COMPUTE_ENTRY);
     }
 
-    // Reset y_bitmap and y_bitmap_reduced (see their own declaration
-    // comments for the padding invariant this reset establishes each
-    // round) -- one DSD op per buffer instead of a scalar while loop, the
-    // tensor engine streams the whole buffer's worth of zeros in one
-    // hardware-driven pass.
+    // Reset y_bitmap and y_bitmap_reduced
     @mov32(y_bitmap_dsd, fill_bitmap_u32);
     @mov32(y_bitmap_reduced_dsd, fill_bitmap_u32);
 
@@ -475,12 +477,12 @@ task compute() void {
     }
 
     // Phase 3 Local boolean multiply: for every locally-nonzero column c with
-    // x_buf[c] set, set the bit for every local (dense) row it touches.
-    // Also merge a candidate parent directly into the persistent
+    // x_bitmap's bit c set, set the bit for every local (dense) row it
+    // touches. Also merge a candidate parent directly into the persistent
     // parent_local_buf -- inline, no separate per-round scratch buffer --
     // BEFORE the reduce below discards column identity. This is safe
-    // because visited_buf is only ever written in reduce_done(), which runs
-    // strictly after compute() finishes for this round, so visited_buf is
+    // because visited_bitmap is only ever written in reduce_done(), which runs
+    // strictly after compute() finishes for this round, so visited_bitmap is
     // guaranteed stable for the whole loop below; the min-comparison
     // ("lowest global vertex id wins") is commutative/idempotent, so folding
     // it in immediately per-hit, instead of via a deferred compact-scratch
@@ -488,7 +490,7 @@ task compute() void {
     var i: u16 = 0;
     while (i < local_nnz_cols[0]) : (i += 1) {
         const c = mat_col_idx_buf[i];
-        if (x_buf[c] != 0.0) {
+        if ((x_bitmap[c >> 5] >> (c & 31)) & 1 != 0) {
             const loc = mat_col_loc_buf[i];
             const len = mat_col_len_buf[i];
             var j: u16 = 0;
@@ -497,7 +499,7 @@ task compute() void {
                 y_bitmap[k >> 5] |= (@as(u32, 1) << (k & 31));
                 if (is_iterative) {
                     const candidate: u16 = pcol_id * blk + c; //global vertex index for column c
-                    if (visited_buf[k] == 0.0 and candidate < parent_local_buf[k]) {
+                    if ((visited_bitmap[k >> 5] >> (k & 31)) & 1 == 0 and candidate < parent_local_buf[k]) {
                         parent_local_buf[k] = candidate;
                     }
                 }
@@ -537,22 +539,26 @@ task reduce_done() void {
         // Runs on EVERY round, including the last: if this only ran when
         // there's a next round to feed (like an unconditional copy would),
         // the final round's discoveries would never make it into
-        // visited_buf, and x_buf would end the call holding stale data
+        // visited_bitmap, and x_bitmap would end the call holding stale data
         // from the second-to-last round instead of this round's actual
         // new nodes.
         //
+        // Word-level, not bit-level: newly_word's zero bits are exactly the
+        // rows that are either not hit this round or already visited, so a
+        // single AND-NOT per word replaces a per-row bit test. Padding-bit
+        // invariant holds automatically -- y_bitmap_reduced's padding is
+        // always 0, so newly_word's padding is always 0 too (AND with
+        // anything), and visited_bitmap/x_bitmap's padding stays 0
+        // inductively (OR/assign of an always-0 value).
         nz_local[0] = 0.0;
-        var i: u16 = 0;
-        while (i < blk) : (i += 1) {
-            const bit_set = (y_bitmap_reduced[i >> 5] >> (i & 31)) & 1 != 0;
-            var newly: f32 = 0.0;
-            if (bit_set and visited_buf[i] == 0.0) {
-                // a real, not-yet-visited discovery this round
-                newly = 1.0;
-                visited_buf[i] = 1.0;
+        var w: u16 = 0;
+        while (w < BITMAP_WORDS) : (w += 1) {
+            const newly_word: u32 = y_bitmap_reduced[w] & ~visited_bitmap[w];
+            if (newly_word != 0) {
                 nz_local[0] = 1.0;
             }
-            x_buf[i] = newly;
+            visited_bitmap[w] |= newly_word;
+            x_bitmap[w] = newly_word;
         }
     }
 
@@ -635,8 +641,8 @@ task term_col_bcast_done() void {
         ts_round = rounds_completed[0];
         record_ts(ts_round, TS_VBCAST_ISSUE);
         
-        // Start with Phase 1 again: row-bcast updated visited buf
-        mpi_x.broadcast(prow_id, @ptrcast([*]u32, &visited_buf), blk, visited_bcast_done_task_id);
+        // Start with Phase 1 again: row-bcast updated visited bitmap
+        mpi_x.broadcast(prow_id, &visited_bitmap, BITMAP_WORDS, visited_bcast_done_task_id);
    
     } else {
         sys_mod.unblock_cmd_stream();
@@ -652,9 +658,9 @@ comptime {
     @bind_local_task(term_col_bcast_done, term_col_bcast_done_task_id);
     @bind_local_task(visited_bcast_done, visited_bcast_done_task_id);
 
-    @export_symbol(ptr_x_buf, "x_buf");
+    @export_symbol(ptr_x_bitmap, "x_bitmap");
     @export_symbol(ptr_y_bitmap_reduced, "y_bitmap_reduced");
-    @export_symbol(ptr_visited_buf, "visited_buf");
+    @export_symbol(ptr_visited_bitmap, "visited_bitmap");
     @export_symbol(ptr_rounds_completed, "rounds_completed");
     @export_symbol(ptr_parent_local_buf, "parent_local_buf");
     @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
