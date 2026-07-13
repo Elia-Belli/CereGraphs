@@ -1,0 +1,96 @@
+// Boolean, diagonal-reduce SpMV (one iteration). Modeled on
+// gemv-collectives_2d/layout.csl: uses <collectives_2d> for all PE-to-PE
+// communication instead of hand-rolled routing, so there's no separate
+// per-module layout.csl the way hypersparse_spmv has one -- bool_pe.csl is
+// the whole per-PE kernel.
+//
+// color/task-id map (mirrors the convention in gemv-collectives_2d/layout.csl)
+//   0 c2d_x_color_0    10 compute_task_id           18 term_row_bcast_done_task_id
+//   1 c2d_x_color_1    11 reduce_done_task_id        19 term_col_bcast_done_task_id
+//   4 c2d_y_color_0    12 term_col_done_task_id      20 visited_bcast_done_task_id
+//   5 c2d_y_color_1    13 term_row_done_task_id
+//                      14 c2d_x_entrypt_0
+//                      15 c2d_x_entrypt_1
+//                      16 c2d_y_entrypt_0
+//                      17 c2d_y_entrypt_1
+// (21-23, 27-30, 33-37ish reserved by memcpy, per the other layout.csl files)
+
+param prows: u16;   // number of PE rows (height of the core rectangle)
+param pcols: u16;   // number of PE cols (width of the core rectangle)
+
+param blk: u16;                 // per-PE dense vector chunk size = ceil(n/P)
+param max_local_nnz: u16;
+param max_local_nnz_cols: u16;
+param max_local_nnz_rows: u16;
+// upper bound on f_spmv_iter rounds profiled by ts_buf (see bool_pe.csl) --
+// defaulted so existing callers (run_single_spmv.py/run_host_driven_bfs.py)
+// that don't care about per-round timing don't need to pass anything;
+// run_bfs.py overrides it explicitly.
+param max_rounds: u16 = 10;
+
+comptime {
+    // the diagonal-target design requires a square grid: every row/column
+    // needs a diagonal PE.
+    @comptime_assert(prows == pcols);
+}
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width = pcols,
+    .height = prows,
+    });
+
+const c2d = @import_module("<collectives_2d/params>");
+
+layout {
+    @set_rectangle(pcols, prows);
+
+    var px: u16 = 0;
+    while (px < pcols) : (px += 1) {
+        const memcpy_params = memcpy.get_params(px);
+
+        var py: u16 = 0;
+        while (py < prows) : (py += 1) {
+            const c2d_params = c2d.get_params(px, py, .{
+                .x_colors = .{ @get_color(0), @get_color(1) },
+                .x_entrypoints = .{ @get_local_task_id(14), @get_local_task_id(15) },
+                .y_colors = .{ @get_color(4), @get_color(5) },
+                .y_entrypoints = .{ @get_local_task_id(16), @get_local_task_id(17) },
+            });
+            @set_tile_code(px, py, "bool_pe.csl", .{
+                .memcpy_params = memcpy_params,
+                .c2d_params = c2d_params,
+                .blk = blk,
+                .max_local_nnz = max_local_nnz,
+                .max_local_nnz_cols = max_local_nnz_cols,
+                .max_local_nnz_rows = max_local_nnz_rows,
+                .max_rounds = max_rounds,
+            });
+        } // while py
+    } // while px
+
+    @export_name("x_buf", [*]f32, true);
+    @export_name("y_buf", [*]f32, true);
+    @export_name("visited_buf", [*]f32, true);
+    @export_name("rounds_completed", [*]u16, true);
+    @export_name("parent_local_buf", [*]u16, true);
+
+    @export_name("mat_rows_buf", [*]u16, true);
+    @export_name("mat_col_idx_buf", [*]u16, true);
+    @export_name("mat_col_loc_buf", [*]u16, true);
+    @export_name("mat_col_len_buf", [*]u16, true);
+    @export_name("y_rows_init_buf", [*]u16, true);
+
+    @export_name("local_nnz", [*]u16, true);
+    @export_name("local_nnz_cols", [*]u16, true);
+    @export_name("local_nnz_rows", [*]u16, true);
+
+    @export_name("tsc_start_buffer", [*]u16, true);
+    @export_name("tsc_end_buffer", [*]u16, true);
+    @export_name("ts_buf", [*]u16, true);
+
+    @export_name("f_spmv", fn()void);
+    @export_name("f_spmv_iter", fn()void);
+    @export_name("f_enable_tsc", fn()void);
+    @export_name("f_tic", fn()void);
+    @export_name("f_toc", fn()void);
+}

@@ -1,0 +1,617 @@
+// Boolean-semiring SpMV, one iteration, using the <collectives_2d> stdlib
+// instead of hand-rolled fabric routing (see gemv-collectives_2d/pe.csl for
+// the reference pattern this follows).
+//
+// The matrix A (n-by-n, boolean) is partitioned into a P-by-P grid of PEs
+// using the SAME hypersparse compressed-column format as hypersparse_spmv
+// (mat_col_idx/loc/len_buf, mat_rows_buf, y_rows_init_buf) -- just without
+// mat_vals_buf, since boolean semiring never uses edge weights.
+//
+// Communication is targeted at the grid diagonal (pcol_id == prow_id) rather
+// than a fixed corner:
+//   - phase 1: mpi_y.broadcast(root=pcol_id, x_buf, ...) -- every PE in a
+//     column receives the SAME x-block, sourced from that column's diagonal
+//     PE (row == pcol_id). Only the diagonal PE's x_buf is seeded with real
+//     data (host memcpy); everyone else's is overwritten by the broadcast.
+//   - phase 2: mpi_x.reduce_fadds(root=prow_id, y_local_buf, y_buf, ...) --
+//     every PE in a row sends its local boolean contribution toward that
+//     row's diagonal column (== prow_id), which ends up holding the final
+//     result. Boolean OR is implemented as add-then-nonzero, since values
+//     are 0.0/1.0: sum > 0 <=> OR.
+//
+// This choice of diagonal target (instead of a scattered or corner-gathered
+// result) is what lets a later BFS loop reuse phase 1 unmodified: the PE
+// that produces row py's final result (the diagonal PE of that row) is
+// exactly the PE that needs to source the next iteration's broadcast down
+// its own column.
+//
+// f_spmv_iter runs this without a host round trip, masking each round's raw
+// result against a cumulative visited_buf (see reduce_done()) before
+// feeding it back as the next round's x -- i.e. only genuinely new
+// discoveries propagate, same as bfs_spmv/run_bfs.py's host-side
+// `new_mask = candidate & ~visited`. It stops once a 4-phase relay (see
+// reduce_done()/term_col_done()/term_row_done()/term_row_bcast_done()/
+// term_col_bcast_done()) agrees no row found anything new this round --
+// no fixed round count, no host round trip anywhere in the loop.
+// Convergence under visited-masking is monotonic (every round either finds
+// >=1 new node or stops) and bounded by the node count, so this is
+// guaranteed to terminate.
+//
+// Parent tracking (which vertex discovered a given node) can't use
+// reduce_fadds at all -- it's a sum, not a selection, so it can't answer
+// "which PE contributed" once more than one predecessor fires in the same
+// round (see bfs_spmv/run_bfs.py's own docstring point 3 for the same
+// limitation on the host-orchestrated version). Instead, parent is tracked
+// per-PE, BEFORE the reduce (see compute()): every PE (i,j) in row i knows
+// exactly which of its own local columns touched which local row this
+// round, which reduce_fadds's aggregation would otherwise throw away.
+//
+// A candidate is only ever recorded for a row that ISN'T YET VISITED (see
+// the visited_buf[dense_idx] == 0.0 check in compute()) -- without that
+// gate, a row that was already visited several rounds ago could still get
+// touched by a later round's frontier (any node with a real structural
+// edge into it, however many hops away that node actually is), silently
+// overwriting a true one-hop-closer parent with an unrelated, invalid one
+// whenever the later node's global index happened to be lower. Since no PE
+// can ever see a hit on a row before that row's actual global discovery
+// round (a hit at any PE immediately makes the row visited by the end of
+// that same round, via the row-reduce all PEs share), gating on
+// visited_buf restricts candidate recording to exactly a row's true
+// discovery round -- gives a genuine, textbook one-hop-closer BFS parent,
+// not merely a valid-but-arbitrary predecessor. This requires visited_buf
+// (otherwise meaningful only at the diagonal PE, see its own comment
+// below) to be distributed to every PE in the row before compute() runs
+// each round -- see visited_bcast_done()/term_col_bcast_done() below.
+//
+// Each PE keeps parent_local_buf, indexed identically to y_local_buf
+// (dense over its row-block), holding the lowest-global-index column it
+// has ever recorded for each local row ("lowest index" is the
+// deterministic tie-break for multiple local columns hitting the same row
+// in the same discovery round). Because different PEs in the SAME row
+// cover different column ranges, a row's true best candidate is the min
+// across all P PEs in that row -- <collectives_2d> has no min-reduce, so
+// this last step is done host-side after memcpy_d2h (see
+// extract_parent_result() in ../device_io.py). TODO: this final
+// cross-PE min could in principle be done on-device with a relay shaped
+// like the termination check above, but there's no min-reduce primitive to
+// build it from without hand-rolling one.
+
+param memcpy_params;
+param c2d_params;
+
+param blk: u16;                 // per-PE dense vector chunk size = ceil(n/P)
+param max_local_nnz: u16;       // max local number of nonzeros (matrix structure only, no vals)
+param max_local_nnz_cols: u16;  // max local number of nonzero columns
+param max_local_nnz_rows: u16;  // max local number of nonzero rows
+param max_rounds: u16;          // upper bound on f_spmv_iter rounds profiled by ts_buf below
+
+const compute_task_id: local_task_id = @get_local_task_id(10);
+const reduce_done_task_id: local_task_id = @get_local_task_id(11);
+// termination-check relay (see reduce_done()/MID below) -- 14-17 are taken
+// by <collectives_2d>'s own x/y entrypoints (see the map in layout_bool.csl).
+const term_col_done_task_id: local_task_id = @get_local_task_id(12);
+const term_row_done_task_id: local_task_id = @get_local_task_id(13);
+const term_row_bcast_done_task_id: local_task_id = @get_local_task_id(18);
+const term_col_bcast_done_task_id: local_task_id = @get_local_task_id(19);
+// distributes visited_buf across each row before compute() runs -- see the
+// module docstring above and visited_bcast_done() below.
+const visited_bcast_done_task_id: local_task_id = @get_local_task_id(20);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// tsc timing, bracketing just broadcast+compute+reduce (memcpy happens
+// before f_tic is launched). No cross-PE clock-skew correction (unlike
+// hypersparse_spmv's allreduce2R1E-based f_sync) -- for a quick relative
+// comparison this is run with the same simplified methodology on both
+// kernels, so the raw min/max is treated as directly comparable rather than
+// as an absolute hardware-calibrated figure.
+const timestamp = @import_module("<time>");
+var tsc_start_buffer = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
+
+// Per-round, per-phase timing (f_spmv_iter only -- see record_ts() below).
+// One raw hardware timestamp is captured at each of these round-boundary
+// points; host-side (bfs_timing.py, used by run_bfs.py) subtracts
+// consecutive pairs (as 48-bit values, cerebras.sdk.sdk_utils.make_u48) to
+// get each phase's elapsed cycles, and MID-1/MID-2 vs. the rest gives
+// min/max/avg across
+// PEs once every PE's copy is read back. Two consecutive slots delimit one
+// phase; where a task immediately re-issues the next collective with no
+// other work in between, its entry timestamp doubles as both the previous
+// phase's end and the next phase's start (see the call sites below):
+//   0 TS_VBCAST_ISSUE        -- before mpi_x.broadcast(visited_buf)
+//   1 TS_VBCAST_DONE         -- entry of visited_bcast_done() (visited
+//                                bcast end / vertical x_buf bcast start)
+//   2 TS_COMPUTE_ENTRY       -- entry of compute() (vertical bcast end /
+//                                local compute start)
+//   3 TS_REDUCE_ISSUE        -- before mpi_x.reduce_fadds in compute()
+//                                (local compute end / reduce start)
+//   4 TS_REDUCE_DONE         -- entry of reduce_done() (reduce end / local
+//                                term-condition start)
+//   5 TS_RELAY_ISSUE         -- before mpi_y.reduce_fadds(nz_local) in
+//                                reduce_done() (local term-cond end /
+//                                relay phase A start)
+//   6 TS_TERM_COL_DONE       -- entry of term_col_done() (relay phase A
+//                                [col-reduce] end / phase B start)
+//   7 TS_TERM_ROW_DONE       -- entry of term_row_done() (relay phase B
+//                                [row-reduce] end / phase C start)
+//   8 TS_TERM_ROW_BCAST_DONE -- entry of term_row_bcast_done() (relay
+//                                phase C [row-bcast] end / phase D start)
+//   9 TS_TERM_COL_BCAST_DONE -- entry of term_col_bcast_done() (relay
+//                                phase D [col-bcast] end / relay total end)
+const TS_VBCAST_ISSUE: u16 = 0;
+const TS_VBCAST_DONE: u16 = 1;
+const TS_COMPUTE_ENTRY: u16 = 2;
+const TS_REDUCE_ISSUE: u16 = 3;
+const TS_REDUCE_DONE: u16 = 4;
+const TS_RELAY_ISSUE: u16 = 5;
+const TS_TERM_COL_DONE: u16 = 6;
+const TS_TERM_ROW_DONE: u16 = 7;
+const TS_TERM_ROW_BCAST_DONE: u16 = 8;
+const TS_TERM_COL_BCAST_DONE: u16 = 9;
+const NUM_TS_SLOTS: u16 = 10;
+
+// flat [max_rounds][NUM_TS_SLOTS][3]u16, row-major (round slowest, then
+// slot, then the 3 raw timestamp words) -- see record_ts() for the index
+// arithmetic. No per-call reset needed: the host only ever reads the
+// [0, rounds_completed) prefix (see ../run_bfs.py), so stale entries
+// from a longer PRIOR run past the current run's rounds_completed are
+// simply never looked at.
+var ts_buf = @zeros([max_rounds * NUM_TS_SLOTS * 3]u16);
+var ts_scratch = @zeros([timestamp.tsc_size_words]u16);
+// which round record_ts() below should file its captures under -- see the
+// two assignment sites (start_spmv(), term_col_bcast_done()) for why this
+// can't just be rounds_completed[0] directly (that counter increments
+// mid-round, in reduce_done(), before the relay phases' own captures).
+var ts_round: u16 = 0;
+
+fn record_ts(round: u16, slot: u16) void {
+    if (round < max_rounds) {
+        timestamp.get_timestamp(&ts_scratch);
+        const base: u16 = (round * NUM_TS_SLOTS + slot) * 3;
+        ts_buf[base] = ts_scratch[0];
+        ts_buf[base + 1] = ts_scratch[1];
+        ts_buf[base + 2] = ts_scratch[2];
+    }
+}
+
+// queues/dsr_ids mirror gemm-collectives_2d/pe.csl -- they don't conflict
+// with memcpy's queue 0.
+const mpi_x = @import_module("<collectives_2d/pe>", .{
+    .dim_params = c2d_params.x,
+    .queues = [2]u16{2, 4},
+    .dest_dsr_ids = [1]u16{1},
+    .src0_dsr_ids = [1]u16{1},
+    .src1_dsr_ids = [1]u16{1},
+    });
+const mpi_y = @import_module("<collectives_2d/pe>", .{
+    .dim_params = c2d_params.y,
+    .queues = [2]u16{3, 5},
+    .dest_dsr_ids = [1]u16{2},
+    .src0_dsr_ids = [1]u16{2},
+    .src1_dsr_ids = [1]u16{2},
+    });
+
+// matrix structure, populated per-PE by run_single_spmv.py/run_bfs.py via
+// memcpy (hypersparse compressed-column format, identical to
+// hypersparse_spmv minus mat_vals_buf)
+var mat_rows_buf = @zeros([max_local_nnz]u16);
+var mat_col_idx_buf = @zeros([max_local_nnz_cols]u16);
+var mat_col_loc_buf = @zeros([max_local_nnz_cols]u16);
+var mat_col_len_buf = @zeros([max_local_nnz_cols]u16);
+var y_rows_init_buf = @zeros([max_local_nnz_rows]u16);
+
+var local_nnz = @zeros([1]u16);
+var local_nnz_cols = @zeros([1]u16);
+var local_nnz_rows = @zeros([1]u16);
+
+// x_buf: this PE's dense column-block of x
+var x_buf = @zeros([blk]f32);
+
+// y_local_buf: this PE's dense local contribution of y
+var y_local_buf = @zeros([blk]f32);
+
+// y_buf: final row-block result after reduce_fadds. 
+// The host reads back the full rectangle and keeps only the diagonal entries.
+var y_buf = @zeros([blk]f32);
+
+// visited_buf: cumulative "ever discovered" bitmap for f_spmv_iter, indexed
+// identically to x_buf/y_buf (same row/column block). Real writes only ever
+// happen at the diagonal PE: seeded from the initial x_buf in start_spmv(),
+// OR'd with every round's genuinely-new discoveries in reduce_done(). Every
+// other PE in the row gets a fresh copy each round via visited_bcast_done()
+// (same "only the diagonal's copy is real, broadcast overwrites everyone
+// else's" convention x_buf already uses) -- compute() needs this at every
+// PE to gate parent tracking (see the module docstring above). Never used
+// or touched by plain f_spmv (see the is_iterative guards below).
+var visited_buf = @zeros([blk]f32);
+
+// Real termination check (see reduce_done()): <collectives_2d> only gives
+// us per-row (mpi_x) or per-column (mpi_y) primitives, never "the
+// diagonal" directly, so reaching from one diagonal PE to another always
+// means relaying through a full row AND a full column. That forces a
+// 4-phase relay -- column-reduce, row-reduce, row-broadcast,
+// column-broadcast -- rooted at MID on both axes, which lands the
+// aggregation point at (MID, MID): itself a diagonal PE, and the position
+// that minimizes each phase's worst-case chain latency (max(root, P-1-root)
+// hops, per <collectives_2d>'s own linear-chain reduce implementation).
+// The middle two phases (row-reduce, row-broadcast) are only ever real
+// work for row MID -- every other row's own copy would combine/broadcast
+// data nobody reads, so term_col_done() has them skip straight to the
+// last phase instead (see its own comment).
+const P: u16 = @get_rectangle().width;
+const MID: u16 = P / 2;
+
+// nz_local: this round's local "did I find anything new" flag 
+// nz_col: after the column-reduce, meaningful only at row MID
+// nz_total: after the row-reduce, meaningful only at (MID, MID)
+var nz_local = @zeros([1]f32);
+var nz_col = @zeros([1]f32);
+var nz_total = @zeros([1]f32); // termination conditionl
+
+// rounds_completed: host-visible counter of how many rounds f_spmv_iter
+// actually ran this call, purely for verifying early termination actually
+// happens (see ../run_host_driven_bfs.py) -- not read by the kernel itself.
+var rounds_completed = @zeros([1]u16);
+
+// scratch: compact per-PE flags over the local distinct-row list
+// (y_rows_init_buf), set true by the local multiply before being expanded
+// into the dense y_local_buf.
+var y_flags = @zeros([max_local_nnz_rows]u16);
+
+// sentinel meaning "no candidate parent seen" -- global vertex indices are
+// always < n, and n is implicitly < 65535 throughout this codebase already
+// (every row/col index here is u16), so this is safely out of range.
+const PARENT_NONE: u16 = 65535;
+
+// parent_compact: per-round scratch, indexed like y_flags (compact distinct-
+// row list), holding the lowest-global-index local column seen touching
+// each compact row THIS round. Reset to PARENT_NONE every round in
+// compute().
+var parent_compact = @zeros([max_local_nnz_rows]u16);
+
+// parent_local_buf: this PE's own candidate parent, dense over its
+// row-block like y_local_buf/x_buf, PERSISTED across rounds (never reset
+// except at a fresh f_spmv_iter call in start_spmv()) -- holds the lowest
+// global vertex index this PE has EVER seen touch each local row, across
+// every round. Meaningful at EVERY PE (unlike x_buf/y_buf/visited_buf,
+// which only matter at the diagonal): different PEs in the same row cover
+// different column ranges, so the row's true parent is the min across all
+// P PEs in that row -- done host-side, see the module docstring above.
+var parent_local_buf = @zeros([blk]u16);
+
+var ptr_x_buf: [*]f32 = &x_buf;
+var ptr_y_buf: [*]f32 = &y_buf;
+var ptr_visited_buf: [*]f32 = &visited_buf;
+var ptr_rounds_completed: [*]u16 = &rounds_completed;
+var ptr_parent_local_buf: [*]u16 = &parent_local_buf;
+var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
+var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
+var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
+var ptr_mat_col_len_buf: [*]u16 = &mat_col_len_buf;
+var ptr_y_rows_init_buf: [*]u16 = &y_rows_init_buf;
+var ptr_local_nnz: [*]u16 = &local_nnz;
+var ptr_local_nnz_cols: [*]u16 = &local_nnz_cols;
+var ptr_local_nnz_rows: [*]u16 = &local_nnz_rows;
+
+var ptr_tsc_start_buffer: [*]u16 = &tsc_start_buffer;
+var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
+var ptr_ts_buf: [*]u16 = &ts_buf;
+
+var pcol_id: u16;
+var prow_id: u16;
+
+// mpi_x/mpi_y.init() only needs to run per device session, not per launch
+var mpi_initialized: bool = false;
+
+// true for f_spmv_iter calls (masking/visited/termination-relay logic
+// applies), false for plain f_spmv (always exactly one round, untouched).
+var is_iterative: bool = false;
+
+fn f_enable_tsc() void {
+    timestamp.enable_tsc();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_tic() void {
+    timestamp.get_timestamp(&tsc_start_buffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_toc() void {
+    timestamp.get_timestamp(&tsc_end_buffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn start_spmv() void {
+    if (!mpi_initialized) {
+        mpi_x.init();
+        mpi_y.init();
+        mpi_initialized = true;
+    }
+    pcol_id = mpi_x.pe_id;
+    prow_id = mpi_y.pe_id;
+
+    // At the start of new BFS: 
+    // - Reset the visited as the new x
+    // - Reset the parent_local_buf to PARENT_NONE
+    if (is_iterative and pcol_id == prow_id) {
+        
+        var i: u16 = 0;
+        while (i < blk) : (i += 1) 
+        {
+            visited_buf[i] = x_buf[i];
+        }
+    }
+    if (is_iterative) {
+
+        var p: u16 = 0;
+        while (p < blk) : (p += 1) 
+        {
+            parent_local_buf[p] = PARENT_NONE;
+        }
+    }
+
+
+    // Start the first round of SpMV (or the next round of iterative SpMV)
+    if (is_iterative) {
+
+        rounds_completed[0] = 0;
+        ts_round = rounds_completed[0];
+        record_ts(ts_round, TS_VBCAST_ISSUE);
+
+        // Phase 1: broadcast visited blk along each row (needed for parent tracking) 
+        mpi_x.broadcast(prow_id, @ptrcast([*]u32, &visited_buf), blk, visited_bcast_done_task_id);
+    
+    } else {
+        // SpMV: just broadcast x_buf down the column
+        mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+    }
+}
+
+task visited_bcast_done() void {
+
+    record_ts(ts_round, TS_VBCAST_DONE);
+    
+    // Phase 2: broadcast x_buf down the column
+    mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+}
+
+// compute y = A*x, one iteration, boolean semiring, reduce to the diagonal
+fn f_spmv() void {
+    is_iterative = false;
+    start_spmv();
+}
+
+// same as f_spmv, but after reducing to the diagonal, copies y back into x
+// (broadcasting it again down the diagonal's column) and repeats until the
+// termination relay (see reduce_done()) agrees no row found anything new --
+// i.e. the output of each round becomes the next round's input vector, for
+// as many rounds as real BFS convergence takes, before returning control to
+// the host.
+fn f_spmv_iter() void {
+    is_iterative = true;
+    start_spmv();
+}
+
+// compute() runs once per round
+task compute() void {
+    if (is_iterative) {
+        record_ts(ts_round, TS_COMPUTE_ENTRY);
+    }
+
+    // Reset compact output buffers (one entry per nnz row):
+    // - y_flags: vertices hit
+    // - parent_compact: candidate parent (lowest global vertex index)
+    var i: u16 = 0;
+    while (i < local_nnz_rows[0]) : (i += 1) {
+        y_flags[i] = 0;
+    }
+    if (is_iterative) {
+        i = 0;
+        while (i < local_nnz_rows[0]) : (i += 1) {
+            parent_compact[i] = PARENT_NONE;
+        }
+    }
+    i = 0;
+
+    // Reset dense output buffers (one entry per blk row):
+    // - y_local_buf: this PE's local contribution to the row's final result
+    // - y_buf: final row-block result after reduce_fadds (for diagonal PEs only)
+    while (i < blk) : (i += 1) {
+        y_local_buf[i] = 0.0;
+        y_buf[i] = 0.0;
+    }
+
+    // Phase 3 Local boolean multiply: for every locally-nonzero column c with
+    // x_buf[c] set, mark every local row it touches (via the compact
+    // y_rows_init_buf list, exactly as hypersparse_spmv does). Also record
+    // a candidate parent BEFORE the reduce below discards column identity:
+    i = 0;
+    while (i < local_nnz_cols[0]) : (i += 1) {
+        const c = mat_col_idx_buf[i];
+        if (x_buf[c] != 0.0) {
+            const loc = mat_col_loc_buf[i];
+            const len = mat_col_len_buf[i];
+            var j: u16 = 0;
+            while (j < len) : (j += 1) {
+                const k = mat_rows_buf[loc + j];
+                y_flags[k] = 1;
+                if (is_iterative) {
+                    const candidate: u16 = pcol_id * blk + c; //global vertex index for column c
+                    if (candidate < parent_compact[k]) {
+                        parent_compact[k] = candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    // Expand compact result to dense for the reduce
+    i = 0;
+    while (i < local_nnz_rows[0]) : (i += 1) {
+        if (y_flags[i] != 0) {
+            const dense_idx = y_rows_init_buf[i];
+            y_local_buf[dense_idx] = 1.0;
+
+            // Set parent
+            if (is_iterative and visited_buf[dense_idx] == 0.0
+                and parent_compact[i] < parent_local_buf[dense_idx])     
+            {
+                parent_local_buf[dense_idx] = parent_compact[i];
+            }
+        }
+    }
+
+    if (is_iterative) {
+        record_ts(ts_round, TS_REDUCE_ISSUE);
+    }
+
+    // Phase 4: reduce this row's local contributions toward its diagonal
+    mpi_x.reduce_fadds(prow_id, @ptrcast([*]f32, &y_local_buf), @ptrcast([*]f32, &y_buf),
+                        blk, reduce_done_task_id);
+}
+
+task reduce_done() void {
+    if (!is_iterative) {
+        // Single SpMV End: all PEs exit
+        sys_mod.unblock_cmd_stream();
+        return;
+    }
+
+    record_ts(ts_round, TS_REDUCE_DONE);
+
+    // Phase 5: local termination condition (output mask)
+    if (pcol_id == prow_id) {
+        //
+        // Runs on EVERY round, including the last: if this only ran when
+        // there's a next round to feed (like an unconditional copy would),
+        // the final round's discoveries would never make it into
+        // visited_buf, and x_buf would end the call holding stale data
+        // from the second-to-last round instead of this round's actual
+        // new nodes.
+        //
+        nz_local[0] = 0.0;
+        var i: u16 = 0;
+        while (i < blk) : (i += 1) {
+            var newly: f32 = y_buf[i];
+            if (visited_buf[i] != 0.0) {
+                // already visited -- not a new discovery this round
+                newly = 0.0;
+            }
+            if (newly != 0.0) {
+                visited_buf[i] = 1.0;
+                nz_local[0] = 1.0;
+            }
+            x_buf[i] = newly;
+        }
+    }
+
+    rounds_completed[0] += 1;
+    record_ts(ts_round, TS_RELAY_ISSUE);
+
+    // Phase 6: start termination check relay
+    mpi_y.reduce_fadds(MID, @ptrcast([*]f32, &nz_local), @ptrcast([*]f32, &nz_col),
+                        1, term_col_done_task_id);
+}
+
+
+// Column-reduce (phase A, above) is needed from every row: each
+// column's diagonal lives at a different row
+
+// Only row MID does phases B/C for real, every other row skips straight to
+// phase D and simply waits there. 
+
+// This is safe because mpi_x (phases B/C) and mpi_y (phase D) use separate fabric
+// queues/colors, so row MID being mid-FSM in mpi_x doesn't block it from later joining
+// mpi_y's phase D, and a non-root broadcast() participant genuinely
+// blocks on its own fabric queue waiting for real data -- it doesn't
+// require the root to have already called broadcast() first.
+task term_col_done() void {
+
+    record_ts(ts_round, TS_TERM_COL_DONE);
+    // column-reduce done: row MID holds local term condition from every diagonal
+
+    if (prow_id == MID) {
+        // Phase 7: reduce the local term conditions on the (MID, MID) PE
+        mpi_x.reduce_fadds(MID, @ptrcast([*]f32, &nz_col), @ptrcast([*]f32, &nz_total),
+                            1, term_row_done_task_id);
+    } else {
+        // Non-MID PEs skip to Phase 9:
+        record_ts(ts_round, TS_TERM_ROW_DONE);
+        record_ts(ts_round, TS_TERM_ROW_BCAST_DONE);
+        mpi_y.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_col_bcast_done_task_id);
+    }
+}
+
+
+task term_row_done() void {
+
+    record_ts(ts_round, TS_TERM_ROW_DONE);
+    // row-reduce done: (MID, MID) now holds final termination condition.
+    
+    // Phase 8: Flood it back out, row first...
+    mpi_x.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_row_bcast_done_task_id);
+}
+
+task term_row_bcast_done() void {
+
+    record_ts(ts_round, TS_TERM_ROW_BCAST_DONE);
+    // row-bcast done: al PEs on MID row hold the termination condition
+
+    // Phase 9: bcast term condition on every col (non-MID PEs are already waiting)
+    mpi_y.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_col_bcast_done_task_id);
+}
+
+task term_col_bcast_done() void {
+
+    record_ts(ts_round, TS_TERM_COL_BCAST_DONE);
+    // col-bcast done: every PE now holds the termination condition
+    
+    // Check term condition    
+    if (nz_total[0] != 0.0) {
+
+        // rounds_completed[0] was already incremented (in reduce_done())
+        ts_round = rounds_completed[0];
+        record_ts(ts_round, TS_VBCAST_ISSUE);
+        
+        // Start with Phase 1 again: row-bcast updated visited buf
+        mpi_x.broadcast(prow_id, @ptrcast([*]u32, &visited_buf), blk, visited_bcast_done_task_id);
+   
+    } else {
+        sys_mod.unblock_cmd_stream();
+    }
+}
+
+comptime {
+    @bind_local_task(compute, compute_task_id);
+    @bind_local_task(reduce_done, reduce_done_task_id);
+    @bind_local_task(term_col_done, term_col_done_task_id);
+    @bind_local_task(term_row_done, term_row_done_task_id);
+    @bind_local_task(term_row_bcast_done, term_row_bcast_done_task_id);
+    @bind_local_task(term_col_bcast_done, term_col_bcast_done_task_id);
+    @bind_local_task(visited_bcast_done, visited_bcast_done_task_id);
+
+    @export_symbol(ptr_x_buf, "x_buf");
+    @export_symbol(ptr_y_buf, "y_buf");
+    @export_symbol(ptr_visited_buf, "visited_buf");
+    @export_symbol(ptr_rounds_completed, "rounds_completed");
+    @export_symbol(ptr_parent_local_buf, "parent_local_buf");
+    @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
+    @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
+    @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");
+    @export_symbol(ptr_mat_col_len_buf, "mat_col_len_buf");
+    @export_symbol(ptr_y_rows_init_buf, "y_rows_init_buf");
+    @export_symbol(ptr_local_nnz, "local_nnz");
+    @export_symbol(ptr_local_nnz_cols, "local_nnz_cols");
+    @export_symbol(ptr_local_nnz_rows, "local_nnz_rows");
+    @export_symbol(ptr_tsc_start_buffer, "tsc_start_buffer");
+    @export_symbol(ptr_tsc_end_buffer, "tsc_end_buffer");
+    @export_symbol(ptr_ts_buf, "ts_buf");
+
+    @export_symbol(f_spmv);
+    @export_symbol(f_spmv_iter);
+    @export_symbol(f_enable_tsc);
+    @export_symbol(f_tic);
+    @export_symbol(f_toc);
+}
