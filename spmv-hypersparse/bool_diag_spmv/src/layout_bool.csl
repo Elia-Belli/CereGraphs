@@ -78,7 +78,6 @@ layout {
     @export_name("mat_col_idx_buf", [*]u16, true);
     @export_name("mat_col_loc_buf", [*]u16, true);
     @export_name("mat_col_len_buf", [*]u16, true);
-    @export_name("y_rows_init_buf", [*]u16, true);
 
     @export_name("local_nnz", [*]u16, true);
     @export_name("local_nnz_cols", [*]u16, true);

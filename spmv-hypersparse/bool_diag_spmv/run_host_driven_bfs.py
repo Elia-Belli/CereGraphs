@@ -200,7 +200,6 @@ def main():
   mat_col_idx_buf = matrix_info["mat_col_idx_buf"]
   mat_col_loc_buf = matrix_info["mat_col_loc_buf"]
   mat_col_len_buf = matrix_info["mat_col_len_buf"]
-  y_rows_init_buf = matrix_info["y_rows_init_buf"]
   local_nnz = matrix_info["local_nnz"]
   local_nnz_cols = matrix_info["local_nnz_cols"]
   local_nnz_rows = matrix_info["local_nnz_rows"]
@@ -282,7 +281,6 @@ def main():
   sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
   sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
   sym_mat_col_len_buf = runner.get_id("mat_col_len_buf")
-  sym_y_rows_init_buf = runner.get_id("y_rows_init_buf")
   sym_local_nnz = runner.get_id("local_nnz")
   sym_local_nnz_cols = runner.get_id("local_nnz_cols")
   sym_local_nnz_rows = runner.get_id("local_nnz_rows")
@@ -317,12 +315,6 @@ def main():
                                             np.uint32)
   runner.memcpy_h2d(sym_mat_col_len_buf, mat_col_len_buf_1d, 0, 0, width, height,
                      max_local_nnz_cols, streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                     order=MemcpyOrder.COL_MAJOR, nonblock=True)
-
-  y_rows_init_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_rows, y_rows_init_buf,
-                                            np.uint32)
-  runner.memcpy_h2d(sym_y_rows_init_buf, y_rows_init_buf_1d, 0, 0, width, height,
-                     max_local_nnz_rows, streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
                      order=MemcpyOrder.COL_MAJOR, nonblock=True)
 
   local_nnz_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz, np.uint32)

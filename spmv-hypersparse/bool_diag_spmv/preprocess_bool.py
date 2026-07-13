@@ -9,7 +9,6 @@ import numpy as np
 #  local_nzcols     local_nnzcols
 #  local_nzrows     local_nnzrows
 #  local_nnz        local_nnz
-#  y_rows           y_rows_init_buf
 #  A_colloc         mat_col_loc_buf
 #  A_collen         mat_col_len_buf
 #  A_colidx         mat_col_idx_buf
@@ -39,11 +38,10 @@ def preprocess(
     local_nzrows: number of nonzero rows
     local_nzcols: number of nonzero columns
     local_nnz: number of nonzero elements
-    y_rows[local_nzrows]: nonzero row index
     A_colloc[local_nzcols]: prefix sum of A_collen, used to point to A_rows
     A_collen[local_nzcols]: A_collen[j] is number of nonzeros of j-th nonzero columns
     A_colidx[local_nzcols]: column index of nonzero columns
-    A_rows[local_nnz]: position of row index of nonzeros in y_rows
+    A_rows[local_nnz]: dense block-local row index of nonzeros (row_l)
 
     """
   assert csrRowPtr[0] == 0, "CSR must be base-0"
@@ -125,6 +123,13 @@ def preprocess(
       np.uint16).max), "LOCAL NUMBER OF NZCOLS WILL OVERFLOW, TRY USING A LARGER FABRIC"
   assert (max_local_nnz_rows < np.iinfo(
       np.uint16).max), "LOCAL NUMBER OF NZROWS WILL OVERFLOW, TRY USING A LARGER FABRIC"
+  # mat_rows_buf now stores direct dense row-block indices (row_l, see step
+  # 5 below) instead of a compact position, so the real bound on its values
+  # is `by` (the per-PE dense row-block size, i.e. the kernel's `blk`), not
+  # max_local_nnz_rows -- assert that explicitly (previously implicitly
+  # covered, since compact indices were always <= max_local_nnz_rows <= by).
+  assert (by < np.iinfo(
+      np.uint16).max), "PER-PE ROW BLOCK SIZE (by) WILL OVERFLOW, TRY USING A LARGER FABRIC"
   # no data overflows u16, we can convert the data to u16
   local_nnz = local_nnz.astype(np.uint16)
   local_nzrows = local_nzrows.astype(np.uint16)
@@ -136,7 +141,6 @@ def preprocess(
   # mat_col_loc_buf[max_local_nnz_cols]   A_colloc[local_nzcols]
   # mat_col_len_buf[max_local_nnz_cols]   A_collen[local_nzcols]
   # mat_col_idx_buf[max_local_nnz_cols]   A_colidx[local_nzcols]
-  # y_rows_init_buf[max_local_nnz_rows]   y_rows[local_nzrows]
   #
   # To prepare the data for spmv, each PE allocates the maximum dimension
   # max_local_nnz, max_local_nnz_cols or max_local_nnz_rows
@@ -144,35 +148,13 @@ def preprocess(
   A_colloc = np.zeros((faby, fabx, max_local_nnz_cols), dtype=np.uint16)
   A_collen = np.zeros((faby, fabx, max_local_nnz_cols), dtype=np.uint16)
   A_colidx = np.zeros((faby, fabx, max_local_nnz_cols), dtype=np.uint16)
-  y_rows = np.zeros((faby, fabx, max_local_nnz_rows), dtype=np.uint16)
 
-  # step 4: compute y_rows
-  local_pos = np.zeros((faby, fabx), dtype=np.int32)
-  counted[0:max_grid_dim] = -1  # invalid token
-  for row in range(nrows):
-    check_token = row
-    # row = row_b * by + row_l
-    row_b = int(row / by)
-    row_l = row - row_b * by
-    start = csrRowPtr[row]
-    end = csrRowPtr[row + 1]
-    for colidx in range(start, end):
-      col = csrColInd[colidx]
-      # col = col_b * bx + col_l
-      col_b = int(col / bx)
-      col_l = col - col_b * bx
-      # Suppose Aij is block (row_b, col_b)
-      # if |{Aij(row_l, j) != 0}| > 0, row_l is a nonzero row in Aij
-      # we use counted[col_b] to count only once
-      if counted[col_b] != check_token:
-        # Aij(row_l,col_l) is nonzero
-        pos = local_pos[(row_b, col_b)]
-        y_rows[(row_b, col_b, pos)] = row_l
-        local_pos[(row_b, col_b)] = pos + 1  # advance to next nonzero row in Aij
-        counted[col_b] = check_token
-
-  # step 5: compute A_colloc, A_colidx, A_colen and A_rows
-  #  y_rows is computed in step 4 because A_rows must be constructed by using y_rows
+  # step 4 (formerly step 5): compute A_colloc, A_colidx, A_colen and A_rows.
+  # A_rows now stores row_l directly (the dense block-local row index) --
+  # no compact "position in y_rows" indirection any more (the compact
+  # y_rows scheme this comment used to describe was dropped: the on-device
+  # kernel now keeps a dense per-PE bitmap over `by`/`blk` rows instead of a
+  # compact scratch array, so there is no compact index space to map into).
 
   # "local_pos" keeps track of the position of nonzero column in A_colidx
   local_pos = np.zeros((faby, fabx), dtype=np.int32)
@@ -225,10 +207,9 @@ def preprocess(
       pos_rel_rowidx = A_collen[(row_b, col_b, pos)]  # position of nonzero row index in A_rows
       # corresponding to Aij(:, col_l)
       pos_rowidx = pos_rel_rowidx + pos_start
-      # y_rows records distance(y_row.begin, find(y_rows.begin(), y_rows.end(), row_l))
-      # spmv uses y_rows to store the result of outer-product of A*x
-      y_rows_list = list(y_rows[(row_b, col_b)])
-      A_rows[(row_b, col_b, pos_rowidx)] = y_rows_list.index(row_l)
+      # A_rows stores row_l directly -- the kernel indexes its dense
+      # per-PE bitmap with this value, no compact lookup needed.
+      A_rows[(row_b, col_b, pos_rowidx)] = row_l
       A_collen[(row_b, col_b, pos)] = pos_rel_rowidx + 1  # move to next nonzero Aij(row_l, col_l)
 
   matrix_info = {}
@@ -242,7 +223,6 @@ def preprocess(
   matrix_info["mat_col_loc_buf"] = A_colloc
   matrix_info["mat_col_len_buf"] = A_collen
   matrix_info["mat_col_idx_buf"] = A_colidx
-  matrix_info["y_rows_init_buf"] = y_rows
   matrix_info["local_nnz"] = local_nnz
   matrix_info["local_nnz_cols"] = local_nzcols
   matrix_info["local_nnz_rows"] = local_nzrows

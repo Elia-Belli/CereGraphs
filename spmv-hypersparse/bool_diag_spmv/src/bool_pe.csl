@@ -4,8 +4,10 @@
 //
 // The matrix A (n-by-n, boolean) is partitioned into a P-by-P grid of PEs
 // using the SAME hypersparse compressed-column format as hypersparse_spmv
-// (mat_col_idx/loc/len_buf, mat_rows_buf, y_rows_init_buf) -- just without
-// mat_vals_buf, since boolean semiring never uses edge weights.
+// (mat_col_idx/loc/len_buf, mat_rows_buf) -- just without mat_vals_buf,
+// since boolean semiring never uses edge weights. Unlike hypersparse_spmv,
+// mat_rows_buf holds a direct dense row-block index (not a compact index
+// into a separate distinct-row list) -- see y_bitmap's own comment below.
 //
 // Communication is targeted at the grid diagonal (pcol_id == prow_id) rather
 // than a fixed corner:
@@ -124,24 +126,29 @@ var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
 //                                bcast end / vertical x_buf bcast start)
 //   2 TS_COMPUTE_ENTRY       -- entry of compute() (vertical bcast end /
 //                                local compute start)
-//   3 TS_COMPUTE_RESET_DONE  -- between compute()'s buffer resets
-//                                (y_flags/parent_compact -- one entry per
-//                                local nnz row -- and y_local_buf/y_buf --
-//                                one entry per blk row, dense regardless of
-//                                sparsity) and the actual compact boolean
-//                                multiply -- isolates the resets (whose
-//                                cost tracks blk, not local sparsity) from
-//                                the sparse work itself (see bfs_timing.py's
+//   3 TS_COMPUTE_RESET_DONE  -- between compute()'s buffer resets (y_bitmap
+//                                -- BITMAP_WORDS = ceil(blk/32) words -- and
+//                                y_local_buf/y_buf -- one entry per blk row,
+//                                dense regardless of sparsity) and the
+//                                actual compact boolean multiply -- isolates
+//                                the resets (whose y_local_buf/y_buf part
+//                                tracks blk, not local sparsity) from the
+//                                sparse work itself (see bfs_timing.py's
 //                                local_compute_reset)
 //   4 TS_COMPUTE_EXPAND_ENTRY -- between compute()'s compact boolean
-//                                multiply (writes y_flags/parent_compact,
-//                                one entry per local nnz row) and its dense
-//                                expansion (writes y_local_buf, one entry
-//                                per blk row) -- splits local_compute into
-//                                "reset" / "compact compute" / "expansion"
-//                                so the three can be compared (see
-//                                bfs_timing.py's local_compute_reset/
-//                                local_compute_compact/local_compute_expand)
+//                                multiply (sets bits in y_bitmap, one per
+//                                real local row hit; also inline-merges
+//                                parent_local_buf, see its own comment) and
+//                                the temporary dense expansion (unpacks
+//                                y_bitmap into y_local_buf, one entry per
+//                                blk row -- dropped once <collectives_2d>
+//                                gets an OR-reduce and this expansion is no
+//                                longer needed at all) -- splits
+//                                local_compute into "reset" / "compact
+//                                compute" / "expansion" so the three can be
+//                                compared (see bfs_timing.py's
+//                                local_compute_reset/local_compute_compact/
+//                                local_compute_expand)
 //   5 TS_REDUCE_ISSUE        -- before mpi_x.reduce_fadds in compute()
 //                                (expansion end / reduce start)
 //   6 TS_REDUCE_DONE         -- entry of reduce_done() (reduce end / local
@@ -221,7 +228,6 @@ var mat_rows_buf = @zeros([max_local_nnz]u16);
 var mat_col_idx_buf = @zeros([max_local_nnz_cols]u16);
 var mat_col_loc_buf = @zeros([max_local_nnz_cols]u16);
 var mat_col_len_buf = @zeros([max_local_nnz_cols]u16);
-var y_rows_init_buf = @zeros([max_local_nnz_rows]u16);
 
 var local_nnz = @zeros([1]u16);
 var local_nnz_cols = @zeros([1]u16);
@@ -282,21 +288,46 @@ var nz_total = @zeros([1]f32); // termination condition
 // happens (see ../run_host_driven_bfs.py) -- not read by the kernel itself.
 var rounds_completed = @zeros([1]u16);
 
-// scratch: compact per-PE flags over the local distinct-row list
-// (y_rows_init_buf), set true by the local multiply before being expanded
-// into the dense y_local_buf.
-var y_flags = @zeros([max_local_nnz_rows]u16);
+// y_bitmap: dense per-PE bitmap over this PE's row-block (bit k == row k of
+// blk, matching y_local_buf/x_buf's own indexing), set by the local
+// multiply below, then (temporarily, see compute()'s "expand" comment)
+// unpacked into the dense f32 y_local_buf for reduce_fadds. Replaces the
+// old compact-index y_flags/y_rows_init_buf scheme -- mat_rows_buf now
+// gives a dense row index directly (see preprocess_bool.py), so there is
+// no compact index space to maintain.
+//
+// Layout: word_idx = k >> 5, bit_idx = k & 31 -- every word covers 32 rows
+// except possibly the last, which is partial whenever blk % 32 != 0.
+// Invariant (relied on by the future OR-reduce over these words too, once
+// <collectives_2d> grows that op): any bit at position >= blk (i.e. past
+// the last real row, within the last word) is ALWAYS 0 -- the reset below
+// zeroes it, and the only bit-set site uses `k` values that always come
+// from mat_rows_buf, which is host-populated from real structural rows and
+// therefore always < blk. Never explicitly masked; true by construction.
+const BITMAP_WORDS: u16 = (blk + 31) / 32;
+var y_bitmap = @zeros([BITMAP_WORDS]u32);
+
+// Fast dense-buffer reset: a single DSD op per buffer instead of a
+// blk/BITMAP_WORDS-iteration scalar while loop. zero_scalar_f32/_u32 are
+// permanent one-element zero sources (written once at load, never again);
+// each fill_* DSD reads that same element `extent`-many times (stride 0,
+// a broadcast read) so @fmovs/@mov32 can stream a whole buffer's worth of
+// zeros in one hardware-driven pass, exploiting the tensor engine's SIMD
+// streaming instead of per-element scalar stores. All four are comptime
+// (blk/BITMAP_WORDS are compile-time params), so they're built once at
+// module scope and reused unchanged every round.
+var zero_scalar_f32 = @zeros([1]f32);
+var zero_scalar_u32 = @zeros([1]u32);
+const fill_blk_f32 = @get_dsd(mem1d_dsd, .{ .base_address = &zero_scalar_f32, .extent = blk, .stride = 0 });
+const fill_bitmap_u32 = @get_dsd(mem1d_dsd, .{ .base_address = &zero_scalar_u32, .extent = BITMAP_WORDS, .stride = 0 });
+const y_local_buf_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_local_buf, .extent = blk });
+const y_buf_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_buf, .extent = blk });
+const y_bitmap_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_bitmap, .extent = BITMAP_WORDS });
 
 // sentinel meaning "no candidate parent seen" -- global vertex indices are
 // always < n, and n is implicitly < 65535 throughout this codebase already
 // (every row/col index here is u16), so this is safely out of range.
 const PARENT_NONE: u16 = 65535;
-
-// parent_compact: per-round scratch, indexed like y_flags (compact distinct-
-// row list), holding the lowest-global-index local column seen touching
-// each compact row THIS round. Reset to PARENT_NONE every round in
-// compute().
-var parent_compact = @zeros([max_local_nnz_rows]u16);
 
 // parent_local_buf: this PE's own candidate parent, dense over its
 // row-block like y_local_buf/x_buf, PERSISTED across rounds (never reset
@@ -317,7 +348,6 @@ var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
 var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
 var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
 var ptr_mat_col_len_buf: [*]u16 = &mat_col_len_buf;
-var ptr_y_rows_init_buf: [*]u16 = &y_rows_init_buf;
 var ptr_local_nnz: [*]u16 = &local_nnz;
 var ptr_local_nnz_cols: [*]u16 = &local_nnz_cols;
 var ptr_local_nnz_rows: [*]u16 = &local_nnz_rows;
@@ -428,38 +458,35 @@ task compute() void {
         record_ts(ts_round, TS_COMPUTE_ENTRY);
     }
 
-    // Reset compact output buffers (one entry per nnz row):
-    // - y_flags: vertices hit
-    // - parent_compact: candidate parent (lowest global vertex index)
-    var i: u16 = 0;
-    while (i < local_nnz_rows[0]) : (i += 1) {
-        y_flags[i] = 0;
-    }
-    if (is_iterative) {
-        i = 0;
-        while (i < local_nnz_rows[0]) : (i += 1) {
-            parent_compact[i] = PARENT_NONE;
-        }
-    }
-    i = 0;
-
-    // Reset dense output buffers (one entry per blk row):
+    // Reset y_bitmap (see its own declaration comment for the padding
+    // invariant this reset establishes each round) and the dense output
+    // buffers (one entry per blk row, still needed because reduce_fadds --
+    // kept unchanged this stage -- operates on dense f32):
     // - y_local_buf: this PE's local contribution to the row's final result
     // - y_buf: final row-block result after reduce_fadds (for diagonal PEs only)
-    while (i < blk) : (i += 1) {
-        y_local_buf[i] = 0.0;
-        y_buf[i] = 0.0;
-    }
+    // One DSD op per buffer (see fill_bitmap_u32/fill_blk_f32's own comment)
+    // instead of a scalar while loop -- the tensor engine streams the whole
+    // buffer's worth of zeros in one hardware-driven pass.
+    @mov32(y_bitmap_dsd, fill_bitmap_u32);
+    @fmovs(y_local_buf_dsd, fill_blk_f32);
+    @fmovs(y_buf_dsd, fill_blk_f32);
 
     if (is_iterative) {
         record_ts(ts_round, TS_COMPUTE_RESET_DONE);
     }
 
     // Phase 3 Local boolean multiply: for every locally-nonzero column c with
-    // x_buf[c] set, mark every local row it touches (via the compact
-    // y_rows_init_buf list, exactly as hypersparse_spmv does). Also record
-    // a candidate parent BEFORE the reduce below discards column identity:
-    i = 0;
+    // x_buf[c] set, set the bit for every local (dense) row it touches.
+    // Also merge a candidate parent directly into the persistent
+    // parent_local_buf -- inline, no separate per-round scratch buffer --
+    // BEFORE the reduce below discards column identity. This is safe
+    // because visited_buf is only ever written in reduce_done(), which runs
+    // strictly after compute() finishes for this round, so visited_buf is
+    // guaranteed stable for the whole loop below; the min-comparison
+    // ("lowest global vertex id wins") is commutative/idempotent, so folding
+    // it in immediately per-hit, instead of via a deferred compact-scratch
+    // merge, produces the identical result.
+    var i: u16 = 0;
     while (i < local_nnz_cols[0]) : (i += 1) {
         const c = mat_col_idx_buf[i];
         if (x_buf[c] != 0.0) {
@@ -467,12 +494,12 @@ task compute() void {
             const len = mat_col_len_buf[i];
             var j: u16 = 0;
             while (j < len) : (j += 1) {
-                const k = mat_rows_buf[loc + j];
-                y_flags[k] = 1;
+                const k = mat_rows_buf[loc + j]; // dense row index, 0..blk-1
+                y_bitmap[k >> 5] |= (@as(u32, 1) << (k & 31));
                 if (is_iterative) {
                     const candidate: u16 = pcol_id * blk + c; //global vertex index for column c
-                    if (candidate < parent_compact[k]) {
-                        parent_compact[k] = candidate;
+                    if (visited_buf[k] == 0.0 and candidate < parent_local_buf[k]) {
+                        parent_local_buf[k] = candidate;
                     }
                 }
             }
@@ -483,19 +510,14 @@ task compute() void {
         record_ts(ts_round, TS_COMPUTE_EXPAND_ENTRY);
     }
 
-    // Expand compact result to dense for the reduce
+    // Temporary: unpack y_bitmap into the dense y_local_buf reduce_fadds
+    // needs. Dense scan (tests every row, not just hit ones) -- deliberately
+    // not optimized, dropped entirely once <collectives_2d> gets an
+    // OR-reduce that can consume y_bitmap's words directly.
     i = 0;
-    while (i < local_nnz_rows[0]) : (i += 1) {
-        if (y_flags[i] != 0) {
-            const dense_idx = y_rows_init_buf[i];
-            y_local_buf[dense_idx] = 1.0;
-
-            // Set parent
-            if (is_iterative and visited_buf[dense_idx] == 0.0
-                and parent_compact[i] < parent_local_buf[dense_idx])     
-            {
-                parent_local_buf[dense_idx] = parent_compact[i];
-            }
+    while (i < blk) : (i += 1) {
+        if ((y_bitmap[i >> 5] >> (i & 31)) & 1 != 0) {
+            y_local_buf[i] = 1.0;
         }
     }
 
@@ -648,7 +670,6 @@ comptime {
     @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
     @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");
     @export_symbol(ptr_mat_col_len_buf, "mat_col_len_buf");
-    @export_symbol(ptr_y_rows_init_buf, "y_rows_init_buf");
     @export_symbol(ptr_local_nnz, "local_nnz");
     @export_symbol(ptr_local_nnz_cols, "local_nnz_cols");
     @export_symbol(ptr_local_nnz_rows, "local_nnz_rows");
