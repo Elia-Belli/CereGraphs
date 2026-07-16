@@ -228,7 +228,7 @@ void iterative_load_balance(
     idx_t nrows, idx_t ncols, int fabx, int faby,
     std::vector<std::pair<idx_t, int>> &nzrows,
     std::vector<std::pair<idx_t, int>> &nzcols, std::vector<idx_t> &iperm_r,
-    std::vector<idx_t> &iperm_c, std::vector<int> &buckets) {
+    std::vector<idx_t> &iperm_c, std::vector<int> &buckets, bool symmetric) {
 
   int bx = std::ceil((float)ncols / ((float)fabx));
   int by = std::ceil((float)nrows / ((float)faby));
@@ -345,7 +345,13 @@ void iterative_load_balance(
 #endif
     }
 
-    {
+    if (symmetric) {
+      // A symmetric adjacency matrix needs a single permutation shared by
+      // rows and columns (row i and column i must stay the same vertex),
+      // so reuse the row assignment just computed above instead of
+      // optimizing an independent column permutation.
+      newiperm_c = newiperm_r;
+    } else {
 // choose new col mapping
 // auto rowhead = rowptr; // make a copy of rowptr
 #if SANITY_CHECK
@@ -474,6 +480,14 @@ int main(int argc, char *argv[]) {
       .default_value(false)
       .implicit_value(true);
 
+  program.add_argument("--symmetric")
+      .help("treat the matrix as a symmetric (undirected graph) adjacency "
+            "matrix and force a single shared row/column permutation, so "
+            "row i and column i keep referring to the same vertex after "
+            "balancing")
+      .default_value(false)
+      .implicit_value(true);
+
   try {
     program.parse_args(argc, argv);
   } catch (const std::runtime_error &err) {
@@ -488,6 +502,7 @@ int main(int argc, char *argv[]) {
   auto fabx = program.get<int>("--fabx");
   auto faby = program.get<int>("--faby");
   auto randperm = program.get<int>("--rand");
+  auto symmetric = program.get<bool>("--symmetric");
 
   /* size of the core rectangle must be positive */
   assert(0 < fabx);
@@ -517,6 +532,32 @@ int main(int argc, char *argv[]) {
   if (program["--remove_dup"] == true) {
     std::cout << "Removing duplicate edges from " << matrix << std::endl;
     remove_duplicates(edges);
+  }
+
+  if (symmetric) {
+    if (m != n || fabx != faby) {
+      std::cerr << "--symmetric requires a square matrix and a square PE "
+                   "grid (a single shared row/column permutation only "
+                   "makes sense when rows and columns share an index "
+                   "space): got " << m << "x" << n << " matrix, " << fabx
+                << "x" << faby << " grid" << std::endl;
+      std::exit(1);
+    }
+    // verify A == A^T structurally: edge (col,row) must have a matching
+    // (row,col) counterpart, i.e. the edge set is closed under swap.
+    std::vector<edge_t> fwd = edges;
+    std::vector<edge_t> rev(edges.size());
+    for (size_t i = 0; i < edges.size(); i++) {
+      rev[i] = std::make_tuple(std::get<1>(edges[i]), std::get<0>(edges[i]));
+    }
+    std::sort(fwd.begin(), fwd.end());
+    std::sort(rev.begin(), rev.end());
+    if (fwd != rev) {
+      std::cerr << "--symmetric was requested but " << matrix
+                << " is not structurally symmetric (A != A^T) -- refusing "
+                   "to balance it as an undirected graph" << std::endl;
+      std::exit(1);
+    }
   }
 
   float num_block = 1;
@@ -620,13 +661,19 @@ int main(int argc, char *argv[]) {
       iperm_r[perm_r[i]] = i;
     }
 
-    // first generate an identity perm vec
-    std::vector<idx_t> perm_c(ncols);
-    std::iota(perm_c.begin(), perm_c.end(), 0);
-    std::random_shuffle(perm_c.begin(), perm_c.end());
-    // now generate the inverse perm
-    for (idx_t i = 0; i < (idx_t)perm_c.size(); i++) {
-      iperm_c[perm_c[i]] = i;
+    if (symmetric) {
+      // keep row and column permutations identical, so this diagnostic
+      // random baseline stays a valid graph relabeling too.
+      iperm_c = iperm_r;
+    } else {
+      // first generate an identity perm vec
+      std::vector<idx_t> perm_c(ncols);
+      std::iota(perm_c.begin(), perm_c.end(), 0);
+      std::random_shuffle(perm_c.begin(), perm_c.end());
+      // now generate the inverse perm
+      for (idx_t i = 0; i < (idx_t)perm_c.size(); i++) {
+        iperm_c[perm_c[i]] = i;
+      }
     }
 
     distribute_permute(rowptr, colidx, bx, by, fabx, faby, iperm_r, iperm_c,
@@ -647,7 +694,7 @@ int main(int argc, char *argv[]) {
 
   iterative_load_balance(rowptr, colidx, colptr, rowidx, nrows, ncols, fabx,
                          faby, sorted_nzrows, sorted_nzcols, iperm_r, iperm_c,
-                         buckets);
+                         buckets, symmetric);
   max_nnz = *std::max_element(buckets.begin(), buckets.end());
   std::cout << "Permuted Max loaded PE has " << max_nnz << " nz" << std::endl;
 #if SANITY_CHECK
