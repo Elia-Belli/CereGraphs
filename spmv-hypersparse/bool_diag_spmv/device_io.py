@@ -136,6 +136,21 @@ def unpack_bitmap_to_dense(height, width, blk, bitmap_hwl):
   return dense
 
 
+def assert_n_supported(n):
+  """bool_pe.csl's PARENT_NONE sentinel is 65535 (u16), and global vertex
+  indices share that same u16 range -- at n == 65536 vertex 65535 is a real,
+  valid index, indistinguishable from "no parent" (see PARENT_NONE's own
+  comment in bool_pe.csl and extract_parent_result's `parent >= n`
+  normalization below, both of which assume n < 65536). Confirmed to
+  silently corrupt every unvisited vertex's parent/visited status at
+  n == 65536 (scale16) -- not yet fixed, so callers must refuse to run
+  rather than produce wrong results."""
+  assert n < 65536, (
+      f"n={n} >= 65536: PARENT_NONE (u16 sentinel 65535) collides with a "
+      "real vertex index at this scale -- unsupported until parent tracking "
+      "is widened past u16")
+
+
 def extract_parent_result(n, blk, P, parent_hwl):
   """Assemble the length-n parent vector from the full (not diagonal-only)
   parent_local_buf rectangle. parent_hwl has shape (height=P, width=P, blk):

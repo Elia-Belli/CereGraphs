@@ -1,4 +1,5 @@
 **/out*/
+data/
 
 simfab_traces/
 wio_flows*
@@ -11,3 +12,6 @@ simconfig.json
 latest/
 
 .claude/
+
+*.o
+spmv-hypersparse/util/analyze

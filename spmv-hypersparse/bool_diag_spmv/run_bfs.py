@@ -63,8 +63,8 @@ from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, comput
                          decode_pe_phase_cycles, decode_phase_row, read_tic_toc_delta,
                          save_pe_phase_cycles)
 from bfs_tree_plot import build_digraph, invalid_parents, render_tree_comparison
-from device_io import (csl_compile_core, derive_visited_from_parent, extract_parent_result,
-                        hwl_to_oned_colmajor, single_source_seed_pe)
+from device_io import (assert_n_supported, csl_compile_core, derive_visited_from_parent,
+                        extract_parent_result, hwl_to_oned_colmajor, single_source_seed_pe)
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
@@ -169,6 +169,7 @@ def main():
   [nrows, ncols] = A_csr.shape
   assert nrows == ncols, "boolean diagonal-reduce SpMV requires a square matrix"
   n = nrows
+  assert_n_supported(n)
   nnz = A_csr.nnz
   assert 0 <= source < n, f"--source={source} out of range [0, {n})"
 
@@ -256,7 +257,7 @@ def main():
     print("COMPILE ONLY: EXIT")
     return
 
-  runner = SdkRuntime(dirname, cmaddr=args.cmaddr, suppress_simfab_trace=True)
+  runner = SdkRuntime(dirname, cmaddr=args.cmaddr, simfab_numthreads=64, suppress_simfab_trace=True)
 
   sym_x_bitmap = runner.get_id("x_bitmap")
   sym_parent_local_buf = runner.get_id("parent_local_buf")

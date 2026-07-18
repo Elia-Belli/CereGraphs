@@ -71,9 +71,9 @@ from datetime import datetime, timezone
 
 import numpy as np
 from cmd_parser import parse_args
-from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
-                        extract_parent_result, hwl_to_oned_colmajor, pack_dense_to_bitmap,
-                        unpack_bitmap_to_dense)
+from device_io import (assert_n_supported, csl_compile_core, dist_x_to_diag_hwl,
+                        extract_diag_result, extract_parent_result, hwl_to_oned_colmajor,
+                        pack_dense_to_bitmap, unpack_bitmap_to_dense)
 from preprocess_bool import preprocess
 from scipy.io import mmread
 
@@ -166,6 +166,7 @@ def main():
   [nrows, ncols] = A_csr.shape
   assert nrows == ncols, "boolean diagonal-reduce SpMV requires a square matrix"
   n = nrows
+  assert_n_supported(n)
   nnz = A_csr.nnz
 
   print(f"Load matrix A, {nrows}-by-{ncols} with {nnz} nonzeros (structural, boolean)")

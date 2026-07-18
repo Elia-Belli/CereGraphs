@@ -334,9 +334,14 @@ const fill_bitmap_u32 = @get_dsd(mem1d_dsd, .{ .base_address = &zero_scalar_u32,
 const y_bitmap_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_bitmap, .extent = BITMAP_WORDS });
 const y_bitmap_reduced_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_bitmap_reduced, .extent = BITMAP_WORDS });
 
-// sentinel meaning "no candidate parent seen" -- global vertex indices are
-// always < n, and n is implicitly < 65535 throughout this codebase already
-// (every row/col index here is u16), so this is safely out of range.
+// sentinel meaning "no candidate parent seen". REQUIRES n < 65536: global
+// vertex indices are u16 and always < n, so this collides with a real
+// vertex index whenever n == 65536 (vertex 65535 becomes indistinguishable
+// from "no parent") -- confirmed to silently corrupt results at that exact
+// scale (every never-discovered vertex reads back as falsely visited, see
+// device_io.py's extract_parent_result). run_bfs.py asserts n < 65536
+// host-side for this reason; not yet fixed here since it needs parent
+// tracking widened past u16 to lift.
 const PARENT_NONE: u16 = 65535;
 
 // parent_local_buf: this PE's own candidate parent, dense over its
