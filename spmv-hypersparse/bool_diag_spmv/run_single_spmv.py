@@ -31,8 +31,8 @@ import numpy as np
 from cmd_parser import parse_args
 from device_io import (csl_compile_core, dist_x_to_diag_hwl, extract_diag_result,
                         hwl_to_oned_colmajor, pack_dense_to_bitmap, unpack_bitmap_to_dense)
+from graph_loader import load_graph
 from preprocess_bool import preprocess
-from scipy.io import mmread
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
@@ -88,7 +88,7 @@ def main():
   infile_mtx = args.infile_mtx
   print(f"infile_mtx = {infile_mtx}")
 
-  A_coo = mmread(infile_mtx)
+  A_coo = load_graph(infile_mtx)
   A_csr = A_coo.tocsr(copy=True)
   A_csr = A_csr.sorted_indices()
   assert A_csr.has_sorted_indices == 1, "Error: A is not sorted"

@@ -49,8 +49,8 @@ from datetime import datetime, timezone
 
 import networkx as nx
 import numpy as np
+from graph_loader import load_graph
 from preprocess_bool import preprocess
-from scipy.io import mmread
 from scipy.sparse.csgraph import breadth_first_order
 
 # plot_bfs_timing.py/bfs_tree_plot.py live in plots/ (see that folder's own
@@ -161,7 +161,7 @@ def main():
   source = args.source
   print(f"infile_mtx = {infile_mtx}, source = {source}, max_rounds = {max_rounds}")
 
-  A_coo = mmread(infile_mtx)
+  A_coo = load_graph(infile_mtx)
   A_csr = A_coo.tocsr(copy=True)
   A_csr = A_csr.sorted_indices()
   assert A_csr.has_sorted_indices == 1, "Error: A is not sorted"
