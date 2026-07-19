@@ -70,19 +70,24 @@
 //
 // Each PE keeps parent_local_buf, indexed identically to x_bitmap/y_bitmap
 // (dense over its row-block), holding a column it has recorded for each
-// local row. The tie-break for multiple local columns hitting the same row
-// in the same discovery round is intentionally NOT the lowest global index
-// -- any candidate gated by visited_bitmap above is already a legal
+// local row -- stored as a LOCAL column index (0..blk-1), not the global
+// vertex id, which keeps this buffer u16-safe at any n (see PARENT_NONE's
+// own comment). The tie-break for multiple local columns hitting the same
+// row in the same discovery round is intentionally NOT the lowest global
+// index -- any candidate gated by visited_bitmap above is already a legal
 // one-hop-closer parent, so there's no correctness reason to prefer the
 // minimum one, and dropping that comparison saves a compare per row-hit
 // (see the parent-tracking pass in compute() below: whichever local column
 // is walked last for a given row wins). Because different PEs in the SAME
 // row cover different column ranges, extract_parent_result() in
-// ../device_io.py still combines each row's P per-PE candidates host-side
-// after memcpy_d2h (via min(), for lack of any on-device min/select
-// primitive -- <collectives_2d> has no min-reduce) -- this remains correct
-// since the min of several legal predecessors is itself a legal predecessor,
-// even though it's no longer "the true global lowest index" in the old sense.
+// ../device_io.py reconstructs each candidate's global vertex id
+// (pcol_id*blk + local column, using the pcol_id it already knows from the
+// readback layout) and then still combines each row's P per-PE candidates
+// host-side after memcpy_d2h (via min(), for lack of any on-device
+// min/select primitive -- <collectives_2d> has no min-reduce) -- this
+// remains correct since the min of several legal predecessors is itself a
+// legal predecessor, even though it's no longer "the true global lowest
+// index" in the old sense.
 
 param memcpy_params;
 param c2d_params;
@@ -341,24 +346,26 @@ const fill_bitmap_u32 = @get_dsd(mem1d_dsd, .{ .base_address = &zero_scalar_u32,
 const y_bitmap_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_bitmap, .extent = BITMAP_WORDS });
 const y_bitmap_reduced_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_bitmap_reduced, .extent = BITMAP_WORDS });
 
-// sentinel meaning "no candidate parent seen". REQUIRES n < 65536: global
-// vertex indices are u16 and always < n, so this collides with a real
-// vertex index whenever n == 65536 (vertex 65535 becomes indistinguishable
-// from "no parent") -- confirmed to silently corrupt results at that exact
-// scale (every never-discovered vertex reads back as falsely visited, see
-// device_io.py's extract_parent_result). run_bfs.py asserts n < 65536
-// host-side for this reason; not yet fixed here since it needs parent
-// tracking widened past u16 to lift.
+// sentinel meaning "no candidate parent seen". Only needs to exceed the max
+// valid LOCAL column index (blk-1), not the max global vertex index --
+// parent_local_buf stores a local column index, not a global vertex id (see
+// its own comment below), so this is independent of n and already safely
+// satisfied by preprocess_bool.py's own blk < 65535 assertion.
 const PARENT_NONE: u16 = 65535;
 
 // parent_local_buf: this PE's own candidate parent, dense over its
 // row-block like x_bitmap, PERSISTED across rounds (never reset
-// except at a fresh f_spmv_iter call in start_spmv()) -- holds the lowest
-// global vertex index this PE has EVER seen touch each local row, across
-// every round. Meaningful at EVERY PE (unlike x_bitmap/y_bitmap_reduced/
-// visited_bitmap, which only matter at the diagonal): different PEs in the same row cover
-// different column ranges, so the row's true parent is the min across all
-// P PEs in that row -- done host-side, see the module docstring above.
+// except at a fresh f_spmv_iter call in start_spmv()) -- holds the LOCAL
+// column index (0..blk-1, see compute()) this PE has recorded for each
+// local row, across every round. Deliberately not the global vertex id:
+// every candidate compared/stored for a given PE shares that PE's own
+// pcol_id, so keeping just the local index is equivalent (see compute()'s
+// own comment) while keeping this buffer u16-safe regardless of n. The
+// global vertex id (pcol_id*blk + local column) is reconstructed host-side
+// in device_io.py's extract_parent_result(), which already knows each
+// slice's pcol_id from the readback layout, before combining each row's P
+// per-PE candidates (see the module docstring above for why that combine
+// step is needed at all, and why it's a min rather than a specific pick).
 var parent_local_buf = @zeros([blk]u16);
 
 var ptr_x_bitmap: [*]u32 = &x_bitmap;
@@ -521,9 +528,14 @@ task compute() void {
                 const k = mat_rows_buf[loc + j]; // dense row index, 0..blk-1
                 y_bitmap[k >> 5] |= (@as(u32, 1) << (k & 31));
                 if (is_iterative) {
-                    const candidate: u16 = pcol_id * blk + c; //global vertex index for column c
+                    // Store the LOCAL column index c directly, not the global vertex id
+                    // (pcol_id*blk+c) -- keeps parent_local_buf/PARENT_NONE at u16 regardless
+                    // of n, since c is always < blk (already independently bounded, see
+                    // PARENT_NONE's own comment below). The global id is reconstructed
+                    // host-side in device_io.py's extract_parent_result(), which already
+                    // knows each slice's pcol_id from the readback layout.
                     if ((visited_bitmap[k >> 5] >> (k & 31)) & 1 == 0) {
-                        parent_local_buf[k] = candidate;
+                        parent_local_buf[k] = c;
                     }
                 }
             }

@@ -136,33 +136,37 @@ def unpack_bitmap_to_dense(height, width, blk, bitmap_hwl):
   return dense
 
 
-def assert_n_supported(n):
-  """bool_pe.csl's PARENT_NONE sentinel is 65535 (u16), and global vertex
-  indices share that same u16 range -- at n == 65536 vertex 65535 is a real,
-  valid index, indistinguishable from "no parent" (see PARENT_NONE's own
-  comment in bool_pe.csl and extract_parent_result's `parent >= n`
-  normalization below, both of which assume n < 65536). Confirmed to
-  silently corrupt every unvisited vertex's parent/visited status at
-  n == 65536 (scale16) -- not yet fixed, so callers must refuse to run
-  rather than produce wrong results."""
-  assert n < 65536, (
-      f"n={n} >= 65536: PARENT_NONE (u16 sentinel 65535) collides with a "
-      "real vertex index at this scale -- unsupported until parent tracking "
-      "is widened past u16")
+# Must match bool_pe.csl's PARENT_NONE exactly -- a LOCAL column-index
+# sentinel (see its own comment there), not a global-vertex-index one, so
+# this is independent of n.
+PARENT_NONE_LOCAL = 65535
 
 
 def extract_parent_result(n, blk, P, parent_hwl):
   """Assemble the length-n parent vector from the full (not diagonal-only)
   parent_local_buf rectangle. parent_hwl has shape (height=P, width=P, blk):
-  for row-block p, every column-PE parent_hwl[p, :, :] independently
-  computed a candidate parent for that row-block's blk local positions (see
-  bool_pe.csl's module docstring) -- take the min across the P column-PEs
-  (the row/column-min-reduce <collectives_2d> can't do, per the TODO there),
-  same list-then-concatenate-then-truncate shape extract_diag_result above
-  uses for the diagonal case."""
-  parts = [parent_hwl[p, :, :].min(axis=0) for p in range(P)]
-  parent = np.concatenate(parts).astype(np.int64)[0:n]
-  parent[parent >= n] = -1  # normalize the device's PARENT_NONE (65535) sentinel
+  for row-block p, every column-PE parent_hwl[p, w, :] independently
+  recorded a LOCAL column index (0..blk-1, or PARENT_NONE_LOCAL if none --
+  see bool_pe.csl's module docstring and PARENT_NONE's own comment) for that
+  row-block's blk local positions. bool_pe.csl never computes the global
+  vertex id itself (that's the whole point -- keeps parent_local_buf u16 at
+  any n), so it's reconstructed here, since only the host readback layout
+  ties each width-index w to its actual pcol_id: global = w*blk + local_c.
+  Sentinel entries are mapped to a value >= n before combining (rather than
+  converted as-is) so they can never spuriously beat a genuine candidate in
+  the min once n is large -- a raw PARENT_NONE_LOCAL could otherwise
+  reconstruct to a small-looking number for w==0. The min across the P
+  column-PEs is still needed (the row/column-min-reduce <collectives_2d>
+  can't do, per the TODO in bool_pe.csl's module docstring); same
+  list-then-concatenate-then-truncate shape extract_diag_result above uses
+  for the diagonal case."""
+  col_pe = np.arange(P, dtype=np.int64).reshape(1, P, 1)
+  local_c = parent_hwl.astype(np.int64)
+  is_none = local_c == PARENT_NONE_LOCAL
+  global_candidate = np.where(is_none, np.iinfo(np.int64).max, col_pe * blk + local_c)
+  parts = [global_candidate[p, :, :].min(axis=0) for p in range(P)]
+  parent = np.concatenate(parts)[0:n]
+  parent[parent >= n] = -1  # no real column-PE ever recorded a candidate for this row
   return parent
 
 

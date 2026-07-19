@@ -58,7 +58,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "plo
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode_phase_row,
                          read_tic_toc_delta)
 from bfs_tree_plot import invalid_parents
-from device_io import (assert_n_supported, csl_compile_core, derive_visited_from_parent,
+from device_io import (csl_compile_core, derive_visited_from_parent,
                         extract_parent_result, hwl_to_oned_colmajor, single_source_seed_pe)
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
@@ -177,7 +177,6 @@ def main():
   [nrows, ncols] = A_csr.shape
   assert nrows == ncols, "boolean diagonal-reduce SpMV requires a square matrix"
   n = nrows
-  assert_n_supported(n)
   nnz = A_csr.nnz
   print(f"Load matrix A, {nrows}-by-{ncols} with {nnz} nonzeros (structural, boolean)")
 
