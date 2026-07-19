@@ -529,6 +529,19 @@ def main():
           + ("" if is_symmetric else "  -- directed graph: not a Graph500-spec-comparable "
                                       "GTEPS, see m_convention"))
 
+    # search_time_cycles minus the two host-transfer brackets (h2d_seed,
+    # d2h) -- isolates on-device round work from host<->device transfer
+    # overhead, since those transfers can otherwise dominate search_time_cycles
+    # for small/fast graphs. Same quantity decode_phase_row already computed
+    # as device_time_cycles; just also logged as its own trailing CSV column.
+    row["search_time_cycles_no_transfer"] = device_time_cycles
+    _, _, search_time_seconds_no_transfer, gteps_no_transfer = compute_m_and_gteps(
+        coo, device_visited, is_symmetric, device_time_cycles)
+    row["gteps_no_transfer"] = gteps_no_transfer
+    print(f"[[ GTEPS w/o h2d_seed/d2h = {m} edges ({m_convention}) / "
+          f"{search_time_seconds_no_transfer * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
+          f"{gteps_no_transfer:.6f} GTEPS ]]")
+
     csv_path = args.csv
     if csv_path is None:
       csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results",
