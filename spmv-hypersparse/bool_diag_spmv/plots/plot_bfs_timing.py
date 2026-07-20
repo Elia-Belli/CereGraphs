@@ -31,11 +31,15 @@
   [local_compute, local_term_cond, communication] order purely for a
   stable, readable legend, not to claim a literal timeline.
 
-  The suptitle also reports `total_runtime_cycles` (the straggler-PE span
-  from round 0's very first TS_VBCAST_ISSUE to the last round's
-  TS_TERM_COL_BCAST_DONE) next to the sum of the round bars, as a sanity
-  check -- they should be close (the gap is just the first broadcast's own
-  one-time fabric fill delay, not per-round recurring cost).
+  total_runtime_cycles (the straggler-PE span from round 0's very first
+  TS_VBCAST_ISSUE to the last round's TS_TERM_COL_BCAST_DONE) is still in
+  bfs_timing.csv, just not compared against the round bars' own sum in the
+  suptitle any more -- that comparison is inherently noisy once a phase
+  with wide per-PE variance (transpose_structure()) is involved, since each
+  bar segment here is its own independent max-across-PEs and can come from
+  a different PE than total_runtime_cycles' one coherent straggler (see
+  run_gap_diagnostic.py for a worked confirmation this isn't double-
+  counting, just that mismatch).
 
   local_compute's own segment additionally gets two tick-mark indicators
   (solid = min, dashed = avg, both across PEs that round) on top of its
@@ -156,6 +160,16 @@ LOCAL_COMPUTE_SPLIT_PARTS = ["local_compute_reset", "local_compute_compact", "lo
 # bar is empty everywhere but that one round.
 TRANSPOSE_COLOR = "#2a9d8f"  # teal -- distinct from every other hue family in use
 
+# Also stacked directly onto the round-bars panel's own switch-round bar
+# (see plot_timing_row) -- round_duration_cycles (what those bars are built
+# from) brackets TS_VBCAST_ISSUE..TS_TERM_COL_BCAST_DONE, which does NOT
+# span transpose_structure()'s own gap (see bool_pe.csl's
+# term_col_bcast_done()), so without this the round bars would visibly sum
+# to less than total_runtime_cycles -- an unaccounted-for gap the reader
+# has no way to attribute from the bars alone, title text notwithstanding.
+ROUND_SEGMENT_COLORS["transpose"] = TRANSPOSE_COLOR
+ROUND_SEGMENT_LABELS["transpose"] = "transpose_structure() (one-time, switch round only)"
+
 COMPUTE_SPLIT_PARTS = LOCAL_COMPUTE_SPLIT_PARTS + ["transpose"]
 COMPUTE_SPLIT_COLORS = dict(zip(
     LOCAL_COMPUTE_SPLIT_PARTS,
@@ -225,7 +239,6 @@ def plot_timing_row(row, out_path):
   channels = row["channels"]
 
   round_duration = parse_cycle_list(row["round_duration_cycles"]).astype(float)
-  total_runtime_cycles = int(row["total_runtime_cycles"])
   assert len(round_duration) == rounds_completed, (
       f"round_duration_cycles has {len(round_duration)} entries, expected "
       f"rounds_completed={rounds_completed}")
@@ -315,10 +328,15 @@ def plot_timing_row(row, out_path):
   ax_d2h.set_xticklabels(["d2h"])
 
   bottom = np.zeros(rounds_completed)
+  transpose_heights = compute_split_stats["transpose"]["max"]
   segment_values = {
       "local_compute": local_compute,
       "local_term_cond": local_term_cond,
       "communication": communication,
+      # stacked last (zero-height, hence invisible, on every round except
+      # the switch round) -- see ROUND_SEGMENT_COLORS["transpose"]'s own
+      # comment for why this needs to be here at all.
+      "transpose": transpose_heights,
   }
   for name, heights in segment_values.items():
     color = ROUND_SEGMENT_COLORS[name]
@@ -403,30 +421,12 @@ def plot_timing_row(row, out_path):
     if not (fits_w and fits_h):
       txt.remove()
 
-  ax_h2d.set_ylabel("cycles")
-  ax_compute.set_ylabel("cycles")
-  reset_total = int(compute_split_stats["local_compute_reset"]["max"].sum())
-  compact_total = int(compute_split_stats["local_compute_compact"]["max"].sum())
-  expand_total = int(compute_split_stats["local_compute_expand"]["max"].sum())
-  transpose_total = int(compute_split_stats["transpose"]["max"].sum())
-  sum_rounds = int(round_duration.sum())
-  diff_pct = 100.0 * (total_runtime_cycles - sum_rounds) / total_runtime_cycles
-  # transpose_structure() runs strictly between one round's own
-  # TERM_COL_BCAST_DONE and the next round's VBCAST_ISSUE (see bool_pe.csl's
-  # term_col_bcast_done()) -- outside every round's own bar span, so it's
-  # folded into this same gap alongside the first round's one-time fabric
-  # fill delay, not double-subtracted from round_duration_cycles.
-  gap_note = ("gap is the first round's one-time fabric fill delay"
-              + (f" + transpose_structure()'s {transpose_total}-cycle one-time cost"
-                 if transpose_total > 0 else ""))
+  ax_h2d.set_ylabel("cycles", labelpad=8)
+  ax_compute.set_ylabel("cycles", labelpad=8)
   fig.suptitle(f"Per-round phase timing -- {matrix}, {pe_grid} grid, source={source}, "
                f"channels={channels}\n"
                f"n={row['n']}, nnz={row['nnz']}, {rounds_completed} rounds "
-               "(bar height = round_duration_cycles, straggler PE span)\n"
-               f"round bars sum to {sum_rounds} cycles vs total_runtime_cycles={total_runtime_cycles} "
-               f"({diff_pct:+.1f}% -- {gap_note})\n"
-               f"local_compute split: reset sums to {reset_total} cycles, compact multiply to "
-               f"{compact_total} cycles, dense expansion to {expand_total} cycles across all rounds",
+               "(bar height = round_duration_cycles, + transpose_structure() on the switch round)",
                fontsize=10)
   for ax in (ax_h2d, ax_rounds, ax_d2h, ax_compute):
     ax.spines["top"].set_visible(False)
@@ -451,9 +451,15 @@ def plot_timing_row(row, out_path):
     labels += l
   handles += STAT_TICK_HANDLES
   labels += [h.get_label() for h in STAT_TICK_HANDLES]
+  # "transpose_structure()" is drawn on both ax_rounds (stacked segment)
+  # and ax_compute (grouped bar) with the same label -- de-dupe by label
+  # text (preserving first-seen order) so it isn't listed twice.
+  seen = set()
+  deduped = [(h, l) for h, l in zip(handles, labels) if not (l in seen or seen.add(l))]
+  handles, labels = [list(t) for t in zip(*deduped)]
   fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, fontsize=8,
-             bbox_to_anchor=(0.5, -0.04))
-  plt.tight_layout(rect=[0, 0.18, 1, 0.90])
+             bbox_to_anchor=(0.5, -0.16), columnspacing=1.8, handletextpad=0.6, labelspacing=1.0)
+  plt.tight_layout(rect=[0, 0.26, 1, 0.93])
 
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=200, bbox_inches="tight")
