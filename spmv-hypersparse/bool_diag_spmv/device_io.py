@@ -217,6 +217,7 @@ def csl_compile_core(
     width_west_buf: int,
     width_east_buf: int,
     max_rounds: Optional[int] = None,
+    tau_switch_count: Optional[int] = None,
 ):
   comp_dir = elf_dir
 
@@ -236,6 +237,11 @@ def csl_compile_core(
     # run_bfs.py) needs per-round timing over a deeper BFS.
     if max_rounds is not None:
       args.append(f"--params=max_rounds:{max_rounds}")
+    # left at layout_bool.csl's own default (effectively unreachable, i.e.
+    # always top-down) unless a caller (see run_bfs.py) opts into the
+    # direction-optimizing switch with a real fraction of n.
+    if tau_switch_count is not None:
+      args.append(f"--params=tau_switch_count:{int(tau_switch_count)}")
 
     args.append(f"-o={comp_dir}")
     if arch is not None:

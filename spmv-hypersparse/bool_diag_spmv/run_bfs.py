@@ -70,6 +70,16 @@ from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-i
     MemcpyDataType, MemcpyOrder, SdkRuntime,
 )
 
+# direction-optimizing BFS (see the plan): --directional's forward-switch
+# fraction of n. Not literally Beamer et al.'s alpha (that's a divisor on an
+# edge-count ratio mf/mu; this kernel uses the simplified nf-vertex-count-only
+# heuristic instead -- see bool_pe.csl's tau_switch_count/is_bottom_up
+# comments), but 0.15 sits in the same ballpark the literature (Beamer SC2012,
+# GAP Benchmark Suite) reports for a pure vertex-count threshold, and the
+# paper's own finding that performance is insensitive to this choice across
+# an order of magnitude means it's not worth exposing as its own flag.
+DEFAULT_TAU_SWITCH_FRAC = 0.15
+
 
 def parse_args():
   parser = argparse.ArgumentParser()
@@ -103,6 +113,12 @@ def parse_args():
                        help="on-device cap on rounds actually profiled for --notimings=False "
                             "(bool_pe.csl's ts_buf) -- rounds beyond this still run correctly, "
                             "just aren't timestamped; bump this if a run reports truncation")
+  parser.add_argument("--directional", action="store_true",
+                       help="enable the direction-optimizing BFS switch (is_bottom_up in "
+                            f"bool_pe.csl): tau_switch_count is computed at runtime as "
+                            f"{DEFAULT_TAU_SWITCH_FRAC} * n (see DEFAULT_TAU_SWITCH_FRAC's own "
+                            "comment). Off by default -- pure top-down, byte-identical to the "
+                            "pre-direction-optimizing kernel.")
   parser.add_argument("--csv", default=None,
                        help="CSV file to append this run's timing row to "
                             "(default: results/bfs_timing.csv next to this script)")
@@ -214,6 +230,12 @@ def main():
   blk = math.ceil(n / P)
   bitmap_words = (blk + 31) // 32
 
+  tau_switch_count = None
+  if args.directional:
+    tau_switch_count = round(DEFAULT_TAU_SWITCH_FRAC * n)
+    print(f"--directional: tau_switch_count = {tau_switch_count} "
+          f"({DEFAULT_TAU_SWITCH_FRAC * 100:.0f}% of n={n})")
+
   # single-source seed -- a real BFS workload, not run_host_driven_bfs.py's
   # random ~50%-density stress frontier (which would mask most rounds'
   # costs behind one giant first round, and wouldn't be a single tree).
@@ -249,6 +271,7 @@ def main():
       core_fabric_offset_x, core_fabric_offset_y, args.run_only, args.arch,
       np_cols, np_rows, blk, max_local_nnz, max_local_nnz_cols, max_local_nnz_rows,
       channels, width_west_buf, width_east_buf, max_rounds=max_rounds,
+      tau_switch_count=tau_switch_count,
   )
   print(f"Compilation done in {time.time()-start}s", flush=True)
 
@@ -268,10 +291,16 @@ def main():
   sym_local_nnz = runner.get_id("local_nnz")
   sym_local_nnz_cols = runner.get_id("local_nnz_cols")
   sym_local_nnz_rows = runner.get_id("local_nnz_rows")
+  sym_nz_total = runner.get_id("nz_total")
+  sym_is_bottom_up_dbg = runner.get_id("is_bottom_up_dbg")
   if need_timing:
     sym_ts_buf = runner.get_id("ts_buf")
     sym_tsc_start_buffer = runner.get_id("tsc_start_buffer")
     sym_tsc_end_buffer = runner.get_id("tsc_end_buffer")
+    sym_nf_history = runner.get_id("nf_history")
+    sym_direction_history = runner.get_id("direction_history")
+    sym_transpose_tic_buffer = runner.get_id("transpose_tic_buffer")
+    sym_transpose_toc_buffer = runner.get_id("transpose_toc_buffer")
 
   runner.load()
   runner.run()
@@ -363,7 +392,27 @@ def main():
                      order=MemcpyOrder.COL_MAJOR, nonblock=False)
   rounds_completed = int(np.reshape(rounds_buf, (height, width, 1), order="F")[(0, 0, 0)])
 
+  # Phase A validation only (see the plan): nz_total is Beamer's nf as of the
+  # last completed round (only meaningful at (MID,MID), but every PE holds
+  # the same flooded value by the end of the relay -- see term_col_bcast_done()
+  # in bool_pe.csl), is_bottom_up_dbg mirrors whether the switch has fired.
+  # No bottom-up compute path exists yet, so this is purely diagnostic.
+  nz_total_buf = np.zeros(height * width, np.float32)
+  runner.memcpy_d2h(nz_total_buf, sym_nz_total, 0, 0, width, height, 1,
+                     streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+                     order=MemcpyOrder.COL_MAJOR, nonblock=False)
+  final_nz_total = float(np.reshape(nz_total_buf, (height, width, 1), order="F")[(0, 0, 0)])
+  is_bottom_up_buf = np.zeros(height * width, np.uint32)
+  runner.memcpy_d2h(is_bottom_up_buf, sym_is_bottom_up_dbg, 0, 0, width, height, 1,
+                     streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                     order=MemcpyOrder.COL_MAJOR, nonblock=False)
+  final_is_bottom_up = bool(np.reshape(is_bottom_up_buf, (height, width, 1), order="F")[(0, 0, 0)])
+  print(f"[[ direction-optimizing Phase A: final nz_total={final_nz_total}, "
+        f"is_bottom_up={final_is_bottom_up}"
+        + (f", tau_switch_count={tau_switch_count}" if tau_switch_count is not None else "") + " ]]")
+
   ts_hwl_u32 = None
+  direction_history = None
   if need_timing:
     ts_len = max_rounds * NUM_TS_SLOTS * 3
     ts_buf_1d = np.zeros(height * width * ts_len, np.uint32)
@@ -371,6 +420,31 @@ def main():
                        streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     ts_hwl_u32 = np.reshape(ts_buf_1d, (height, width, ts_len), order="F")
+
+    # direction_history/nf_history (Phase D telemetry, see the plan): the
+    # direction decision is identical on every PE by construction (every PE
+    # compares the SAME flooded nz_total against the SAME tau_switch_count
+    # -- see bool_pe.csl's term_col_bcast_done()), so reading PE(0,0)'s own
+    # copy is exactly as valid as any other PE's -- no aggregation needed.
+    nf_history_1d = np.zeros(height * width * max_rounds, np.uint32)
+    runner.memcpy_d2h(nf_history_1d, sym_nf_history, 0, 0, width, height, max_rounds,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
+    nf_history_hwl = np.reshape(nf_history_1d, (height, width, max_rounds), order="F")
+    direction_history_1d = np.zeros(height * width * max_rounds, np.uint32)
+    runner.memcpy_d2h(direction_history_1d, sym_direction_history, 0, 0, width, height,
+                       max_rounds, streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
+    direction_history_hwl = np.reshape(direction_history_1d, (height, width, max_rounds), order="F")
+    nf_history = nf_history_hwl[0, 0, :]
+    direction_history = direction_history_hwl[0, 0, :]
+
+    # transpose_structure()'s one-time cost (see the plan's Phase B/D) --
+    # per-PE (real imbalance signal, not just an aggregate), zero on every
+    # PE if the switch never fired this run (both tic and toc stay at their
+    # zero-init value in that case).
+    transpose_cycles = read_tic_toc_delta(
+        runner, sym_transpose_tic_buffer, sym_transpose_toc_buffer, height, width)
 
   runner.stop()
 
@@ -461,6 +535,39 @@ def main():
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
     row.update(row_cols)
 
+    # direction-optimizing BFS Phase D: per-round frontier size + which
+    # traversal strategy each profiled round actually used, alongside the
+    # phase timing decoded above -- see bool_pe.csl's nf_history/
+    # direction_history and the plan's own Phase D writeup.
+    profiled_directions = [int(v) for v in direction_history[:profiled_rounds]]
+    profiled_nf = [int(v) for v in nf_history[:profiled_rounds]]
+    row["direction_history"] = ";".join(str(v) for v in profiled_directions)
+    row["nf_history"] = ";".join(str(v) for v in profiled_nf)
+    dir_labels = ["BU" if d else "TD" for d in profiled_directions]
+    print(f"  direction per round (TD=top-down, BU=bottom-up): {dir_labels}")
+    print(f"  nf per round (this round's own discovery count): {profiled_nf}")
+
+    # Logged per-round (zero everywhere except the one round the switch
+    # actually fires in), matching every other compute-split column's own
+    # format -- lets plot_bfs_timing.py render it as a bar in that round's
+    # group alongside local_compute's own reset/compact/expand split,
+    # instead of only reporting one aggregate number for the whole run.
+    switch_round = next((i for i, d in enumerate(profiled_directions) if d), None)
+    transpose_min_list = [0] * profiled_rounds
+    transpose_max_list = [0] * profiled_rounds
+    transpose_avg_list = [0.0] * profiled_rounds
+    if switch_round is not None:
+      transpose_min_list[switch_round] = int(transpose_cycles.min())
+      transpose_max_list[switch_round] = int(transpose_cycles.max())
+      transpose_avg_list[switch_round] = float(transpose_cycles.mean())
+    row["transpose_min_cycles"] = ";".join(str(v) for v in transpose_min_list)
+    row["transpose_max_cycles"] = ";".join(str(v) for v in transpose_max_list)
+    row["transpose_avg_cycles"] = ";".join(f"{v:.1f}" for v in transpose_avg_list)
+    print(f"  {'transpose':>18s}: min={int(transpose_cycles.min())} "
+          f"max={int(transpose_cycles.max())} avg={transpose_cycles.mean():.1f}"
+          + (f"  (round {switch_round})" if switch_round is not None
+             else "  (0 -- switch never fired)"))
+
     if args.dump_pe_timing:
       phase_cycles, raw_slots, _ = decode_pe_phase_cycles(ts_hwl_u32, height, width, max_rounds,
                                                            rounds_completed)
@@ -507,10 +614,18 @@ def main():
       })
       print(f"saved per-PE timing grid to {pe_timing_out}")
 
-    search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles + int(d2h_cycles.max())
+    # transpose_structure()'s one-time cost (straggler-PE max, matching the
+    # convention every other cycle count here uses) is folded in explicitly
+    # -- none of decode_phase_row's phase windows span the gap it runs in
+    # (see transpose_cycles' own readback comment above), so device_time_cycles
+    # would otherwise silently exclude it from both search_time_cycles and GTEPS,
+    # overstating the hybrid kernel's speed by exactly the transpose cost.
+    device_time_cycles_with_transpose = device_time_cycles + int(transpose_cycles.max())
+    search_time_cycles = (int(h2d_seed_cycles.max()) + device_time_cycles_with_transpose
+                           + int(d2h_cycles.max()))
     row["search_time_cycles"] = search_time_cycles
-    print(f"[[ search_time_cycles (h2d_seed + device rounds + d2h parent readback, "
-          f"GRAPH500_BENCHMARK.md section 3): {search_time_cycles} ]]")
+    print(f"[[ search_time_cycles (h2d_seed + device rounds [incl. transpose] + d2h parent "
+          f"readback, GRAPH500_BENCHMARK.md section 3): {search_time_cycles} ]]")
 
     coo = A_csr.tocoo()
     m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(
@@ -534,9 +649,9 @@ def main():
     # overhead, since those transfers can otherwise dominate search_time_cycles
     # for small/fast graphs. Same quantity decode_phase_row already computed
     # as device_time_cycles; just also logged as its own trailing CSV column.
-    row["search_time_cycles_no_transfer"] = device_time_cycles
+    row["search_time_cycles_no_transfer"] = device_time_cycles_with_transpose
     _, _, search_time_seconds_no_transfer, gteps_no_transfer = compute_m_and_gteps(
-        coo, device_visited, is_symmetric, device_time_cycles)
+        coo, device_visited, is_symmetric, device_time_cycles_with_transpose)
     row["gteps_no_transfer"] = gteps_no_transfer
     print(f"[[ GTEPS w/o h2d_seed/d2h = {m} edges ({m_convention}) / "
           f"{search_time_seconds_no_transfer * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "

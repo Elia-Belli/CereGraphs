@@ -97,6 +97,9 @@ param max_local_nnz: u16;       // max local number of nonzeros (matrix structur
 param max_local_nnz_cols: u16;  // max local number of nonzero columns
 param max_local_nnz_rows: u16;  // max local number of nonzero rows
 param max_rounds: u16;          // upper bound on f_spmv_iter rounds profiled by ts_buf below
+param tau_switch_count: u32;    // switch top-down -> bottom-up once nz_total exceeds this (see term_col_bcast_done())
+                                 // u32 (not f32): cslc's --params CLI flag only accepts unsigned
+                                 // integers, and this is always a whole vertex count anyway
 
 const compute_task_id: local_task_id = @get_local_task_id(10);
 const reduce_done_task_id: local_task_id = @get_local_task_id(11);
@@ -121,6 +124,18 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const timestamp = @import_module("<time>");
 var tsc_start_buffer = @zeros([timestamp.tsc_size_words]u16);
 var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
+
+// Brackets transpose_structure()'s one-time cost (see term_col_bcast_done())
+// explicitly, instead of leaving it as an unattributed gap inside
+// total_runtime_cycles -- same raw-timestamp mechanism as record_ts()
+// below, captured unconditionally (like record_ts already is) regardless
+// of whether the host asked for full per-round timing; stays all-zero
+// (tic==toc==0) if the switch never fires, which is itself the correct
+// "no transpose happened" signal, not a bug. Per-PE, not a single scalar --
+// local_nnz/local_nnz_rows vary per PE, so this is a real imbalance signal
+// too, not just an aggregate cost.
+var transpose_tic_buffer = @zeros([timestamp.tsc_size_words]u16);
+var transpose_toc_buffer = @zeros([timestamp.tsc_size_words]u16);
 
 // Per-round, per-phase timing (f_spmv_iter only -- see record_ts() below).
 // One raw hardware timestamp is captured at each of these round-boundary
@@ -199,6 +214,17 @@ const NUM_TS_SLOTS: u16 = 12;
 // from a longer PRIOR run past the current run's rounds_completed are
 // simply never looked at.
 var ts_buf = @zeros([max_rounds * NUM_TS_SLOTS * 3]u16);
+
+// Phase D telemetry (direction-optimizing BFS, see the plan): per-round
+// frontier size (nf_history[r] == nz_total at the end of round r, i.e. the
+// number of vertices round r itself discovered) and which traversal
+// strategy round r actually used (direction_history[r], 0=top-down/
+// 1=bottom-up) -- lets a host script label each round's own
+// local_compute-family timing with the direction that produced it, instead
+// of only knowing the aggregate hybrid-vs-pure-top-down difference. Same
+// max_rounds-bounded sizing/truncation convention as ts_buf above.
+var nf_history = @zeros([max_rounds]u32);
+var direction_history = @zeros([max_rounds]u16);
 var ts_scratch = @zeros([timestamp.tsc_size_words]u16);
 // which round record_ts() below should file its captures under -- see the
 // two assignment sites (start_spmv(), term_col_bcast_done()) for why this
@@ -251,6 +277,44 @@ var local_nnz = @zeros([1]u16);
 var local_nnz_cols = @zeros([1]u16);
 var local_nnz_rows = @zeros([1]u16);
 
+// Phase B (direction-optimizing BFS, see the plan): CSR-by-destination
+// mirror of mat_col_idx/loc/len_buf, built ON-DEVICE by transpose_structure()
+// the one time is_bottom_up flips true -- never shipped from the host.
+// mat_row_idx_buf[nnz_rows] lists this PE's distinct nonzero LOCAL rows
+// (mirrors mat_col_idx_buf); mat_row_loc_buf/mat_row_len_buf are its
+// prefix-sum/degree pair (mirrors mat_col_loc_buf/mat_col_len_buf) into...
+// mat_rows_buf itself, REUSED IN PLACE: transpose_structure() overwrites it
+// to hold SOURCE COLUMN values grouped by row, instead of destination row
+// values grouped by column -- see its own comment for why this needs no
+// second [max_local_nnz]-sized array. local_nnz_rows[0] (already existing,
+// today host-shipped) is overwritten with the on-device recount as a
+// byproduct, so it's guaranteed self-consistent with these new buffers.
+var mat_row_idx_buf = @zeros([max_local_nnz_rows]u16);
+var mat_row_loc_buf = @zeros([max_local_nnz_rows]u16);
+var mat_row_len_buf = @zeros([max_local_nnz_rows]u16);
+
+// row_to_bucket: dense [blk] map from a row VALUE to its bucket index into
+// mat_row_idx/loc/len_buf (ROW_BUCKET_NONE if that row has no local nonzero
+// entries) -- blk-sized, not nnz-sized, so this is cheap relative to the
+// full second data array a naive dual-structure design would need. Doubles
+// as scratch for the row-degree histogram during transpose_structure()'s
+// counting pass, before being overwritten in place with real bucket
+// indices (see its own comment there).
+var row_to_bucket = @zeros([blk]u16);
+const ROW_BUCKET_NONE: u16 = 65535;
+
+// cursor_buf: mutable working copy of mat_row_loc_buf, advanced by
+// transpose_structure()'s cycle-leader scatter as it places each element
+// into the next free slot of its target row-bucket.
+var cursor_buf = @zeros([max_local_nnz_rows]u16);
+
+// visited_pos: 1 bit per OLD (column-grouped) position in mat_rows_buf,
+// tracking which have already been permuted to their final row-grouped
+// slot -- this plus cursor_buf/row_to_bucket above is the ENTIRE extra
+// memory transpose_structure() needs; no [max_local_nnz]-sized duplicate.
+const NNZ_BITMAP_WORDS: u16 = (max_local_nnz + 31) / 32;
+var visited_pos = @zeros([NNZ_BITMAP_WORDS]u32);
+
 // Real termination check (see reduce_done()): <collectives_2d> only gives
 // us per-row (mpi_x) or per-column (mpi_y) primitives, never "the
 // diagonal" directly, so reaching from one diagonal PE to another always
@@ -276,9 +340,30 @@ const MID: u16 = P / 2;
 // to sum, just move the diagonal's one real value to the rest of the
 // column. After that broadcast, every row's own nz_local holds the same
 // (that column's) shared value -- no separate nz_col buffer needed.
-// nz_total: after the row-reduce, meaningful only at (MID, MID)
+// nz_total: after the row-reduce, meaningful only at (MID, MID). Since
+// stage "direction-optimizing BFS" (see the plan), nz_local/nz_total hold a
+// POPCOUNT (this round's newly-discovered vertex count), not a 0/1 flag --
+// see reduce_done()'s own comment. reduce_fadds still just sums whatever's
+// in nz_local, so nz_total ends up exactly Beamer's nf (next round's
+// frontier size), flooded to every PE by the existing relay at zero added
+// communication cost. Termination is still "nz_total == 0" either way.
 var nz_local = @zeros([1]f32);
-var nz_total = @zeros([1]f32); // termination condition
+var nz_total = @zeros([1]f32); // termination condition (and, since >0, next round's frontier size nf)
+
+// is_bottom_up: this run's current BFS traversal strategy (Beamer et al.,
+// SC 2012 -- top-down/push vs. bottom-up/pull), decided once nz_total
+// crosses tau_switch_count (see term_col_bcast_done()). Deliberately named
+// to avoid a bare "direction" -- <collectives_2d>'s own POS_DIR/NEG_DIR
+// (imported above via mpi_x/mpi_y) is an unrelated fabric-routing-direction
+// concept internal to the broadcast/reduce FSMs, not this traversal
+// strategy. Switching is one-way (top-down -> bottom-up only, never back)
+// by design: this is what lets the transposed structure it requires be
+// built in place instead of duplicated (see the plan).
+var is_bottom_up: bool = false;
+// Temporary debug mirror of is_bottom_up (u16, host-readable) for
+// validating the switch threshold against real graphs before the
+// bottom-up compute path (Phase B/C) exists -- see the plan's Phase A.
+var is_bottom_up_dbg = @zeros([1]u16);
 
 // rounds_completed: host-visible counter of how many rounds f_spmv_iter
 // actually ran this call, purely for verifying early termination actually
@@ -346,6 +431,32 @@ const fill_bitmap_u32 = @get_dsd(mem1d_dsd, .{ .base_address = &zero_scalar_u32,
 const y_bitmap_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_bitmap, .extent = BITMAP_WORDS });
 const y_bitmap_reduced_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &y_bitmap_reduced, .extent = BITMAP_WORDS });
 
+// Same fast-reset trick, for transpose_structure()'s own two scratch
+// buffers (see the plan's Phase B) -- row_to_bucket is u16 (needs its own
+// zero_scalar_u16, since @mov16/@mov32 aren't interchangeable on element
+// width), visited_pos is u32 and reuses zero_scalar_u32 above directly
+// (same value, just a different extent than fill_bitmap_u32's).
+var zero_scalar_u16 = @zeros([1]u16);
+const fill_row_to_bucket_u16 = @get_dsd(mem1d_dsd, .{ .base_address = &zero_scalar_u16, .extent = blk, .stride = 0 });
+const row_to_bucket_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &row_to_bucket, .extent = blk });
+const fill_visited_pos_u32 = @get_dsd(mem1d_dsd, .{ .base_address = &zero_scalar_u32, .extent = NNZ_BITMAP_WORDS, .stride = 0 });
+const visited_pos_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &visited_pos, .extent = NNZ_BITMAP_WORDS });
+
+// Popcount support for reduce_done()'s nf computation: @popcnt (like
+// @or16/@and16) is 16-bit-granularity only, no @popcnt32 -- same
+// u16-view-of-a-u32-buffer trick reduce_or's own transfer_data_reduce_or()
+// uses (collectives_2d/pe.csl). @ptrcast can't be used inside a comptime
+// DSD-construction struct literal ("comptime pointer cast is not
+// supported") -- mirror collectives_2d's own workaround instead: build the
+// DSD with a harmless placeholder base address at module scope, then
+// retarget it to x_bitmap's u16 view via @set_dsd_base_addr at runtime
+// (see start_spmv()'s one-time-init block) -- @ptrcast is fine there,
+// same as collectives_2d's own mem16 = @set_dsd_base_addr(mem16,
+// @ptrcast(...)) call sites.
+var popcnt_scratch = @zeros([2 * BITMAP_WORDS]u16);
+var popcnt_src_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &popcnt_scratch, .extent = 2 * BITMAP_WORDS });
+const popcnt_dst_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &popcnt_scratch, .extent = 2 * BITMAP_WORDS });
+
 // sentinel meaning "no candidate parent seen". Only needs to exceed the max
 // valid LOCAL column index (blk-1), not the max global vertex index --
 // parent_local_buf stores a local column index, not a global vertex id (see
@@ -380,10 +491,27 @@ var ptr_mat_col_len_buf: [*]u16 = &mat_col_len_buf;
 var ptr_local_nnz: [*]u16 = &local_nnz;
 var ptr_local_nnz_cols: [*]u16 = &local_nnz_cols;
 var ptr_local_nnz_rows: [*]u16 = &local_nnz_rows;
+// Temporary debug exports for Phase B validation (see the plan / the
+// dedicated run_transpose_device_test.py) -- let a host script read back
+// transpose_structure()'s output and cross-check it against the
+// already-validated Python prototype.
+var ptr_mat_row_idx_buf: [*]u16 = &mat_row_idx_buf;
+var ptr_mat_row_loc_buf: [*]u16 = &mat_row_loc_buf;
+var ptr_mat_row_len_buf: [*]u16 = &mat_row_len_buf;
+// Temporary debug exports for Phase A validation (see the plan) -- nz_total
+// is Beamer's nf on the last completed round; is_bottom_up_dbg mirrors
+// is_bottom_up. Both let a host script confirm the switch threshold fires
+// where expected before the bottom-up compute path exists.
+var ptr_nz_total: [*]f32 = &nz_total;
+var ptr_is_bottom_up_dbg: [*]u16 = &is_bottom_up_dbg;
 
 var ptr_tsc_start_buffer: [*]u16 = &tsc_start_buffer;
 var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
+var ptr_transpose_tic_buffer: [*]u16 = &transpose_tic_buffer;
+var ptr_transpose_toc_buffer: [*]u16 = &transpose_toc_buffer;
 var ptr_ts_buf: [*]u16 = &ts_buf;
+var ptr_nf_history: [*]u32 = &nf_history;
+var ptr_direction_history: [*]u16 = &direction_history;
 
 var pcol_id: u16;
 var prow_id: u16;
@@ -415,6 +543,10 @@ fn start_spmv() void {
         mpi_x.init();
         mpi_y.init();
         mpi_initialized = true;
+        // one-time retarget of popcnt_src_dsd to x_bitmap's u16 view (see
+        // its own declaration comment) -- x_bitmap's address never changes
+        // for the life of this kernel, so this only needs to happen once.
+        popcnt_src_dsd = @set_dsd_base_addr(popcnt_src_dsd, @ptrcast([*]u16, &x_bitmap));
     }
     pcol_id = mpi_x.pe_id;
     prow_id = mpi_y.pe_id;
@@ -433,10 +565,18 @@ fn start_spmv() void {
     if (is_iterative) {
 
         var p: u16 = 0;
-        while (p < blk) : (p += 1) 
+        while (p < blk) : (p += 1)
         {
             parent_local_buf[p] = PARENT_NONE;
         }
+
+        // Every fresh BFS must start top-down: nf at the root is always far
+        // below tau_switch_count anyway, but relying on that implicitly
+        // instead of an explicit reset would be fragile (and see
+        // is_bottom_up's own comment for why this can only ever flip once
+        // per call).
+        is_bottom_up = false;
+        is_bottom_up_dbg[0] = 0;
     }
 
 
@@ -446,6 +586,9 @@ fn start_spmv() void {
         rounds_completed[0] = 0;
         ts_round = rounds_completed[0];
         record_ts(ts_round, TS_VBCAST_ISSUE);
+        if (ts_round < max_rounds) {
+            direction_history[ts_round] = 0; // round 0 always starts top-down
+        }
 
         // Phase 1: broadcast visited bitmap along each row (needed for parent tracking)
         mpi_x.broadcast(prow_id, &visited_bitmap, BITMAP_WORDS, visited_bcast_done_task_id);
@@ -481,42 +624,126 @@ fn f_spmv_iter() void {
     start_spmv();
 }
 
+// col_of(p): which column-group OLD (column-grouped) position p belongs to
+// -- mat_col_loc_buf is strictly increasing (every listed column has
+// degree >= 1), so this is a plain binary search for the largest i with
+// mat_col_loc_buf[i] <= p. Used only by transpose_structure()'s cycle
+// jumps below, which visit positions in scattered (non-sequential) order --
+// a sequential running-boundary trick isn't available there, and
+// precomputing this for every p would need an [max_local_nnz]-sized array,
+// exactly the duplicate this whole design avoids (see the plan).
+fn col_of(p: u16) u16 {
+    var lo: u16 = 0;
+    var hi: u16 = local_nnz_cols[0]; // exclusive upper bound
+    while (hi - lo > 1) {
+        const mid: u16 = lo + (hi - lo) / 2;
+        if (mat_col_loc_buf[mid] <= p) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return mat_col_idx_buf[lo];
+}
+
+// transpose_structure(): one-time in-place transpose of this PE's local
+// CSC-by-source block (mat_col_idx/loc/len_buf + mat_rows_buf) into a
+// CSR-by-destination block (mat_row_idx/loc/len_buf + mat_rows_buf, the
+// LATTER REUSED IN PLACE) -- see the plan's Phase B and this file's own
+// buffer-declaration comments above. Called exactly once, synchronously,
+// from term_col_bcast_done() the moment is_bottom_up flips true -- pure
+// local computation, no fabric traffic, so a plain fn (not a task) is
+// enough; the caller only needs to not proceed to the next round's
+// compute() until this returns.
+fn transpose_structure() void {
+    const nnz: u16 = local_nnz[0];
+
+    // --- counting pass: row-degree histogram, using row_to_bucket as
+    // scratch degree storage before it holds real bucket indices ---
+    @mov16(row_to_bucket_dsd, fill_row_to_bucket_u16);
+    var p: u16 = 0;
+    while (p < nnz) : (p += 1) {
+        row_to_bucket[mat_rows_buf[p]] += 1;
+    }
+
+    var nrows: u16 = 0;
+    var running: u16 = 0;
+    var r: u16 = 0;
+    while (r < blk) : (r += 1) {
+        const deg = row_to_bucket[r];
+        if (deg != 0) {
+            mat_row_idx_buf[nrows] = r;
+            mat_row_loc_buf[nrows] = running;
+            mat_row_len_buf[nrows] = deg;
+            cursor_buf[nrows] = running;
+            row_to_bucket[r] = nrows; // now a bucket index, not a degree
+            running += deg;
+            nrows += 1;
+        } else {
+            row_to_bucket[r] = ROW_BUCKET_NONE;
+        }
+    }
+    local_nnz_rows[0] = nrows; // on-device recount; self-consistent with the buffers above
+
+    // --- cycle-leader in-place scatter (see the plan's own writeup for the
+    // full derivation -- this permutes POSITIONS via each element's row
+    // value, but writes COLUMN values, not row values, at each target) ---
+    @mov32(visited_pos_dsd, fill_visited_pos_u32);
+
+    var p0: u16 = 0;
+    while (p0 < nnz) : (p0 += 1) {
+        if ((visited_pos[p0 >> 5] >> (p0 & 31)) & 1 != 0) {
+            continue;
+        }
+        var r_cur: u16 = mat_rows_buf[p0];
+        var c_cur: u16 = col_of(p0);
+        visited_pos[p0 >> 5] |= (@as(u32, 1) << (p0 & 31));
+        while (true) {
+            const b: u16 = row_to_bucket[r_cur];
+            const target: u16 = cursor_buf[b];
+            cursor_buf[b] += 1;
+            if ((visited_pos[target >> 5] >> (target & 31)) & 1 != 0) {
+                // closes the cycle -- target must be p0 (the only position
+                // this cycle could still map onto that we haven't already
+                // freshly marked visited above)
+                mat_rows_buf[target] = c_cur;
+                break;
+            }
+            const r_next: u16 = mat_rows_buf[target];
+            const c_next: u16 = col_of(target);
+            mat_rows_buf[target] = c_cur;
+            visited_pos[target >> 5] |= (@as(u32, 1) << (target & 31));
+            r_cur = r_next;
+            c_cur = c_next;
+        }
+    }
+}
+
 // compute() runs once per round
-task compute() void {
-    if (is_iterative) {
-        record_ts(ts_round, TS_COMPUTE_ENTRY);
-    }
-
-    // Reset y_bitmap and y_bitmap_reduced
-    @mov32(y_bitmap_dsd, fill_bitmap_u32);
-    @mov32(y_bitmap_reduced_dsd, fill_bitmap_u32);
-
-    if (is_iterative) {
-        record_ts(ts_round, TS_COMPUTE_RESET_DONE);
-    }
-
-    // Phase 3 Local boolean multiply: for every locally-nonzero column c with
-    // x_bitmap's bit c set, set the bit for every local (dense) row it
-    // touches. Also merge a candidate parent directly into the persistent
-    // parent_local_buf -- inline, no separate per-round scratch buffer --
-    // BEFORE the reduce below discards column identity. This is safe
-    // because visited_bitmap is only ever written in reduce_done(), which runs
-    // strictly after compute() finishes for this round, so visited_bitmap is
-    // guaranteed stable for the whole loop below. Any candidate gated by
-    // visited_bitmap is an acceptable one-hop-closer parent regardless of
-    // which local column supplies it (see the module docstring above), so
-    // there's no ordering requirement across multiple hits on the same row --
-    // whichever column is walked last for a given row wins, folded in
-    // immediately per-hit rather than via a deferred compact-scratch merge.
-    //
-    // A two-pass split (boolean multiply, then a separate parent-tracking
-    // pass) was tried to measure each half independently -- it showed the two
-    // cost almost exactly the same (bool-multiply marginally larger), but
-    // re-walking the same mat_col_idx_buf/mat_col_loc_buf/mat_col_len_buf/
-    // mat_rows_buf structure a second time (no intermediate storage between
-    // passes) inflated total_runtime_cycles by ~58% at the s12e16
-    // balanced16x16 ch16 reference config, so it was reverted in favor of
-    // this single fused pass.
+// compute_topdown(): Phase 3 local boolean multiply (push) -- for every
+// locally-nonzero column c with x_bitmap's bit c set, set the bit for
+// every local (dense) row it touches. Also merges a candidate parent
+// directly into the persistent parent_local_buf -- inline, no separate
+// per-round scratch buffer -- BEFORE the reduce (in compute()) discards
+// column identity. This is safe because visited_bitmap is only ever
+// written in reduce_done(), which runs strictly after compute() finishes
+// for this round, so visited_bitmap is guaranteed stable for the whole
+// loop below. Any candidate gated by visited_bitmap is an acceptable
+// one-hop-closer parent regardless of which local column supplies it (see
+// the module docstring above), so there's no ordering requirement across
+// multiple hits on the same row -- whichever column is walked last for a
+// given row wins, folded in immediately per-hit rather than via a deferred
+// compact-scratch merge.
+//
+// A two-pass split (boolean multiply, then a separate parent-tracking
+// pass) was tried to measure each half independently -- it showed the two
+// cost almost exactly the same (bool-multiply marginally larger), but
+// re-walking the same mat_col_idx_buf/mat_col_loc_buf/mat_col_len_buf/
+// mat_rows_buf structure a second time (no intermediate storage between
+// passes) inflated total_runtime_cycles by ~58% at the s12e16
+// balanced16x16 ch16 reference config, so it was reverted in favor of this
+// single fused pass.
+fn compute_topdown() void {
     var i: u16 = 0;
     while (i < local_nnz_cols[0]) : (i += 1) {
         const c = mat_col_idx_buf[i];
@@ -540,6 +767,62 @@ task compute() void {
                 }
             }
         }
+    }
+}
+
+// compute_bottomup(): the pull counterpart, used only after transpose_structure()
+// has run (see the plan's Phase B/is_bottom_up's own comment) -- iterates
+// this PE's locally-nonzero destination ROWS instead of source columns, and
+// for each not-yet-visited row, stops at the FIRST frontier column it finds
+// (the actual bottom-up efficiency win: unlike compute_topdown(), which
+// always walks every row a frontier column touches regardless of that
+// row's visited state, this skips a row's remaining columns as soon as one
+// hit is found). mat_rows_buf here holds SOURCE COLUMN values grouped by
+// row -- transpose_structure()'s in-place repurposing of its own memory,
+// not a second array (see mat_row_idx_buf's own declaration comment).
+fn compute_bottomup() void {
+    var i: u16 = 0;
+    while (i < local_nnz_rows[0]) : (i += 1) {
+        const r = mat_row_idx_buf[i];
+        if ((visited_bitmap[r >> 5] >> (r & 31)) & 1 != 0) {
+            continue; // already discovered -- skip this row's columns entirely
+        }
+        const loc = mat_row_loc_buf[i];
+        const len = mat_row_len_buf[i];
+        var j: u16 = 0;
+        while (j < len) : (j += 1) {
+            const c = mat_rows_buf[loc + j]; // source column, post-transpose
+            if ((x_bitmap[c >> 5] >> (c & 31)) & 1 != 0) {
+                y_bitmap[r >> 5] |= (@as(u32, 1) << (r & 31));
+                if (is_iterative) {
+                    parent_local_buf[r] = c;
+                }
+                break; // first hit wins -- no need to look at r's other columns
+            }
+        }
+    }
+}
+
+task compute() void {
+    if (is_iterative) {
+        record_ts(ts_round, TS_COMPUTE_ENTRY);
+    }
+
+    // Reset y_bitmap and y_bitmap_reduced
+    @mov32(y_bitmap_dsd, fill_bitmap_u32);
+    @mov32(y_bitmap_reduced_dsd, fill_bitmap_u32);
+
+    if (is_iterative) {
+        record_ts(ts_round, TS_COMPUTE_RESET_DONE);
+    }
+
+    // Phase 3: dispatch to whichever traversal strategy this round is
+    // using -- only the LOCAL computation differs (see the plan); the
+    // reset above and the reduce below are shared, unmodified either way.
+    if (is_bottom_up) {
+        compute_bottomup();
+    } else {
+        compute_topdown();
     }
 
     // TS_COMPUTE_EXPAND_ENTRY is recorded at the same point as
@@ -585,15 +868,25 @@ task reduce_done() void {
         // always 0, so newly_word's padding is always 0 too (AND with
         // anything), and visited_bitmap/x_bitmap's padding stays 0
         // inductively (OR/assign of an always-0 value).
-        nz_local[0] = 0.0;
         var w: u16 = 0;
         while (w < BITMAP_WORDS) : (w += 1) {
             const newly_word: u32 = y_bitmap_reduced[w] & ~visited_bitmap[w];
-            if (newly_word != 0) {
-                nz_local[0] = 1.0;
-            }
             visited_bitmap[w] |= newly_word;
             x_bitmap[w] = newly_word;
+        }
+
+        // nz_local: popcount of x_bitmap, which the loop above just set to
+        // exactly this round's newly-discovered bits -- no separate storage
+        // needed. reduce_fadds (below, via term_col_done()) still just sums
+        // whatever's here, so nz_total ends up exactly Beamer's nf (next
+        // round's frontier size) instead of a 0/1 flag, at zero added
+        // communication cost. Termination is unchanged: nf == 0 means
+        // nothing new was found, same as the old flag's 0.0 case.
+        @popcnt(popcnt_dst_dsd, popcnt_src_dsd);
+        nz_local[0] = 0.0;
+        var pw: u16 = 0;
+        while (pw < 2 * BITMAP_WORDS) : (pw += 1) {
+            nz_local[0] += @as(f32, popcnt_scratch[pw]);
         }
     }
 
@@ -668,14 +961,50 @@ task term_col_bcast_done() void {
 
     record_ts(ts_round, TS_TERM_COL_BCAST_DONE);
     // col-bcast done: every PE now holds the termination condition
-    
-    // Check term condition    
+
+    // Phase D telemetry: nf_history[ts_round] is round ts_round's OWN
+    // discovery count (this is still the OLD ts_round -- the round that
+    // just finished -- direction_history's own update below happens after
+    // ts_round is advanced, since that one instead records the NEXT
+    // round's direction).
+    if (ts_round < max_rounds) {
+        nf_history[ts_round] = @as(u32, nz_total[0]);
+    }
+
+    // Check term condition
     if (nz_total[0] != 0.0) {
+
+        // Direction decision: nz_total is now Beamer's nf (next round's
+        // frontier size, see reduce_done()), already flooded to every PE by
+        // the col-bcast above -- so every PE reaches this same comparison
+        // on the same value and switches in lockstep, with no extra
+        // agreement step needed. One-way only, by design (see is_bottom_up's
+        // own comment): switching back is deliberately unsupported, which
+        // is what lets Phase B build the transposed structure in place
+        // instead of duplicating it.
+        if (!is_bottom_up and nz_total[0] > @as(f32, tau_switch_count)) {
+            is_bottom_up = true;
+            is_bottom_up_dbg[0] = 1;
+            // Synchronous, runs to completion before the broadcast below
+            // (into next round's compute()) is issued -- compute_bottomup()
+            // (Phase C) can then safely assume the transposed structure is
+            // already in place by the time it's dispatched to.
+            timestamp.get_timestamp(&transpose_tic_buffer);
+            transpose_structure();
+            timestamp.get_timestamp(&transpose_toc_buffer);
+        }
 
         // rounds_completed[0] was already incremented (in reduce_done())
         ts_round = rounds_completed[0];
+        if (ts_round < max_rounds) {
+            if (is_bottom_up) {
+                direction_history[ts_round] = 1;
+            } else {
+                direction_history[ts_round] = 0;
+            }
+        }
         record_ts(ts_round, TS_VBCAST_ISSUE);
-        
+
         // Start with Phase 1 again: row-bcast updated visited bitmap
         mpi_x.broadcast(prow_id, &visited_bitmap, BITMAP_WORDS, visited_bcast_done_task_id);
    
@@ -705,9 +1034,18 @@ comptime {
     @export_symbol(ptr_local_nnz, "local_nnz");
     @export_symbol(ptr_local_nnz_cols, "local_nnz_cols");
     @export_symbol(ptr_local_nnz_rows, "local_nnz_rows");
+    @export_symbol(ptr_mat_row_idx_buf, "mat_row_idx_buf");
+    @export_symbol(ptr_mat_row_loc_buf, "mat_row_loc_buf");
+    @export_symbol(ptr_mat_row_len_buf, "mat_row_len_buf");
+    @export_symbol(ptr_nz_total, "nz_total");
+    @export_symbol(ptr_is_bottom_up_dbg, "is_bottom_up_dbg");
     @export_symbol(ptr_tsc_start_buffer, "tsc_start_buffer");
     @export_symbol(ptr_tsc_end_buffer, "tsc_end_buffer");
+    @export_symbol(ptr_transpose_tic_buffer, "transpose_tic_buffer");
+    @export_symbol(ptr_transpose_toc_buffer, "transpose_toc_buffer");
     @export_symbol(ptr_ts_buf, "ts_buf");
+    @export_symbol(ptr_nf_history, "nf_history");
+    @export_symbol(ptr_direction_history, "direction_history");
 
     @export_symbol(f_spmv);
     @export_symbol(f_spmv_iter);

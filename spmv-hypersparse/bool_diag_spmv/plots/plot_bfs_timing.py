@@ -144,13 +144,28 @@ H2D_COLORS = dict(zip(H2D_PARTS, hue_shades(H2D_BASE_HEX, len(H2D_PARTS))))
 # identity -- shades of local_compute's own yellow (same hue-family
 # convention as H2D_COLORS above), light->dark in chronological order
 # (reset happens first, then the compact multiply, then the expansion).
-COMPUTE_SPLIT_PARTS = ["local_compute_reset", "local_compute_compact", "local_compute_expand"]
+LOCAL_COMPUTE_SPLIT_PARTS = ["local_compute_reset", "local_compute_compact", "local_compute_expand"]
+
+# transpose_structure()'s one-time direction-optimizing-BFS cost (see the
+# plan): NOT a sub-part of local_compute (it runs in term_col_bcast_done(),
+# not compute()) -- rendered in the same grouped-bar panel per the user's
+# own request, but deliberately its own distinct hue, not a 4th yellow
+# shade, so it doesn't read as "part of local_compute's own breakdown".
+# transpose_*_cycles is zero in every round except whichever one the
+# top-down -> bottom-up switch actually fires in (see run_bfs.py), so this
+# bar is empty everywhere but that one round.
+TRANSPOSE_COLOR = "#2a9d8f"  # teal -- distinct from every other hue family in use
+
+COMPUTE_SPLIT_PARTS = LOCAL_COMPUTE_SPLIT_PARTS + ["transpose"]
 COMPUTE_SPLIT_COLORS = dict(zip(
-    COMPUTE_SPLIT_PARTS, hue_shades(ROUND_SEGMENT_COLORS["local_compute"], len(COMPUTE_SPLIT_PARTS))))
+    LOCAL_COMPUTE_SPLIT_PARTS,
+    hue_shades(ROUND_SEGMENT_COLORS["local_compute"], len(LOCAL_COMPUTE_SPLIT_PARTS))))
+COMPUTE_SPLIT_COLORS["transpose"] = TRANSPOSE_COLOR
 COMPUTE_SPLIT_LABELS = {
     "local_compute_reset": "buffer reset (y_local_buf/y_buf, tracks blk)",
     "local_compute_compact": "compact multiply (y_flags)",
     "local_compute_expand": "dense expansion (y_local_buf)",
+    "transpose": "transpose_structure() (one-time, switch round only)",
 }
 
 TEXT_PRIMARY = "#0b0b0b"
@@ -332,8 +347,20 @@ def plot_timing_row(row, out_path):
 
     bottom = total_heights
 
+  # direction-optimizing BFS Phase D (see the plan): label each round's own
+  # xtick with which traversal strategy it actually used, when that column
+  # is present (older CSV rows / runs predating this feature simply won't
+  # have it -- .get() + truthiness check covers both a missing key and an
+  # empty string the same way).
+  direction_history_row = row.get("direction_history")
+  if direction_history_row:
+    directions = parse_cycle_list(direction_history_row)
+    round_labels = [f"round {r}\n({'BU' if directions[r] else 'TD'})" for r in rounds]
+  else:
+    round_labels = [f"round {r}" for r in rounds]
+
   ax_rounds.set_xticks(rounds)
-  ax_rounds.set_xticklabels([f"round {r}" for r in rounds])
+  ax_rounds.set_xticklabels(round_labels)
 
   # Fourth panel: local_compute's own reset/compact/expand split, grouped
   # bars (not stacked -- these are independent measurements, not parts of
@@ -358,7 +385,7 @@ def plot_timing_row(row, out_path):
       candidate_labels.append((ax_compute, txt, xpos[r], 0.0, heights[r], compute_split_bar_width))
 
   ax_compute.set_xticks(rounds)
-  ax_compute.set_xticklabels([f"round {r}" for r in rounds])
+  ax_compute.set_xticklabels(round_labels)
 
   # measure-first pass: a label only survives if its rendered bounding box
   # actually fits inside its own segment's rectangle (with a little
@@ -381,14 +408,23 @@ def plot_timing_row(row, out_path):
   reset_total = int(compute_split_stats["local_compute_reset"]["max"].sum())
   compact_total = int(compute_split_stats["local_compute_compact"]["max"].sum())
   expand_total = int(compute_split_stats["local_compute_expand"]["max"].sum())
+  transpose_total = int(compute_split_stats["transpose"]["max"].sum())
   sum_rounds = int(round_duration.sum())
   diff_pct = 100.0 * (total_runtime_cycles - sum_rounds) / total_runtime_cycles
+  # transpose_structure() runs strictly between one round's own
+  # TERM_COL_BCAST_DONE and the next round's VBCAST_ISSUE (see bool_pe.csl's
+  # term_col_bcast_done()) -- outside every round's own bar span, so it's
+  # folded into this same gap alongside the first round's one-time fabric
+  # fill delay, not double-subtracted from round_duration_cycles.
+  gap_note = ("gap is the first round's one-time fabric fill delay"
+              + (f" + transpose_structure()'s {transpose_total}-cycle one-time cost"
+                 if transpose_total > 0 else ""))
   fig.suptitle(f"Per-round phase timing -- {matrix}, {pe_grid} grid, source={source}, "
                f"channels={channels}\n"
                f"n={row['n']}, nnz={row['nnz']}, {rounds_completed} rounds "
                "(bar height = round_duration_cycles, straggler PE span)\n"
                f"round bars sum to {sum_rounds} cycles vs total_runtime_cycles={total_runtime_cycles} "
-               f"({diff_pct:+.1f}% -- gap is the first round's one-time fabric fill delay)\n"
+               f"({diff_pct:+.1f}% -- {gap_note})\n"
                f"local_compute split: reset sums to {reset_total} cycles, compact multiply to "
                f"{compact_total} cycles, dense expansion to {expand_total} cycles across all rounds",
                fontsize=10)
