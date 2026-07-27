@@ -9,8 +9,9 @@ import os
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(BENCH_DIR)
 DATA_DIR = os.path.join(REPO_ROOT, "data")
-ORIGINAL_SPMV_DIR = os.path.join(REPO_ROOT, "original_spmv")
-BOOL_DIAG_SPMV_DIR = os.path.join(REPO_ROOT, "bool_diag_spmv")
+ORIGINAL_SPMV_DIR = os.path.join(REPO_ROOT, "spmv", "sdk-hypersparse-spmv")
+BOOL_DIAG_SPMV_DIR = os.path.join(REPO_ROOT, "bfs", "bool_diag_spmv")
+FP32_DIAG_SPMV_DIR = os.path.join(REPO_ROOT, "spmv", "fp32_diag_spmv")
 
 CLOCK_GHZ = 0.85  # 850MHz, matches hypersparse_spmv/run.py's cycles->us conversion
 

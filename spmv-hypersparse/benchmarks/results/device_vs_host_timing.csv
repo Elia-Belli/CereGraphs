@@ -1,0 +1,5 @@
+matrix,pe_grid,version,h2d_cycles,compute_cycles,d2h_cycles,total_cycles
+data/rmat_s6_e4.mtx,8x8,sdk-hypersparse-spmv (host-driven),28210,108280,11650,148140
+data/rmat_s6_e4.mtx,8x8,fp32_diag_spmv (device-only),12585,25715,2860,41160
+data/rmat_s8_e4.mtx,8x8,sdk-hypersparse-spmv (host-driven),50931,235940,19450,306321
+data/rmat_s8_e4.mtx,8x8,fp32_diag_spmv (device-only),34955,102421,9148,146524

@@ -1,0 +1,257 @@
+// fp32, diagonal-broadcast SpMV -- generic power iteration (y = A*x, real
+// values), NOT a BFS kernel. Forked from bool_diag_spmv/src/bool_pe.csl at
+// its very first commit (233800f, before any BFS-specific machinery existed)
+// and adapted back to real arithmetic: mat_vals_buf is restored (dropped in
+// the boolean fork since boolean semiring never used edge weights) and
+// compute() does genuine multiply-accumulate instead of the OR-via-add
+// boolean trick. Purpose: an architecturally-comparable device-only
+// iterative kernel to benchmark against sdk-hypersparse-spmv (the actual forked
+// Cerebras SDK hypersparse-spmv example) driven host-side, isolating the
+// cost of the host round trip as the only variable (see the plan's
+// Workstream A/B).
+//
+// Same diagonal-target design as bool_pe.csl (see its own module comment for
+// the full rationale): x is broadcast down each column from that column's
+// diagonal PE, and y is reduce_fadds-ed toward each row's diagonal PE -- the
+// PE that produces row py's result is exactly the PE that needs to source
+// the next round's column broadcast, which is what lets f_spmv_iter chain
+// rounds entirely on-device with no host round trip.
+//
+// Two entry points, mirroring bool_pe.csl's f_spmv/f_spmv_iter split:
+//   f_spmv      -- single round, host round-trip capable (host can call this
+//                  repeatedly, feeding y back as x itself, to measure the
+//                  host-driven baseline's per-round overhead).
+//   f_spmv_iter -- runs num_iters rounds (a host-written scalar, NOT a BFS
+//                  convergence check -- there is no notion of "done" here
+//                  beyond "ran the requested round count") entirely
+//                  on-fabric with a single blocking launch.
+
+param memcpy_params;
+param c2d_params;
+
+param blk: u16;                // per-PE dense vector chunk size = ceil(n/P)
+param max_local_nnz: u16;      // max local number of nonzeros
+param max_local_nnz_cols: u16; // max local number of nonzero columns
+
+const compute_task_id: local_task_id = @get_local_task_id(10);
+const reduce_done_task_id: local_task_id = @get_local_task_id(11);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// tsc timing, bracketing just broadcast+compute+reduce (memcpy happens
+// before f_tic is launched) -- same simplified methodology bool_pe.csl uses,
+// for a like-for-like relative comparison rather than an absolute
+// hardware-calibrated figure.
+const timestamp = @import_module("<time>");
+var tsc_start_buffer = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
+
+// system stdlib collectives_2d (not a local vendored copy -- unlike
+// bool_pe.csl, this kernel never touches the OR-reduce that vendoring was
+// for; broadcast + reduce_fadds are exactly what the unmodified system
+// module already provides).
+const mpi_x = @import_module("<collectives_2d/pe>", .{
+    .dim_params = c2d_params.x,
+    .queues = [2]u16{2, 4},
+    .dest_dsr_ids = [1]u16{1},
+    .src0_dsr_ids = [1]u16{1},
+    .src1_dsr_ids = [1]u16{1},
+    });
+const mpi_y = @import_module("<collectives_2d/pe>", .{
+    .dim_params = c2d_params.y,
+    .queues = [2]u16{3, 5},
+    .dest_dsr_ids = [1]u16{2},
+    .src0_dsr_ids = [1]u16{2},
+    .src1_dsr_ids = [1]u16{2},
+    });
+
+// matrix structure + values, populated per-PE by preprocess_fp32.py via
+// memcpy: same hypersparse compressed-column format bool_diag_spmv uses
+// (direct dense row-block index in mat_rows_buf, no compact indirection),
+// plus mat_vals_buf (the one thing the boolean fork dropped).
+var mat_rows_buf = @zeros([max_local_nnz]u16);
+var mat_vals_buf = @zeros([max_local_nnz]f32);
+var mat_col_idx_buf = @zeros([max_local_nnz_cols]u16);
+var mat_col_loc_buf = @zeros([max_local_nnz_cols]u16);
+var mat_col_len_buf = @zeros([max_local_nnz_cols]u16);
+
+var local_nnz = @zeros([1]u16);
+var local_nnz_cols = @zeros([1]u16);
+
+// x_buf: this PE's dense column-block of x. Host memcpy seeds real data only
+// at the diagonal PE (pcol_id == prow_id); everyone else starts at zero and
+// gets overwritten by the phase-1 broadcast.
+var x_buf = @zeros([blk]f32);
+
+// y_local_buf: this PE's own local contribution (dense over the row-block),
+// reset to 0 at the top of every compute() call -- unlike the boolean fork's
+// original 233800f version, this MUST be reset every round: real
+// accumulated sums (not idempotent OR-of-1.0 flags) would otherwise leak
+// stale partial sums from a prior round/call into this round's result.
+var y_local_buf = @zeros([blk]f32);
+
+// y_buf: final row-block result after reduce_fadds. Meaningful only at the
+// diagonal PE (pcol_id == prow_id) -- the host (or, for f_spmv_iter, this
+// same kernel feeding the next round) reads only the diagonal entries.
+var y_buf = @zeros([blk]f32);
+
+// num_iters: host-written scalar -- how many rounds f_spmv_iter should run.
+// Deliberately a runtime value, not a compile-time param, so a Workstream B
+// sweep over iteration counts (5/10/20/50/...) doesn't need a recompile per
+// point. Ignored by f_spmv (always exactly one round).
+var num_iters = @zeros([1]u16);
+var iter_round: u16 = 0;
+
+var ptr_x_buf: [*]f32 = &x_buf;
+var ptr_y_buf: [*]f32 = &y_buf;
+var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
+var ptr_mat_vals_buf: [*]f32 = &mat_vals_buf;
+var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
+var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
+var ptr_mat_col_len_buf: [*]u16 = &mat_col_len_buf;
+var ptr_local_nnz: [*]u16 = &local_nnz;
+var ptr_local_nnz_cols: [*]u16 = &local_nnz_cols;
+var ptr_num_iters: [*]u16 = &num_iters;
+
+var ptr_tsc_start_buffer: [*]u16 = &tsc_start_buffer;
+var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
+
+var pcol_id: u16;
+var prow_id: u16;
+
+// mpi_x/mpi_y.init() only needs to run once per device session, not once per
+// launch -- matters here specifically because f_spmv is meant to be called
+// repeatedly by a host-driven loop (see the module comment above).
+var mpi_initialized: bool = false;
+
+// true for f_spmv_iter calls (loop-back-into-next-round logic in
+// reduce_done() applies); false for plain f_spmv (always exactly one round).
+var is_iterative: bool = false;
+
+fn f_enable_tsc() void {
+    timestamp.enable_tsc();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_tic() void {
+    timestamp.get_timestamp(&tsc_start_buffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_toc() void {
+    timestamp.get_timestamp(&tsc_end_buffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn start_spmv() void {
+    if (!mpi_initialized) {
+        mpi_x.init();
+        mpi_y.init();
+        mpi_initialized = true;
+    }
+    pcol_id = mpi_x.pe_id;
+    prow_id = mpi_y.pe_id;
+    iter_round = 0;
+
+    // phase 1: broadcast this column's x-block down from its diagonal PE
+    // (row == pcol_id). Every PE in the column calls this identically.
+    mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+}
+
+// compute y = A*x, one round, real fp32 semiring, reduce to the diagonal
+fn f_spmv() void {
+    is_iterative = false;
+    start_spmv();
+}
+
+// runs num_iters[0] rounds of y = A*x entirely on-fabric, feeding each
+// round's y back as the next round's x at the diagonal PE -- no host round
+// trip, no convergence/termination check (this is generic power iteration,
+// not BFS: "done" just means "ran the requested round count").
+fn f_spmv_iter() void {
+    is_iterative = true;
+    start_spmv();
+}
+
+task compute() void {
+    var w: u16 = 0;
+    while (w < blk) : (w += 1) {
+        y_local_buf[w] = 0.0;
+    }
+
+    // local multiply-accumulate: for every locally-nonzero column c with
+    // x_buf[c] set, accumulate mat_vals_buf[k]*x_buf[c] into every local row
+    // it touches. Unlike the boolean fork's flag-then-expand two-pass
+    // scheme, this must accumulate (a row can be hit by more than one
+    // column), so there is no benefit to a separate compact pass here.
+    var i: u16 = 0;
+    while (i < local_nnz_cols[0]) : (i += 1) {
+        const c = mat_col_idx_buf[i];
+        if (x_buf[c] != 0.0) {
+            const loc = mat_col_loc_buf[i];
+            const len = mat_col_len_buf[i];
+            var j: u16 = 0;
+            while (j < len) : (j += 1) {
+                const k = mat_rows_buf[loc + j]; // dense row index, 0..blk-1
+                y_local_buf[k] += mat_vals_buf[loc + j] * x_buf[c];
+            }
+        }
+    }
+
+    // phase 2: reduce this row's local contributions toward its diagonal
+    // column (== prow_id). Genuine sum now, not an OR-via-add surrogate.
+    mpi_x.reduce_fadds(prow_id, @ptrcast([*]f32, &y_local_buf), @ptrcast([*]f32, &y_buf),
+                        blk, reduce_done_task_id);
+}
+
+task reduce_done() void {
+    if (!is_iterative) {
+        // Single f_spmv call: all PEs exit, host reads y_buf's diagonal
+        // entries (same convention as bool_pe.csl/hypersparse_spmv).
+        sys_mod.unblock_cmd_stream();
+        return;
+    }
+
+    iter_round += 1;
+    if (iter_round < num_iters[0]) {
+        // Feed this round's result back as the next round's input, only at
+        // the diagonal PE (the only PE where y_buf is real) -- every other
+        // PE's x_buf gets overwritten again by the next broadcast below
+        // regardless, so it doesn't need touching.
+        if (pcol_id == prow_id) {
+            var w: u16 = 0;
+            while (w < blk) : (w += 1) {
+                x_buf[w] = y_buf[w];
+            }
+        }
+        mpi_y.broadcast(pcol_id, @ptrcast([*]u32, &x_buf), blk, compute_task_id);
+    } else {
+        // Ran the requested round count: all PEs exit, host reads the final
+        // round's y_buf diagonal entries.
+        sys_mod.unblock_cmd_stream();
+    }
+}
+
+comptime {
+    @bind_local_task(compute, compute_task_id);
+    @bind_local_task(reduce_done, reduce_done_task_id);
+
+    @export_symbol(ptr_x_buf, "x_buf");
+    @export_symbol(ptr_y_buf, "y_buf");
+    @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
+    @export_symbol(ptr_mat_vals_buf, "mat_vals_buf");
+    @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
+    @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");
+    @export_symbol(ptr_mat_col_len_buf, "mat_col_len_buf");
+    @export_symbol(ptr_local_nnz, "local_nnz");
+    @export_symbol(ptr_local_nnz_cols, "local_nnz_cols");
+    @export_symbol(ptr_num_iters, "num_iters");
+    @export_symbol(ptr_tsc_start_buffer, "tsc_start_buffer");
+    @export_symbol(ptr_tsc_end_buffer, "tsc_end_buffer");
+
+    @export_symbol(f_spmv);
+    @export_symbol(f_spmv_iter);
+    @export_symbol(f_enable_tsc);
+    @export_symbol(f_tic);
+    @export_symbol(f_toc);
+}
