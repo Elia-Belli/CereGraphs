@@ -44,12 +44,7 @@ MODE="${1:-simulator}"
 SOURCE=0
 
 CASES=(
-  "12 16 16"
-  "14 16 16"
-  "16 16 32"
   "18 16 64"
-  # "19 16 64"  # pilot -- uncomment once s12-s18 are confirmed clean
-  # "20 16 64"  # stretch goal -- only after s19's pilot succeeds
 )
 
 case "$MODE" in
@@ -58,6 +53,13 @@ case "$MODE" in
     RUN_SCRIPT="bfs/bool_diag_spmv/run_bfs.appliance.py"
     PYTHON=python
     SIM_FLAG=""
+    # SdkRuntime's memcpy gRPC streams can get reset if https_proxy/HTTPS_PROXY
+    # (needed for e.g. pip through ALCF's proxy) also routes this internal
+    # cluster traffic -- confirmed against a real run, reset traced back to
+    # proxy.alcf.anl.gov's own IP. Excluding the cluster's internal network
+    # fixes it; append to (not clobber) any no_proxy already set.
+    export no_proxy="10.125.8.2,.cerebras.internal,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
+    export NO_PROXY="$no_proxy"
     echo "=== appliance mode: REAL hardware, --arch=$ARCH ==="
     ;;
   appliance-sim)
@@ -65,6 +67,8 @@ case "$MODE" in
     RUN_SCRIPT="bfs/bool_diag_spmv/run_bfs.appliance.py"
     PYTHON=python
     SIM_FLAG="--simulator"
+    export no_proxy="10.125.8.2,.cerebras.internal,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
+    export NO_PROXY="$no_proxy"
     echo "=== appliance-sim mode: appliance client, simulator backend, --arch=$ARCH ==="
     ;;
   simulator)
@@ -84,9 +88,16 @@ for case in "${CASES[@]}"; do
   read -r scale edgefactor grid <<< "$case"
   matrix="data/rmat_s${scale}_e${edgefactor}.balanced${grid}x${grid}.mtx"
   raw="data/rmat_s${scale}_e${edgefactor}.mtx"
+  # Max I/O channels for this grid size: the SDK's only documented rule is a
+  # flat hardware cap of 16 (channels are physical host<->device streamer
+  # lanes, not grid-topology-dependent per any doc/source checked) -- but we
+  # additionally cap at the grid's own edge width/height on the assumption
+  # channels map to fabric-edge columns, since that combination was never
+  # exercised at grid sizes below 16 before now.
+  channels=$(( grid < 16 ? grid : 16 ))
 
   echo ""
-  echo "=== s${scale} e${edgefactor} @ ${grid}x${grid} ==="
+  echo "=== s${scale} e${edgefactor} @ ${grid}x${grid} (channels=${channels}) ==="
 
   if [ ! -f "$matrix" ]; then
     if [ ! -f "$raw" ]; then
@@ -97,16 +108,29 @@ for case in "${CASES[@]}"; do
     ./util/analyze --matrix "$raw" --rand 0 --fabx "$grid" --faby "$grid" --omatrix "$matrix"
   fi
 
+  # Real hardware (appliance, no --simulator) gets its own csv/plot folder,
+  # kept separate from simulator/appliance-sim results -- same run_bfs.py/
+  # run_bfs.appliance.py --csv/--out-timing flags, just pointed elsewhere.
+  # Both scripts os.makedirs() the containing directory themselves.
+  OUT_ARGS=()
+  if [ "$MODE" = "appliance" ]; then
+    matrix_base="$(basename "$matrix" .mtx)"
+    OUT_ARGS=(
+      "--csv=bfs/bool_diag_spmv/results/hw/bfs_timing.csv"
+      "--out-timing=bfs/bool_diag_spmv/plots/hw/timing/timing_${matrix_base}_${grid}x${grid}_src${SOURCE}_ch${channels}.png"
+    )
+  fi
+
   if [ "$MODE" = "appliance" ] || [ "$MODE" = "appliance-sim" ]; then
     echo "-- compiling (writes artifact_path.json)"
     "$PYTHON" "$RUN_SCRIPT" --infile_mtx="$matrix" --num_pe_cols="$grid" --num_pe_rows="$grid" \
-      --channels=1 --source="$SOURCE" --arch="$ARCH" $SIM_FLAG --compile-only
+      --channels="$channels" --source="$SOURCE" --arch="$ARCH" $SIM_FLAG --notree --compile-only
     echo "-- running (reads artifact_path.json)"
     "$PYTHON" "$RUN_SCRIPT" --infile_mtx="$matrix" --num_pe_cols="$grid" --num_pe_rows="$grid" \
-      --channels=1 --source="$SOURCE" --arch="$ARCH" $SIM_FLAG
+      --channels="$channels" --source="$SOURCE" --arch="$ARCH" $SIM_FLAG --notree "${OUT_ARGS[@]}"
   else
     "$PYTHON" "$RUN_SCRIPT" --infile_mtx="$matrix" --num_pe_cols="$grid" --num_pe_rows="$grid" \
-      --channels=1 --source="$SOURCE" --arch="$ARCH" --driver=cslc
+      --channels="$channels" --source="$SOURCE" --arch="$ARCH" --driver=cslc --notree "${OUT_ARGS[@]}"
   fi
 done
 

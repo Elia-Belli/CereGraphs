@@ -31,12 +31,40 @@
   NOTE: cerebras.sdk.client / cerebras.appliance are only importable when
   actually connected to a Cerebras appliance -- this script cannot be
   exercised in a simulator-only environment (confirmed: both imports fail
-  there). It was written and cross-checked against ALCF's own documented
-  compile.py/run.py examples (docs.alcf.anl.gov/ai-testbed/cerebras/csl/,
-  v2.10.0 csl-examples) but still needs validation against real hardware,
-  not just a read-through -- in particular, the 4th positional argument to
-  SdkCompiler.compile() (see device_io.csl_compile_core_appliance's own
-  comment) is unverified.
+  there).
+
+  VALIDATED against a real ALCF appliance run (appliance-sim, small RMAT
+  case, from cer-usn-01) on 2026-07-27: full compile -> artifact_path.json
+  -> SdkRuntime round trip succeeds, scipy cross-check passes. Two real
+  issues were found and fixed in that pass, both cluster/environment
+  quirks rather than logic bugs:
+
+  1. elf_dir's default ("out/latest", meaningful only for the local
+     simulator's own checkout) fails the appliance compile job with
+     "<remote path>/out does not exist" -- the compile job runs in a
+     fresh remote sandbox with no pre-existing directory tree, so cslc's
+     -o flag needs a FLAT single-level name there. Fixed in main() by
+     passing os.path.basename(dirname) instead of dirname to
+     csl_compile_core_appliance -- matches both ALCF's own tutorial's
+     "-o out" and the SDK-bundled single-tile-matvec example's "-o
+     latest".
+  2. SdkRuntime's memcpy_d2h streaming call can get its gRPC connection
+     reset ("recvmsg:Connection reset by peer") if the shell's
+     https_proxy/HTTPS_PROXY (needed for e.g. pip installs through
+     ALCF's proxy) also ends up routing this internal cluster traffic --
+     the reset traced back to proxy.alcf.anl.gov's own IP. Fix is
+     environmental, not code: export no_proxy/NO_PROXY covering the
+     cluster's internal network (10.125.8.2, .cerebras.internal) before
+     invoking this script. sweep_bfs.sh's appliance/appliance-sim
+     branches do this automatically now; if invoking this script
+     directly, do it yourself.
+
+  The 4th positional argument to SdkCompiler.compile() (see
+  device_io.csl_compile_core_appliance's own comment) was separately
+  confirmed correct by introspecting the actually-installed
+  cerebras.sdk.client package (inspect.signature + docstring): out_path
+  is genuinely where the compiled artifact tar.gz is placed locally, not
+  redundant with app_path.
 
   How to compile and run (simulator, i.e. --simulator; drop it for real
   WSE-3 hardware -- see the fabric-dims branch in main() for why that also
@@ -271,8 +299,15 @@ def main():
     print("WARNING: compile only -- the appliance's compile server is torn down once this "
           "returns, so SdkRuntime can't be used in this same invocation")
     start = time.time()
+    # The compile job runs in a fresh remote sandbox with no pre-existing
+    # directory tree, so a nested -o path (dirname's default is "out/latest",
+    # meaningful only for the local simulator's own checkout) fails with
+    # "<path>/out does not exist" -- only a flat, single-level name works
+    # remotely (confirmed against a real ALCF compile job; matches both
+    # ALCF's own tutorial's "-o out" and the bundled single-tile-matvec
+    # example's "-o latest").
     artifact_path = csl_compile_core_appliance(
-        csl_dir, csl_file, dirname, fabric_width, fabric_height,
+        csl_dir, csl_file, os.path.basename(dirname), fabric_width, fabric_height,
         core_fabric_offset_x, core_fabric_offset_y, args.arch,
         np_cols, np_rows, blk, max_local_nnz, max_local_nnz_cols, max_local_nnz_rows,
         channels, width_west_buf, width_east_buf, max_rounds=max_rounds,

@@ -1,0 +1,169 @@
+[2026-07-28T08:53:34Z] === run_snap_sweep starting: berkstan pokec topcats orkut livejournal @ 750x750 ===
+[2026-07-28T08:53:34Z] --- berkstan (data/snap_berkstan.balanced750x750.mtx) @ 750x750 (channels=16) ---
+[2026-07-28T08:53:34Z] compiling berkstan (writes artifact_path.json)
+Event 2026-07-28 08:55:37 +0000 UTC reason=InconsistentVersion wsjob=wsjob-hsgrpksz4cdahrvyyecaib message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+2026-07-28 09:00:57,484 INFO     CSL compiler output:
+	CSL compiler produced no messages. Compilation successful.
+infile_mtx = data/snap_berkstan.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 685500-by-685500 with 7600595 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+WARNING: compile only -- the appliance's compile server is torn down once this returns, so SdkRuntime can't be used in this same invocation
+compile artifact_path: /home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/src/cs_822d4f7d80e5271c21d053cf5c586bc55a3b7be700a6526630a33f5015233a90.tar.gz
+Compilation done in 360.1019723415375s
+dumped artifact_path to artifact_path.json
+COMPILE ONLY: EXIT
+[2026-07-28T09:01:36Z] running berkstan (reads artifact_path.json)
+Event 2026-07-28 09:03:38 +0000 UTC reason=InconsistentVersion wsjob=wsjob-rrnqvtgjb2amiutp7vgfgm message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Could not find coordinator IP:port in cluster details
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/plots/plot_bfs_timing.py:462: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  plt.tight_layout(rect=[0, 0.26, 1, 0.93])
+infile_mtx = data/snap_berkstan.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 685500-by-685500 with 7600595 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+load artifact_path from artifact_path.json
+enabling tsc...
+timing h2d: matrix structure upload (Graph500-style 'construction')...
+timing h2d: seed x upload (Graph500-style per-search cost)...
+running f_spmv_iter...
+timing d2h readback (parent_local_buf -- the real BFS output)...
+[[ direction-optimizing Phase A: final nz_total=0.0, is_bottom_up=False ]]
+*** Run done in 678.4004497528076s
+scipy reference: breadth_first_order
+[[ scipy visited: 679835/685500 ]]
+[[ visited vs scipy mismatches: device=0 ]]
+[[ invalid device parents vs original graph: 0 ]]
+[[ parent differs from scipy's own pick (expected tie-break difference, not a bug): device=195275 ]]
+[[ mismatches (visited, device vs scipy): 0 / 685500 ]]
+[[ scipy cross-check: OK ]]
+          h2d_matrix: min=365109711757 max=365109711757 avg=365109711757.0
+            h2d_seed: min=1068763 max=1068763 avg=1068763.0
+                 d2h: min=12802866999 max=12802866999 avg=12802866999.0
+  round_duration_cycles (straggler span, VBCAST_ISSUE->TERM_COL_BCAST_DONE): [48888, 43268, 60003, 53023, 38023, 32697, 32698, 32697]
+  total_runtime_cycles (straggler span, round 0 VBCAST_ISSUE -> last round TERM_COL_BCAST_DONE): 341822  (sum of round_duration_cycles above: 341297)
+       visited_bcast: min=[411, 407, 407, 407, 407, 407, 407, 407] max=[4820, 2146, 2146, 2146, 2146, 2146, 2146, 2146] avg=[1949.1, 991.1, 991.1, 991.1, 991.1, 991.1, 991.1, 991.1] | adjusted max=[4820, 2146, 2146, 2146, 2146, 2146, 2146, 2146]
+      vertical_bcast: min=[362, 359, 360, 359, 359, 359, 360, 359] max=[420, 1946, 1947, 1946, 1946, 1946, 1947, 1946] avg=[377.1, 635.9, 636.9, 635.9, 635.9, 635.9, 636.9, 635.9] | adjusted max=[419, 380, 381, 380, 380, 380, 381, 380]
+       local_compute: min=[149, 149, 149, 149, 149, 149, 149, 149] max=[29120, 28515, 44861, 35913, 17530, 16732, 16732, 16732] avg=[461.4, 561.1, 1141.8, 717.9, 473.9, 451.3, 450.0, 449.9]
+  local_compute_reset: min=[64, 64, 64, 64, 64, 64, 64, 64] max=[64, 64, 64, 64, 64, 64, 64, 64] avg=[64.0, 64.0, 64.0, 64.0, 64.0, 64.0, 64.0, 64.0]
+  local_compute_compact: min=[56, 56, 56, 56, 56, 56, 56, 56] max=[29027, 28422, 44768, 35820, 17437, 16639, 16639, 16639] avg=[368.4, 468.1, 1048.8, 624.9, 380.9, 358.3, 357.0, 356.9]
+  local_compute_expand: min=[29, 29, 29, 29, 29, 29, 29, 29] max=[29, 29, 29, 29, 29, 29, 29, 29] avg=[29.0, 29.0, 29.0, 29.0, 29.0, 29.0, 29.0, 29.0]
+              reduce: min=[667, 667, 667, 667, 667, 667, 667, 667] max=[36780, 32557, 47616, 41717, 25940, 22536, 22536, 22536] avg=[10744.8, 10906.5, 15355.3, 13233.5, 8793.7, 8097.8, 8064.9, 8064.2] | adjusted max=[16355, 28474, 39920, 39767, 24767, 19422, 19422, 19422]
+     local_term_cond: min=[41, 41, 41, 41, 41, 41, 41, 41] max=[2292, 2292, 2292, 2292, 2292, 2292, 2292, 2292] avg=[44.0, 44.0, 44.0, 44.0, 44.0, 44.0, 44.0, 44.0]
+    relay_col_reduce: min=[318, 318, 318, 318, 318, 318, 318, 318] max=[35787, 32862, 49601, 42626, 27626, 22373, 22373, 22373] avg=[15208.0, 13737.8, 19101.2, 20030.7, 11109.0, 9786.5, 9758.5, 9759.3] | adjusted max=[35229, 30014, 48179, 41083, 26187, 21331, 21429, 21429]
+    relay_row_reduce: min=[38, 38, 38, 38, 38, 38, 38, 38] max=[29555, 20027, 35023, 26630, 19050, 16716, 16716, 16716] avg=[50.2, 54.6, 59.9, 53.5, 53.4, 50.8, 51.0, 51.0] | adjusted max=[12683, 2990, 14393, 7303, 3873, 2264, 2264, 2264]
+     relay_row_bcast: min=[29, 29, 29, 29, 29, 29, 29, 29] max=[20349, 20493, 26234, 27784, 18151, 13063, 13063, 13063] avg=[40.8, 35.8, 42.1, 36.9, 35.9, 33.7, 33.7, 33.7] | adjusted max=[20349, 20493, 26234, 27784, 18151, 13063, 13063, 13063]
+     relay_col_bcast: min=[340, 340, 340, 340, 340, 340, 340, 340] max=[31443, 28958, 40260, 37241, 24515, 19830, 19830, 19830] avg=[17556.8, 16301.2, 22630.7, 17279.4, 15886.0, 12605.8, 12667.9, 12667.9] | adjusted max=[29831, 25097, 39887, 34368, 21494, 16187, 16279, 16279]
+         relay_total: min=[4989, 7289, 8434, 8023, 8747, 6878, 6878, 6878] max=[44527, 41584, 58304, 51339, 36339, 31013, 31013, 31013] avg=[32855.7, 30129.4, 41833.9, 37400.6, 27084.3, 22476.8, 22511.1, 22511.9]
+  relay_critical_path_cycles (skew-adjusted, replaces relay_total's raw max in search_time_cycles): [35492, 32893, 44241, 40802, 28588, 23264, 23264, 23264]
+rounds_completed = 8 (profiled: 8)
+  direction per round (TD=top-down, BU=bottom-up): ['TD', 'TD', 'TD', 'TD', 'TD', 'TD', 'TD', 'TD']
+  nf per round (this round's own discovery count): [84208, 232572, 314334, 45871, 2730, 113, 6, 0]
+           transpose: min=0 max=0 avg=0.0  (0 -- switch never fired)
+[[ search_time_cycles (h2d_seed + device rounds [incl. transpose] + d2h parent readback, GRAPH500_BENCHMARK.md section 3): 12804642513 ]]
+[[ visited_count = 679835 / 685500, m_edges_traversed = 7583542 (directed_source_visited) ]]
+[[ GTEPS = 7583542 edges (directed_source_visited) / 14633877.16 us (@875 MHz) = 0.000518 GTEPS ]]  -- directed graph: not a Graph500-spec-comparable GTEPS, see m_convention
+[[ GTEPS w/o h2d_seed/d2h = 7583542 edges (directed_source_visited) / 807.72 us (@875 MHz) = 9.388878 GTEPS ]]
+appended timing row to bfs/bool_diag_spmv/results/hw/bfs_timing.csv
+saved timing plot to bfs/bool_diag_spmv/plots/hw/timing/timing_snap_berkstan.balanced750x750_750x750_src0_ch16.png
+[2026-07-28T09:15:19Z] === berkstan OK ===
+[2026-07-28T09:15:19Z] --- pokec (data/snap_pokec.balanced750x750.mtx) @ 750x750 (channels=16) ---
+[2026-07-28T09:15:19Z] compiling pokec (writes artifact_path.json)
+Event 2026-07-28 09:25:24 +0000 UTC reason=InconsistentVersion wsjob=wsjob-a9vq6y8dsbqxnfnjnr4zvf message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+2026-07-28 09:30:52,595 INFO     CSL compiler output:
+	CSL compiler produced no messages. Compilation successful.
+infile_mtx = data/snap_pokec.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 1633500-by-1633500 with 30622564 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+WARNING: compile only -- the appliance's compile server is torn down once this returns, so SdkRuntime can't be used in this same invocation
+compile artifact_path: /home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/src/cs_72aa2e0f38d1776be3fa5303b4353b3362737a83bc325fd501527b29cbd65690.tar.gz
+Compilation done in 370.1047022342682s
+dumped artifact_path to artifact_path.json
+COMPILE ONLY: EXIT
+[2026-07-28T09:31:33Z] running pokec (reads artifact_path.json)
+Event 2026-07-28 09:41:45 +0000 UTC reason=InconsistentVersion wsjob=wsjob-juiyaf2gtwqj9ej4p4cusr message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Could not find coordinator IP:port in cluster details
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+infile_mtx = data/snap_pokec.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 1633500-by-1633500 with 30622564 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+load artifact_path from artifact_path.json
+enabling tsc...
+timing h2d: matrix structure upload (Graph500-style 'construction')...
+timing h2d: seed x upload (Graph500-style per-search cost)...
+running f_spmv_iter...
+timing d2h readback (parent_local_buf -- the real BFS output)...
+Traceback (most recent call last):
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 675, in <module>
+    main()
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 422, in main
+    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 1185, in memcpy_d2h
+    memcpy_d2h_watcher(dest, request, response_iterator)
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 1139, in memcpy_d2h_watcher
+    for response in response_iterator:
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/grpc/_channel.py", line 426, in __next__
+    return self._next()
+           ^^^^^^^^^^^^
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/grpc/_channel.py", line 826, in _next
+    raise self
+grpc._channel._MultiThreadedRendezvous: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.RESOURCE_EXHAUSTED
+	details = "Sent message larger than max (2147482648 vs. 2147482624)"
+	debug_error_string = "UNKNOWN:Error received from peer ipv4:10.125.8.2:443 {created_time:"2026-07-28T09:46:19.306807166+00:00", grpc_status:8, grpc_message:"Sent message larger than max (2147482648 vs. 2147482624)"}"
+>
+[2026-07-28T09:46:26Z] FAILED: pokec run step failed -- see traceback above.
+[2026-07-28T09:46:26Z] --- topcats (data/snap_topcats.balanced750x750.mtx) @ 750x750 (channels=16) ---
+[2026-07-28T09:46:26Z] compiling topcats (writes artifact_path.json)
+Event 2026-07-28 09:55:18 +0000 UTC reason=InconsistentVersion wsjob=wsjob-azhxq44yyv4vffjay3u97u message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+2026-07-28 10:01:03,742 INFO     CSL compiler output:
+	CSL compiler produced no messages. Compilation successful.
+infile_mtx = data/snap_topcats.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 1791750-by-1791750 with 28511807 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+WARNING: compile only -- the appliance's compile server is torn down once this returns, so SdkRuntime can't be used in this same invocation
+compile artifact_path: /home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/src/cs_33b6355e19972cce5e1f144bbc6e5a09a2a7b41b842848cfe6efbe84d063a991.tar.gz
+Compilation done in 380.09917664527893s
+dumped artifact_path to artifact_path.json
+COMPILE ONLY: EXIT
+[2026-07-28T10:01:38Z] running topcats (reads artifact_path.json)
+Event 2026-07-28 10:10:28 +0000 UTC reason=InconsistentVersion wsjob=wsjob-pfyjtyztptgptlixvmhmc9 message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Could not find coordinator IP:port in cluster details
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+infile_mtx = data/snap_topcats.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 1791750-by-1791750 with 28511807 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+load artifact_path from artifact_path.json
+enabling tsc...
+timing h2d: matrix structure upload (Graph500-style 'construction')...
+timing h2d: seed x upload (Graph500-style per-search cost)...
+running f_spmv_iter...
+timing d2h readback (parent_local_buf -- the real BFS output)...
+Traceback (most recent call last):
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 675, in <module>
+    main()
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 422, in main
+    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 1185, in memcpy_d2h
+    memcpy_d2h_watcher(dest, request, response_iterator)
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 1139, in memcpy_d2h_watcher
+    for response in response_iterator:
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/grpc/_channel.py", line 426, in __next__
+    return self._next()
+           ^^^^^^^^^^^^
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/grpc/_channel.py", line 826, in _next
+    raise self
+grpc._channel._MultiThreadedRendezvous: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.RESOURCE_EXHAUSTED
+	details = "Sent message larger than max (2147482648 vs. 2147482624)"
+	debug_error_string = "UNKNOWN:Error received from peer ipv4:10.125.8.2:443 {grpc_message:"Sent message larger than max (2147482648 vs. 2147482624)", grpc_status:8, created_time:"2026-07-28T10:27:59.947835435+00:00"}"
+>
+[2026-07-28T10:28:01Z] FAILED: topcats run step failed -- see traceback above.
+[2026-07-28T10:28:01Z] --- orkut (data/snap_orkut.balanced750x750.mtx) @ 750x750 (channels=16) ---
+[2026-07-28T10:28:01Z] compiling orkut (writes artifact_path.json)
+Event 2026-07-28 11:06:10 +0000 UTC reason=InconsistentVersion wsjob=wsjob-g6mzm6gejaqaep5ljeswjt message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+2026-07-28 11:13:01,176 INFO     CSL compiler output:
+	CSL compiler produced no messages. Compilation successful.

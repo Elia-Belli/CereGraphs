@@ -327,14 +327,14 @@ def csl_compile_core_appliance(
   # setup") -- their own tutorial scripts pass this unconditionally.
   with SdkCompiler(disable_version_check=True) as compiler:
     args_str = " ".join(args)
-    # NOTE: ALCF's documented call passes a 4th positional argument (in
-    # their gemv-01 example, also "." -- same as csl_path) that
-    # sdk-hypersparse-spmv/run.appliance.py's 3-argument call doesn't have.
-    # Its exact meaning (a separate working/log directory? redundant with
-    # csl_path?) isn't determinable without either SDK docs deeper than
-    # what's quoted or a real cluster to introspect against -- verify this
-    # is right before trusting a real run, ideally by first running the
-    # unmodified ALCF tutorial example as a known-good reference point.
+    # CONFIRMED (2026-07-27, via inspect.signature/docstring against the
+    # actually-installed cerebras.sdk.client on a real ALCF node): compile()
+    # is (app_path, csl_main, options, out_path) -- out_path is genuinely
+    # "the path where to place the compile artifact on the user's machine"
+    # (a .tar.gz), not redundant with app_path. Reusing csl_path for both
+    # just places the artifact next to the source, matching ALCF's own
+    # gemv-01 tutorial's "." / "." pattern. Validated end-to-end against a
+    # real appliance-sim run, not just this signature check.
     artifact_path = compiler.compile(csl_path, file_config, args_str, csl_path)
     print("compile artifact_path:", artifact_path)
     return artifact_path

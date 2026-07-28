@@ -12,10 +12,10 @@
 #   named subset (e.g. `download_snap_graphs.sh berkstan` to skip waiting on
 #   orkut/livejournal's much larger downloads).
 #
-# NOTE: these SNAP filenames/URLs were not independently re-verified against
-# snap.stanford.edu when this script was written (no network access from
-# that environment) -- if a fetch 404s, check https://snap.stanford.edu/data/
-# and fix the matching entry in SNAP_FILES below.
+# NOTE: all five URLs (including orkut's SNAP_URL_OVERRIDE path) were
+# independently verified against snap.stanford.edu on 2026-07-28 from
+# cer-usn-01 -- if a fetch 404s again later, check https://snap.stanford.edu/
+# data/ and fix the matching entry in SNAP_FILES/SNAP_URL_OVERRIDE below.
 
 set -e
 
@@ -27,6 +27,14 @@ declare -A SNAP_FILES=(
   [pokec]="soc-pokec-relationships.txt.gz"
   [topcats]="wiki-topcats.txt.gz"
   [livejournal]="soc-LiveJournal1.txt.gz"
+)
+
+# Per-dataset URL override for entries that don't live directly under
+# data/$filename -- confirmed against snap.stanford.edu on 2026-07-28: orkut
+# is filed under data/bigdata/communities/, everything else above is at the
+# plain top-level path.
+declare -A SNAP_URL_OVERRIDE=(
+  [orkut]="https://snap.stanford.edu/data/bigdata/communities/com-orkut.ungraph.txt.gz"
 )
 
 names=("$@")
@@ -44,7 +52,7 @@ for name in "${names[@]}"; do
   fi
 
   dest="data/snap/$filename"
-  url="https://snap.stanford.edu/data/$filename"
+  url="${SNAP_URL_OVERRIDE[$name]:-https://snap.stanford.edu/data/$filename}"
 
   if [ -f "$dest" ]; then
     echo "[$name] already present at $dest, skipping"

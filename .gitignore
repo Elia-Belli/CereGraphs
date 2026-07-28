@@ -3,6 +3,8 @@ data/
 
 simfab_traces/
 wio_flows*
+wsjob-*
+cs_*
 __pycache__/
 
 

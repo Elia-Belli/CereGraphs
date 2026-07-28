@@ -1,0 +1,48 @@
+[2026-07-28T07:30:35Z] === grow_sweep starting at scale=20, grid=750x750 ===
+[2026-07-28T07:30:35Z] --- s20 e16 @ 750x750 (channels=16) ---
+[2026-07-28T07:30:35Z] compiling s20 (writes artifact_path.json)
+Event 2026-07-28 07:39:42 +0000 UTC reason=InconsistentVersion wsjob=wsjob-suvaxdge9dbsiuarh4kslh message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+2026-07-28 07:45:08,450 INFO     CSL compiler output:
+	CSL compiler produced no messages. Compilation successful.
+infile_mtx = data/rmat_s20_e16.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 1049250-by-1049250 with 31403422 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+WARNING: compile only -- the appliance's compile server is torn down once this returns, so SdkRuntime can't be used in this same invocation
+compile artifact_path: /home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/src/cs_d5d99302721799a4dd94a9c44e28f7a4c955bb08d71954b22eb8f1b573f7b3b9.tar.gz
+Compilation done in 370.10672330856323s
+dumped artifact_path to artifact_path.json
+COMPILE ONLY: EXIT
+[2026-07-28T07:45:51Z] running s20 (reads artifact_path.json)
+Event 2026-07-28 07:54:59 +0000 UTC reason=InconsistentVersion wsjob=wsjob-gexfdvu6x9ben8mccssog5 message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Could not find coordinator IP:port in cluster details
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+infile_mtx = data/rmat_s20_e16.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 1049250-by-1049250 with 31403422 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+load artifact_path from artifact_path.json
+enabling tsc...
+timing h2d: matrix structure upload (Graph500-style 'construction')...
+timing h2d: seed x upload (Graph500-style per-search cost)...
+running f_spmv_iter...
+timing d2h readback (parent_local_buf -- the real BFS output)...
+Traceback (most recent call last):
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 675, in <module>
+    main()
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 422, in main
+    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 1185, in memcpy_d2h
+    memcpy_d2h_watcher(dest, request, response_iterator)
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 1139, in memcpy_d2h_watcher
+    for response in response_iterator:
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/grpc/_channel.py", line 426, in __next__
+    return self._next()
+           ^^^^^^^^^^^^
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/grpc/_channel.py", line 826, in _next
+    raise self
+grpc._channel._MultiThreadedRendezvous: <_MultiThreadedRendezvous of RPC that terminated with:
+	status = StatusCode.RESOURCE_EXHAUSTED
+	details = "Sent message larger than max (2147482648 vs. 2147482624)"
+	debug_error_string = "UNKNOWN:Error received from peer ipv4:10.125.8.2:443 {created_time:"2026-07-28T08:00:04.074911931+00:00", grpc_status:8, grpc_message:"Sent message larger than max (2147482648 vs. 2147482624)"}"
+>
+[2026-07-28T08:00:09Z] STOP: run FAILED at s20 @ 750x750 (compiled fine, runtime/on-device failure).
