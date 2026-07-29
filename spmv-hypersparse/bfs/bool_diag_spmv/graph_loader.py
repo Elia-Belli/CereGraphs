@@ -73,7 +73,21 @@ def _load_edgelist(path):
   inferred_n = max(src + dst) + 1 if src else 0
   n = max(declared_n or 0, inferred_n)
   data = np.ones(len(src), dtype=np.float64)
-  return coo_matrix((data, (src, dst)), shape=(n, n))
+  # (dst, src), NOT (src, dst): bool_pe.csl's compute_topdown() walks, per
+  # local column c, the *row* list stored for c and marks those rows newly
+  # visited when c is in the frontier -- i.e. it computes y = M @ x meaning
+  # "row r becomes visited if r has an edge TO some frontier column c",
+  # which is ancestor/in-edge reachability relative to M, not descendant/
+  # out-edge reachability. Feeding M = A^T here (row=dst, col=src) makes the
+  # kernel's native ancestor-of-M computation equal descendant-of-A -- i.e.
+  # the standard "vertices reachable via out-edges from source" semantics a
+  # directed BFS is expected to have. Verified against real SNAP ground
+  # truth (berkstan vertex 546279: forward reaches 459,847, reverse reaches
+  # 18; pre-fix, sourcing from 546279 gave 18 -- see ERRORS.md). Irrelevant
+  # for RMAT (self-symmetric, doesn't use this loader) and for orkut
+  # (symmetrize() is its own transpose-symmetric fixed point, A+A^T ==
+  # A^T+A, so this swap is a no-op there either way).
+  return coo_matrix((data, (dst, src)), shape=(n, n))
 
 
 def _open(path, mode):

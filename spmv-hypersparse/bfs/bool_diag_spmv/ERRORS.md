@@ -276,6 +276,62 @@ table/`.data.hi` overflow lines; this is very likely just linker cleanup
 choking after the real failure already occurred, not an independent root
 cause.
 
+### 15. Directed BFS computed ancestor-reachability, not descendant-reachability — FIXED (code), but reopens berkstan
+```
+raw vertex 546279: forward (out-edge) BFS reaches 459,847; reverse (in-edge)
+BFS reaches 18. Hardware/scipy, sourcing from 546279 (translated), gave 18.
+```
+**Where**: every genuinely directed SNAP graph (berkstan, pokec, topcats,
+livejournal — not orkut, which is symmetrized; not RMAT, which doesn't use
+this loader). Invisible until now because every prior check only verified
+device-vs-scipy self-consistency, never checked against an independently-
+known real-world root vertex's true reachability (caught by the user
+directly questioning berkstan's canonical-root visited count against a
+published reference table's expected explored-edge count).
+**Cause**: `graph_loader.py`'s SNAP edge-list loader built
+`coo_matrix((data, (src, dst)))` (row=src, col=dst — the natural
+convention). But `bool_pe.csl`'s `compute_topdown()` walks, per local
+column `c`, the row-list stored for `c` and marks those rows visited when
+`c` is in the frontier — i.e. it computes `y = M @ x`: "row `r` becomes
+visited if `r` has an edge **to** some already-frontier column `c`". Given
+row=src, that's ancestor-reachability (who points at the frontier), not
+descendant-reachability (what the frontier points to). Verified directly:
+translating balanced row 353938 back to original vertex ids reproduced
+546279's *true out-neighbors* exactly — the matrix and the balancing were
+never wrong, only which direction "row=src" gets fed into the kernel's
+native (ancestor) SpMV walk.
+**Fix**: `graph_loader.py::_load_edgelist` now builds
+`coo_matrix((data, (dst, src)))` — i.e. feeds `M = A^T` instead of `A`.
+The kernel's native ancestor-of-`M` computation becomes descendant-of-`A`
+(standard "vertices reachable via out-edges from source" BFS). Verified:
+re-running the exact transpose-then-`breadth_first_order` logic
+`run_bfs.appliance.py` already uses for its own scipy check, against the
+newly-regenerated berkstan file, now gives 459,847 for vertex 546279 —
+matching true forward reachability exactly.
+**Consequence — berkstan is temporarily broken again, for a different
+reason**: regenerating+rebalancing berkstan with the corrected direction
+raised `max_local_nnz` from 1102 to 3481 (the true directed skew is worse
+than the accidentally-reversed one) — high enough that it now hits the
+*existing* PE static-memory ceiling (#8) at 750×750, the same wall
+topcats/livejournal are already stuck behind. This is not a new bug; it's
+`max_local_nnz` crossing a threshold that was already known to exist,
+independent of source vertex (a compile-time constant from matrix
+structure alone) — confirmed by ~100+ repeated `ran out of PE memory for
+task table`/`for data (section .data.hi)` errors across many internal
+placement attempts in one compile, not the random linker flake (#12).
+**This invalidates today's earlier "berkstan h2d fix" success rows**
+(`source=0` and the `546279`→`353938` canonical-root run) — both were
+computed against the wrong-direction matrix, which happened to have low
+enough skew (1102) to fit; the corrected graph doesn't fit at all right
+now. Those CSV rows and plots were removed rather than left looking valid.
+**Status**: code fix is in and verified correct at the matrix-construction
+level; berkstan itself is back to **Open** (needs a bigger grid, joining
+#8) until a coarser-than-750×750 option exists. **pokec, topcats,
+livejournal all need the same regenerate+rebalance treatment** — not done
+yet this session; their currently-published results (pokec especially,
+currently marked OK) were computed under the same pre-fix direction and
+must be treated as unverified until redone.
+
 ## Summary table
 
 | # | Error | Where confirmed | Cause | Status |
@@ -283,7 +339,7 @@ cause.
 | 1 | d2h gRPC 2GiB ceiling | RMAT s20 | design flaw (P copies transferred) | **Fixed** (`reduce_select_any`) |
 | 2 | PE mem overflow (new collective) | pokec/topcats | 3-buffer design | **Fixed** (2-buffer redesign) |
 | 3 | task id collision | compile-time | id 21 not actually free | **Fixed** (moved to 24) |
-| 4 | h2d gRPC 2GiB ceiling | berkstan (verified fixed), orkut | `max_local_nnz` skew + vendor SDK chunker envelope-overflow bug | **Fixed** (`memcpy_h2d_chunked`) |
+| 4 | h2d gRPC 2GiB ceiling | berkstan (fix verified logically; blocked again by #15/#8), orkut | `max_local_nnz` skew + vendor SDK chunker envelope-overflow bug | **Fixed** (`memcpy_h2d_chunked`) |
 | 4b | `h2d_matrix` stat garbage | berkstan/s18/s20 @ 750x750 | likely 32-bit cycle-counter wraparound in that stat's readout | **Open** (cosmetic; GTEPS unaffected) |
 | 5 | fabricated symmetrization | v2 SNAP pipeline | wrong default (`A\|A^T` for directed graphs) | **Fixed** (opt-in `--symmetrize`) |
 | 6 | scrambled source vertex | any SNAP run | `--rand 0` doesn't disable base permutation | **Fixed** (`--operm`) |
@@ -295,3 +351,4 @@ cause.
 | 12 | linker file-vanished flake | s21 (4/4), livejournal (1x), orkut (1/1) | compile-farm scratch/container lifecycle (probable), correlates with the 3 largest jobs in the suite | **Open**, not retried further |
 | 13 | transient 503 upload error | pokec (1st attempt) | connectivity flake (probable) | Resolved on retry |
 | 14 | "failed to terminate linker workers" | topcats | secondary message alongside #8 | Not independent |
+| 15 | directed BFS = ancestor not descendant reachability | berkstan (546279 test vs. reference table), affects all 4 directed SNAP graphs | edge-list loader fed row=src into a kernel that natively computes ancestor-of-frontier | **Fixed** (code, `graph_loader.py`); reopens berkstan/#8, pokec/topcats/livejournal need re-verification |
