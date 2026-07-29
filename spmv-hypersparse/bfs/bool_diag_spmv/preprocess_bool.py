@@ -14,6 +14,18 @@ import numpy as np
 #  A_colidx         mat_col_idx_buf
 #  A_rows           mat_rows_buf
 #
+# Vectorized with numpy (no per-nonzero Python loop) -- the original
+# implementation did three full O(nnz) passes in plain Python (`for col in
+# range(ncols): for colidx in range(start, end): ...`), which for graphs
+# with tens of millions of nonzeros (e.g. SNAP-scale pokec/topcats) cost
+# multiple CPU-minutes of local, single-threaded, unvectorized work before
+# ever reaching the actual remote CSL compile -- easy to mistake for "the
+# cluster is slow" when it was actually this client-side step. Every
+# per-nonzero decision below is instead expressed as a numpy
+# sort/unique/bincount/cumsum call over the full nonzero array at once, so
+# it scales the same O(nnz) but at C/vectorized speed, not interpreted
+# per-element speed. See the module's own git history / project memory for
+# the timing investigation that motivated this rewrite.
 def preprocess(
     # A is nrows-by-ncols with nnz nonzeros
     nrows: int,
@@ -52,70 +64,62 @@ def preprocess(
   bx = int((ncols + fabx - 1) / fabx)  # number of columns of a block
   by = int((nrows + faby - 1) / faby)  # number of rows of a block
 
-  local_nzrows = np.zeros((faby, fabx, 1), dtype=np.int32)
-  local_nzcols = np.zeros((faby, fabx, 1), dtype=np.int32)
-  local_nnz = np.zeros((faby, fabx, 1), dtype=np.int32)
+  # ---- per-nonzero column/row arrays, CSC order (col-major: col ascending,
+  # row ascending within each col -- REQUIRES sorted CSC row indices, same
+  # invariant the original loop's own "Remark" comment relied on; callers
+  # pass scipy's own .tocsc(), whose indices are sorted by construction
+  # here, so no extra .sort_indices() call is needed -- verified against
+  # graph_loader.py's own CSR/CSC construction). ----
+  col_per_nz = np.repeat(np.arange(ncols, dtype=np.int64), np.diff(cscColPtr))
+  row_per_nz = cscRowInd.astype(np.int64)
+  row_b_per_nz = row_per_nz // by
+  col_b_per_nz = col_per_nz // bx
+  row_l_per_nz = row_per_nz - row_b_per_nz * by
+  col_l_per_nz = col_per_nz - col_b_per_nz * bx
 
   max_grid_dim = max(faby, fabx)
-  counted = np.zeros(max_grid_dim, dtype=np.int32)
+  del max_grid_dim  # unused now -- was the pure-Python loop's `counted[]` scratch size
 
-  # step 1: compute local_ncols and local_nnz
-  counted[0:max_grid_dim] = -1  # invalid token
-  for col in range(ncols):
-    check_token = col
-    # col = col_b * bx + col_l
-    # where col_b is the column block index
-    #       col_l is local column index
-    col_b = int(col / bx)
-    col_l = col - col_b * bx
-    start = cscColPtr[col]
-    end = cscColPtr[col + 1]
-    for colidx in range(start, end):
-      row = cscRowInd[colidx]
-      # row = row_b * by + row_l
-      # where row_b is the row block index
-      #       row_l is local row index
-      row_b = int(row / by)
-      row_l = row - row_b * by
-      local_nnz[(row_b, col_b)] += 1
-      # Suppose Aij is block (row_b, col_b)
-      # if |{Aij(i, col_l) != 0}| > 0, col_l is a nonzero column in Aij
-      # we use counted[row_b] to count only once
-      # if Aij(i1, col_l) and Aij(i2, col_l) are nonzero and i1 < i2,
-      # only Aij(i1, col_l) adds local_nzcols[(row_b, col_b)]
-      if counted[row_b] != check_token:
-        # Aij(row_l,col_l) is nonzero
-        local_nzcols[(row_b, col_b)] += 1
-        counted[row_b] = check_token
+  # step 1 (local_nnz): a nonzero's block is fully determined by (row_b,
+  # col_b) -- a straight histogram over the flat block id, no per-nonzero
+  # branching needed at all.
+  block_id_per_nz = row_b_per_nz * fabx + col_b_per_nz
+  local_nnz = np.bincount(block_id_per_nz, minlength=faby * fabx).reshape(faby, fabx, 1)
 
-  # step 2: compute local_nrows
-  counted[0:max_grid_dim] = -1  # invalid token
-  for row in range(nrows):
-    check_token = row
-    # row = row_b * by + row_l
-    row_b = int(row / by)
-    row_l = row - row_b * by
-    start = csrRowPtr[row]
-    end = csrRowPtr[row + 1]
-    for colidx in range(start, end):
-      col = csrColInd[colidx]
-      # col = col_b * bx + col_l
-      col_b = int(col / bx)
-      col_l = col - col_b * bx
-      # Suppose Aij is block (row_b, col_b)
-      # if |{Aij(row_l, j) != 0}| > 0, row_l is a nonzero row in Aij
-      # we use counted[col_b] to count only once
-      # if Aij(row_l, j1) and Aij(row_l, j2) are nonzero and j1 < j2,
-      # only Aij(row_l, j1) adds local_nzrows[(row_b, col_b)]
-      if counted[col_b] != check_token:
-        # Aij(row_l,col_l) is nonzero
-        local_nzrows[(row_b, col_b)] += 1
-        counted[col_b] = check_token
+  # step 1 (local_nzcols): count of DISTINCT (row_b, col) combinations per
+  # block -- the original loop's `counted[row_b] != check_token(=col)` gate
+  # counts each (row_b, col) pair at most once per col, i.e. exactly once
+  # per distinct (row_b, col_b, col) triple (col_b follows deterministically
+  # from col). `col < ncols` always, so `row_b * ncols + col` is a safe
+  # unique key -- np.unique's own sort does in one vectorized pass what the
+  # scalar `counted[]` scratch array did one element at a time.
+  rowb_col_key = row_b_per_nz * np.int64(ncols) + col_per_nz
+  unique_rc_key, unique_rc_inverse, unique_rc_count = np.unique(
+      rowb_col_key, return_inverse=True, return_counts=True)
+  u_row_b = unique_rc_key // ncols
+  u_col = unique_rc_key % ncols
+  u_col_b = u_col // bx
+  u_col_l = u_col - u_col_b * bx
+  u_block_id = u_row_b * fabx + u_col_b
+  local_nzcols = np.bincount(u_block_id, minlength=faby * fabx).reshape(faby, fabx, 1)
+
+  # step 2 (local_nzrows): symmetric with step 1's local_nzcols, but over
+  # CSR (distinct (col_b, row) combinations per block, i.e. exactly once
+  # per distinct (row_b, col_b, row) triple, row_b determined by row).
+  row_per_nz_csr = np.repeat(np.arange(nrows, dtype=np.int64), np.diff(csrRowPtr))
+  col_per_nz_csr = csrColInd.astype(np.int64)
+  colb_row_key = (col_per_nz_csr // bx) * np.int64(nrows) + row_per_nz_csr
+  unique_cr_key = np.unique(colb_row_key)
+  u2_col_b = unique_cr_key // nrows
+  u2_row = unique_cr_key % nrows
+  u2_row_b = u2_row // by
+  u2_block_id = u2_row_b * fabx + u2_col_b
+  local_nzrows = np.bincount(u2_block_id, minlength=faby * fabx).reshape(faby, fabx, 1)
 
   # step 3: compute maximum dimension of Aij
-  max_local_nnz = max(local_nnz.ravel())
-  max_local_nnz_cols = max(local_nzcols.ravel())
-  max_local_nnz_rows = max(local_nzrows.ravel())
+  max_local_nnz = int(local_nnz.max())
+  max_local_nnz_cols = int(local_nzcols.max())
+  max_local_nnz_rows = int(local_nzrows.max())
 
   assert (max_local_nnz < np.iinfo(
       np.uint16).max), "LOCAL NUMBER OF NONZEROS WILL OVERFLOW, TRY USING A LARGER FABRIC"
@@ -155,62 +159,57 @@ def preprocess(
   # y_rows scheme this comment used to describe was dropped: the on-device
   # kernel now keeps a dense per-PE bitmap over `by`/`blk` rows instead of a
   # compact scratch array, so there is no compact index space to map into).
+  #
+  # Vectorized restatement of the original per-nonzero loop: `unique_rc_key`
+  # above (sorted ascending by row_b then col, since it was built as
+  # row_b*ncols+col) already enumerates every distinct (row_b, col_b, col)
+  # triple this block needs an A_colidx/A_colloc/A_collen slot for, in
+  # EXACTLY the order the original loop assigned increasing `pos` values --
+  # because col_b = col // bx is non-decreasing as col increases within a
+  # fixed row_b, entries belonging to the same (row_b, col_b) block form a
+  # contiguous run in this sorted key array. `pos` is therefore just each
+  # entry's 0-indexed rank within its own contiguous same-block run.
+  same_block_as_prev = np.empty(u_block_id.shape[0], dtype=bool)
+  same_block_as_prev[0] = False
+  same_block_as_prev[1:] = u_block_id[1:] == u_block_id[:-1]
+  # cumulative count reset to 0 at every run boundary -- a standard
+  # "position within contiguous group" trick: subtract, from each index,
+  # the index where its own run started.
+  run_start_idx = np.where(~same_block_as_prev)[0]
+  run_len = np.diff(np.append(run_start_idx, u_block_id.shape[0]))
+  pos_in_block = np.arange(u_block_id.shape[0]) - np.repeat(run_start_idx, run_len)
 
-  # "local_pos" keeps track of the position of nonzero column in A_colidx
-  local_pos = np.zeros((faby, fabx), dtype=np.int32)
-  counted[0:max_grid_dim] = -1  # invalid token
-  for col in range(ncols):
-    check_token = col
-    # col = col_b * bx + col_l
-    # where col_b is the column block index
-    #       col_l is local column index
-    col_b = int(col / bx)
-    col_l = col - col_b * bx
-    start = cscColPtr[col]
-    end = cscColPtr[col + 1]
-    for colidx in range(start, end):
-      row = cscRowInd[colidx]
-      # row = row_b * by + row_l
-      # where row_b is the row block index
-      #       row_l is local row index
-      row_b = int(row / by)
-      row_l = row - row_b * by
-      # Suppose Aij is block (row_b, col_b)
-      # Aij(row_l,col_l) is nonzero
-      if counted[row_b] != check_token:
-        # pos = position of nonzero column index in A_colidx and A_colen
-        # A_collen[pos] is accumulated nonzero rows
-        # A_colidx[pos] is the nonzero local column index
-        pos = local_pos[(row_b, col_b)]
-        # only record nonzero local column index once
-        A_colidx[(row_b, col_b, pos)] = col_l
-        # update A_colloc such that
-        # A_colloc[0] = 0
-        # A_colloc[j] = A_colloc[j-1] + A_colen[j-1]
-        if pos > 0:
-          A_colloc[(row_b, col_b,
-                    pos)] = A_colloc[(row_b, col_b, pos - 1)] + A_collen[(row_b, col_b, pos - 1)]
-        local_pos[(row_b, col_b)] = pos + 1  # advance to next nonzero column in Aij
-        counted[row_b] = check_token
-      # else:
-      #   "pos" is still current position of nonzero column index in A_colen
+  A_colidx[(u_row_b, u_col_b, pos_in_block)] = u_col_l.astype(np.uint16)
+  A_collen[(u_row_b, u_col_b, pos_in_block)] = unique_rc_count.astype(np.uint16)
+  # A_colloc[pos] = exclusive prefix sum of A_collen WITHIN this (row_b,
+  # col_b) block, i.e. a cumsum reset to 0 at every block boundary -- same
+  # run-start-subtraction trick, applied to the cumulative sum instead of a
+  # plain index.
+  cumsum_excl = np.concatenate(([0], np.cumsum(unique_rc_count)))[:-1]
+  A_colloc[(u_row_b, u_col_b,
+            pos_in_block)] = (cumsum_excl - cumsum_excl[np.repeat(run_start_idx, run_len)]).astype(np.uint16)
 
-      # Remark: "pos" is well-defined because CSC is sorted in ascending order
-      #   if col_l changes, then previous nonzero col_l is done
-      #   When the loop enters 1st row_l of in Aij(:, col_l), it defines "pos"
-      #   , the subsequent row_l in the same Aij(:, col_l) keeps the same "pos"
-      #   When the loop exits Aij, A_collen and A_rows for Aij(:, col_l) is done
-      #   When the loop enters Aij again, it re-starts the process for next nonzero
-      #   col_l in Aij
-      pos_start = A_colloc[(row_b, col_b,
-                            pos)]  # position of 1st row index if Aij(:, col_l) in A_rows
-      pos_rel_rowidx = A_collen[(row_b, col_b, pos)]  # position of nonzero row index in A_rows
-      # corresponding to Aij(:, col_l)
-      pos_rowidx = pos_rel_rowidx + pos_start
-      # A_rows stores row_l directly -- the kernel indexes its dense
-      # per-PE bitmap with this value, no compact lookup needed.
-      A_rows[(row_b, col_b, pos_rowidx)] = row_l
-      A_collen[(row_b, col_b, pos)] = pos_rel_rowidx + 1  # move to next nonzero Aij(row_l, col_l)
+  # Now place every ORIGINAL nonzero's row_l into A_rows at its correct
+  # flat position: this block's A_colloc[pos] (looked up via each
+  # original's own group) plus that nonzero's own rank within its
+  # (row_b, col) group (0-indexed, row-ascending -- guaranteed by CSC's
+  # sorted row order within a column, so a subset sharing (row_b, col) is
+  # still row-sorted). `unique_rc_inverse` maps each ORIGINAL nonzero to
+  # its group's index in the sorted unique array, and -- because CSC order
+  # is col-major with row ascending within col, and row_b is non-decreasing
+  # in row for fixed col -- entries sharing a group are themselves
+  # contiguous in the ORIGINAL array too, so the same run-start trick
+  # applies a second time, on `unique_rc_inverse` directly.
+  same_group_as_prev = np.empty(nnz, dtype=bool)
+  same_group_as_prev[0] = False
+  same_group_as_prev[1:] = unique_rc_inverse[1:] == unique_rc_inverse[:-1]
+  group_run_start_idx = np.where(~same_group_as_prev)[0]
+  group_run_len = np.diff(np.append(group_run_start_idx, nnz))
+  pos_rel_rowidx = np.arange(nnz) - np.repeat(group_run_start_idx, group_run_len)
+
+  pos_start_per_nz = A_colloc[(u_row_b, u_col_b, pos_in_block)][unique_rc_inverse]
+  pos_rowidx_per_nz = pos_start_per_nz.astype(np.int64) + pos_rel_rowidx
+  A_rows[(row_b_per_nz, col_b_per_nz, pos_rowidx_per_nz)] = row_l_per_nz.astype(np.uint16)
 
   matrix_info = {}
   matrix_info["nrows"] = nrows  # number of rows of the matrix

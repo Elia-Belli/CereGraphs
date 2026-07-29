@@ -301,6 +301,10 @@ def main():
     sym_direction_history = runner.get_id("direction_history")
     sym_transpose_tic_buffer = runner.get_id("transpose_tic_buffer")
     sym_transpose_toc_buffer = runner.get_id("transpose_toc_buffer")
+    sym_parent_resolve_tic_buffer = runner.get_id("parent_resolve_tic_buffer")
+    sym_parent_resolve_toc_buffer = runner.get_id("parent_resolve_toc_buffer")
+    sym_round_trip_start_buffer = runner.get_id("round_trip_start_buffer")
+    sym_round_trip_done_buffer = runner.get_id("round_trip_done_buffer")
 
   runner.load()
   runner.run()
@@ -374,9 +378,16 @@ def main():
     print("timing d2h readback (parent_local_buf -- the real BFS output)...")
     runner.launch("f_tic", nonblock=True)
 
-  parent_local_buf_1d = np.zeros(height * width * blk, np.uint32)
-  runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
-                     streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+  # Phase B of the on-device parent resolution plan: bool_pe.csl already
+  # resolved each row's P per-PE candidates down to a single winner at
+  # PE-column 0 (see term_col_bcast_done()'s reduce_select_any call), so
+  # only that one narrow column needs to leave the device -- the fix for
+  # the real d2h gRPC ~2GiB message-size ceiling (see project memory /
+  # GRAPH500_BENCHMARK.md). width=1 here, not width -- do not widen this
+  # back out, that's the whole point.
+  parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
+  runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, 1, height, blk,
+                     streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                      order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
   d2h_cycles = None
@@ -446,10 +457,25 @@ def main():
     transpose_cycles = read_tic_toc_delta(
         runner, sym_transpose_tic_buffer, sym_transpose_toc_buffer, height, width)
 
+    # mpi_x.reduce_select_any()'s one-time end-of-run cost (Phase B of the
+    # on-device parent resolution plan) -- unlike transpose_cycles this is
+    # NOT conditional (always fires once for is_iterative runs), so no
+    # "did it fire" zero-check is needed here.
+    parent_resolve_cycles = read_tic_toc_delta(
+        runner, sym_parent_resolve_tic_buffer, sym_parent_resolve_toc_buffer, height, width)
+
+    # Always-correct round-trip span, independent of max_rounds/ts_buf
+    # truncation -- see round_trip_start_buffer/round_trip_done_buffer's
+    # own declaration comment in bool_pe.csl and decode_phase_row's own
+    # comment for how this fixes total_runtime_cycles/search_time_cycles
+    # for BFS runs with more rounds than max_rounds can profile in detail.
+    round_trip_cycles = read_tic_toc_delta(
+        runner, sym_round_trip_start_buffer, sym_round_trip_done_buffer, height, width)
+
   runner.stop()
 
   device_parent = extract_parent_result(
-      n, blk, P, np.reshape(parent_local_buf_1d, (height, width, blk), order="F"))
+      n, blk, P, np.reshape(parent_local_buf_1d, (height, 1, blk), order="F"))
   device_parent[source] = source  # root, not "undiscovered" -- see bool_pe.csl's module docstring
   device_visited = derive_visited_from_parent(n, device_parent, source)
 
@@ -523,7 +549,7 @@ def main():
     }
 
     for name, cycles in (("h2d_matrix", h2d_matrix_cycles), ("h2d_seed", h2d_seed_cycles),
-                         ("d2h", d2h_cycles)):
+                         ("d2h", d2h_cycles), ("parent_resolve", parent_resolve_cycles)):
       row[f"{name}_min_cycles"] = int(cycles.min())
       row[f"{name}_max_cycles"] = int(cycles.max())
       row[f"{name}_avg_cycles"] = f"{cycles.mean():.1f}"
@@ -531,7 +557,7 @@ def main():
             f"avg={cycles.mean():.1f}")
 
     row_cols, device_time_cycles, profiled_rounds = decode_phase_row(
-        ts_hwl_u32, height, width, max_rounds, rounds_completed)
+        ts_hwl_u32, height, width, max_rounds, rounds_completed, round_trip_cycles)
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
     row.update(row_cols)
 
@@ -614,14 +640,16 @@ def main():
       })
       print(f"saved per-PE timing grid to {pe_timing_out}")
 
-    # transpose_structure()'s one-time cost (straggler-PE max, matching the
-    # convention every other cycle count here uses) is folded in explicitly
-    # -- none of decode_phase_row's phase windows span the gap it runs in
-    # (see transpose_cycles' own readback comment above), so device_time_cycles
-    # would otherwise silently exclude it from both search_time_cycles and GTEPS,
-    # overstating the hybrid kernel's speed by exactly the transpose cost.
-    device_time_cycles_with_transpose = device_time_cycles + int(transpose_cycles.max())
-    search_time_cycles = (int(h2d_seed_cycles.max()) + device_time_cycles_with_transpose
+    # transpose_structure()'s one-time cost and mpi_x.reduce_select_any()'s
+    # one-time end-of-run cost (straggler-PE max, matching the convention
+    # every other cycle count here uses) are folded in explicitly -- none
+    # of decode_phase_row's phase windows span either gap (see each's own
+    # readback comment above), so device_time_cycles would otherwise
+    # silently exclude both from search_time_cycles and GTEPS, overstating
+    # the kernel's speed by exactly those costs.
+    device_time_cycles_with_extras = (device_time_cycles + int(transpose_cycles.max())
+                                       + int(parent_resolve_cycles.max()))
+    search_time_cycles = (int(h2d_seed_cycles.max()) + device_time_cycles_with_extras
                            + int(d2h_cycles.max()))
     row["search_time_cycles"] = search_time_cycles
     print(f"[[ search_time_cycles (h2d_seed + device rounds [incl. transpose] + d2h parent "
@@ -649,9 +677,9 @@ def main():
     # overhead, since those transfers can otherwise dominate search_time_cycles
     # for small/fast graphs. Same quantity decode_phase_row already computed
     # as device_time_cycles; just also logged as its own trailing CSV column.
-    row["search_time_cycles_no_transfer"] = device_time_cycles_with_transpose
+    row["search_time_cycles_no_transfer"] = device_time_cycles_with_extras
     _, _, search_time_seconds_no_transfer, gteps_no_transfer = compute_m_and_gteps(
-        coo, device_visited, is_symmetric, device_time_cycles_with_transpose)
+        coo, device_visited, is_symmetric, device_time_cycles_with_extras)
     row["gteps_no_transfer"] = gteps_no_transfer
     print(f"[[ GTEPS w/o h2d_seed/d2h = {m} edges ({m_convention}) / "
           f"{search_time_seconds_no_transfer * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "

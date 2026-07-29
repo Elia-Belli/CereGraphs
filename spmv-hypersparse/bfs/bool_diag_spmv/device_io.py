@@ -136,37 +136,32 @@ def unpack_bitmap_to_dense(height, width, blk, bitmap_hwl):
   return dense
 
 
-# Must match bool_pe.csl's PARENT_NONE exactly -- a LOCAL column-index
-# sentinel (see its own comment there), not a global-vertex-index one, so
-# this is independent of n.
-PARENT_NONE_LOCAL = 65535
+# Must match bool_pe.csl's PARENT_NONE exactly. Phase A of the on-device
+# parent resolution plan: parent_local_buf now stores the FULL global
+# vertex id (widened u16 local-index -> u32 global-id), so this sentinel is
+# now a global-vertex-index one (u32::MAX), not a local-column-index one --
+# keep this numerically in sync with bool_pe.csl's own PARENT_NONE constant
+# by hand; there is no single shared source of truth for the two languages.
+PARENT_NONE_GLOBAL = 4294967295
 
 
 def extract_parent_result(n, blk, P, parent_hwl):
-  """Assemble the length-n parent vector from the full (not diagonal-only)
-  parent_local_buf rectangle. parent_hwl has shape (height=P, width=P, blk):
-  for row-block p, every column-PE parent_hwl[p, w, :] independently
-  recorded a LOCAL column index (0..blk-1, or PARENT_NONE_LOCAL if none --
-  see bool_pe.csl's module docstring and PARENT_NONE's own comment) for that
-  row-block's blk local positions. bool_pe.csl never computes the global
-  vertex id itself (that's the whole point -- keeps parent_local_buf u16 at
-  any n), so it's reconstructed here, since only the host readback layout
-  ties each width-index w to its actual pcol_id: global = w*blk + local_c.
-  Sentinel entries are mapped to a value >= n before combining (rather than
-  converted as-is) so they can never spuriously beat a genuine candidate in
-  the min once n is large -- a raw PARENT_NONE_LOCAL could otherwise
-  reconstruct to a small-looking number for w==0. The min across the P
-  column-PEs is still needed (the row/column-min-reduce <collectives_2d>
-  can't do, per the TODO in bool_pe.csl's module docstring); same
-  list-then-concatenate-then-truncate shape extract_diag_result above uses
-  for the diagonal case."""
-  col_pe = np.arange(P, dtype=np.int64).reshape(1, P, 1)
-  local_c = parent_hwl.astype(np.int64)
-  is_none = local_c == PARENT_NONE_LOCAL
-  global_candidate = np.where(is_none, np.iinfo(np.int64).max, col_pe * blk + local_c)
-  parts = [global_candidate[p, :, :].min(axis=0) for p in range(P)]
-  parent = np.concatenate(parts)[0:n]
-  parent[parent >= n] = -1  # no real column-PE ever recorded a candidate for this row
+  """Assemble the length-n parent vector from parent_local_buf's PE-column-0
+  slice. parent_hwl has shape (height=P, width=1, blk): Phase B of the
+  on-device parent resolution plan resolves each row's P per-PE candidates
+  down to a single winner ON-DEVICE (bool_pe.csl's term_col_bcast_done()
+  calls mpi_x.reduce_select_any(root=0, ...) exactly once, at the very end
+  of the BFS, right before host readback -- see its own comment), landing
+  the result at a FIXED PE-column (0) for every row so the host can read
+  back a plain narrow rectangle instead of the full P-wide grid this used
+  to require (the fix for the real d2h gRPC ~2GiB message-size ceiling --
+  see project memory / GRAPH500_BENCHMARK.md). No per-row combine needed
+  here any more -- just decode column 0's global ids and map the sentinel
+  to -1. `P` is accepted but unused (kept for call-site stability across
+  this repo's four callers)."""
+  del P  # unused in Phase B -- see docstring
+  global_c = parent_hwl[:, 0, :].astype(np.int64)
+  parent = np.where(global_c == PARENT_NONE_GLOBAL, -1, global_c).reshape(-1)[0:n]
   return parent
 
 

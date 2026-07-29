@@ -43,7 +43,7 @@ for name in berkstan orkut pokec topcats livejournal; do
 
   if [ ! -f "$balanced" ]; then
     log "balancing $mtx -> $balanced (${GRID}x${GRID} grid)"
-    if ! ./util/analyze --matrix "$mtx" --rand 0 --fabx "$GRID" --faby "$GRID" --omatrix "$balanced" 2>&1 | tee -a "$LOG"; then
+    if ! ./util/analyze --matrix "$mtx" --shared-perm --rand 0 --fabx "$GRID" --faby "$GRID" --omatrix "$balanced" 2>&1 | tee -a "$LOG"; then
       log "FAILED balancing $name, skipping"
       continue
     fi

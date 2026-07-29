@@ -105,7 +105,7 @@ for case in "${CASES[@]}"; do
       cs_python benchmarks/gen_rmat.py "$scale" "$edgefactor" 0 "$raw"
     fi
     echo "-- balancing $raw -> $matrix (util/analyze, ${grid}x${grid} grid)"
-    ./util/analyze --matrix "$raw" --rand 0 --fabx "$grid" --faby "$grid" --omatrix "$matrix"
+    ./util/analyze --matrix "$raw" --symmetric --rand 0 --fabx "$grid" --faby "$grid" --omatrix "$matrix"
   fi
 
   # Real hardware (appliance, no --simulator) gets its own csv/plot folder,

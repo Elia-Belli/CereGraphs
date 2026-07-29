@@ -105,11 +105,24 @@ const reduce_fabouts = [2]fabout_dsd { data_0_fabout, data_1_fabout };
 // FSM/DSR/teardown machinery exactly (none of that is arithmetic-specific);
 // only the actual combine op differs (@or16 instead of @fadds), which is
 // why it needs its own Ftype tag, not a variant of reduce_fadds.
-const Ftype = enum(u16) { broadcast, scatter, gather, reduce_fadds, reduce_or };
+// reduce_select_any: "keep mine if valid, else take incoming" reduce, added
+// for bool_diag_spmv's on-device parent resolution work -- unlike
+// reduce_fadds/reduce_or, there is no fused ALU op for this (no @max16/
+// @select16/@cmp16 builtin exists -- confirmed by direct compiler probing),
+// so its per-hop combine is ordinary branching CSL compute, not a single
+// fused async instruction. See reduce_select_any()/transfer_data_reduce_select_any()
+// below.
+const Ftype = enum(u16) { broadcast, scatter, gather, reduce_fadds, reduce_or, reduce_select_any };
 const Network_Config = struct {
   root: u16,
   count: u16,
-  type: Ftype
+  type: Ftype,
+  // Only meaningful for reduce_select_any -- the sentinel value marking
+  // "no candidate" in send_buf/recv_buf. Unused (always 0) by every other
+  // op; CSL struct literals have no field-default syntax (confirmed by
+  // direct compiler probing), so every Network_Config literal below must
+  // set this explicitly even when irrelevant.
+  sentinel: u32
 };
 
 // This array is used as a placeholder value for `mem1d_dsd`s. DSDs require
@@ -136,7 +149,8 @@ const FSM_State = struct {
 var cur_network_cfg = Network_Config {
   .root = 0,
   .count = 0,
-  .type = Ftype.broadcast
+  .type = Ftype.broadcast,
+  .sentinel = 0
 };
 
 
@@ -211,7 +225,8 @@ fn broadcast(root: u16, buf: [*]u32, count: u16, callback: local_task_id) void {
   cur_network_cfg = Network_Config {
     .root = root,
     .count = count,
-    .type = Ftype.broadcast
+    .type = Ftype.broadcast,
+    .sentinel = 0
   };
   // Initialize the FSM state to store `buf` and `callback`
   fsm_state = FSM_State {
@@ -239,7 +254,8 @@ fn scatter(root: u16, send_buf: [*]u32, recv_buf: [*]u32, count: u16, callback: 
   cur_network_cfg = Network_Config {
     .root = root,
     .count = count,
-    .type = Ftype.scatter
+    .type = Ftype.scatter,
+    .sentinel = 0
   };
   // Initialize the FSM state to store `send_buf`, `recv_buf`, and `callback`
   fsm_state = FSM_State {
@@ -267,7 +283,8 @@ fn gather(root: u16, send_buf: [*]u32, recv_buf: [*]u32, count: u16, callback: l
   cur_network_cfg = Network_Config {
     .root = root,
     .count = count,
-    .type = Ftype.gather
+    .type = Ftype.gather,
+    .sentinel = 0
   };
   // Initialize the FSM state to store `send_buf`, `recv_buf`, and `callback`
   fsm_state = FSM_State {
@@ -296,7 +313,8 @@ fn reduce_fadds(root: u16, send_buf: [*]f32, recv_buf: [*]f32, count: u16, callb
   cur_network_cfg = Network_Config {
     .root = root,
     .count = count,
-    .type = Ftype.reduce_fadds
+    .type = Ftype.reduce_fadds,
+    .sentinel = 0
   };
   // Initialize the FSM state to store `send_buf`, `recv_buf`, and `callback`
   fsm_state = FSM_State {
@@ -329,7 +347,8 @@ fn reduce_or(root: u16, send_buf: [*]u32, recv_buf: [*]u32, count: u16, callback
   cur_network_cfg = Network_Config {
     .root = root,
     .count = count,
-    .type = Ftype.reduce_or
+    .type = Ftype.reduce_or,
+    .sentinel = 0
   };
   // send_buf/recv_buf are already u32 -- no @ptrcast needed (unlike
   // reduce_fadds, which takes f32 and casts at this same boundary).
@@ -345,6 +364,70 @@ fn reduce_or(root: u16, send_buf: [*]u32, recv_buf: [*]u32, count: u16, callback
   // reconfigure the routing and switch on C0 and C1, then start the FSM --
   // configure_reduce_network() is pure routing/color config, no arithmetic
   // dependence, reused unchanged from reduce_fadds.
+  configure_reduce_network(DATA_COLOR_0);
+  configure_reduce_network(DATA_COLOR_1);
+  start_data_transfer();
+}
+
+// "Keep mine if valid, else take incoming" combine -- the correctness
+// property that distinguishes this from reduce_or: the result is
+// non-sentinel iff AT LEAST ONE input was non-sentinel, and whenever
+// non-sentinel it is ALWAYS exactly one of the genuinely-supplied values,
+// never a corrupted bitwise mix the way OR(3,5)=7 would be. Ordinary CSL
+// compute, not a fused fabric-transit ALU op (no @max16/@select16/@cmp16
+// builtin exists -- confirmed by direct compiler probing), so dst/incoming/
+// mine are plain [*]u32 slices, not DSDs -- this never touches the fabric
+// itself, only already-landed local memory.
+fn select_merge_u32(dst: [*]u32, incoming: [*]u32, mine: [*]u32, count: u16, sentinel: u32) void {
+  var i: u16 = 0;
+  while (i < count) : (i += 1) {
+    dst[i] = if (incoming[i] != sentinel) incoming[i] else mine[i];
+  }
+}
+
+// Select-any reduce: like reduce_or, but for values where a genuine
+// per-position pick (not a bitwise combine) is required -- see
+// select_merge_u32's own comment for why reduce_or's fused @or16 approach
+// silently corrupts this case. `sentinel` marks "no candidate" in
+// send_buf/recv_buf. Only 2 buffers needed, same as reduce_or/reduce_fadds
+// -- NOT 3, despite each hop here being a real receive-then-branch-then-
+// forward sequence instead of one fused async op. The trick (see
+// transfer_data_reduce_select_any()'s own comment): a middle root merges
+// its own value into recv_buf IMMEDIATELY after its first incoming side
+// lands, rather than saving that merge for last -- which frees send_buf's
+// memory (its value has already been consumed) to reuse AS the landing
+// zone for the second incoming side, instead of needing a dedicated third
+// buffer. Every non-root PE's recv_buf is otherwise entirely unused (only
+// the root's is ever read by the caller), so it doubles as that PE's own
+// landing zone too. send_buf/recv_buf must not alias each other (same
+// non-aliasing requirement bool_diag_spmv's own y_bitmap/y_bitmap_reduced
+// already documents for reduce_or's send/recv pair).
+fn reduce_select_any(root: u16, send_buf: [*]u32, recv_buf: [*]u32,
+                      sentinel: u32, count: u16, callback: local_task_id) void {
+
+  // WARNING: block LOCK in the beginning and only
+  // unblock LOCK when the operation finishes
+  @block(C_LOCK);
+
+  @assert(lib_initialized);
+  cur_network_cfg = Network_Config {
+    .root = root,
+    .count = count,
+    .type = Ftype.reduce_select_any,
+    .sentinel = sentinel
+  };
+  fsm_state = FSM_State {
+    .send_buf = send_buf,
+    .recv_buf = recv_buf,
+    .state = StateEnum.Configure_network,
+    .callback = callback,
+    .counter = 0
+  };
+  // all ops must clear filter and switch first
+  clear_filter_and_switch();
+  // reconfigure the routing and switch on C0 and C1, then start the FSM --
+  // configure_reduce_network() is pure routing/color config, no arithmetic
+  // dependence, reused unchanged from reduce_fadds/reduce_or.
   configure_reduce_network(DATA_COLOR_0);
   configure_reduce_network(DATA_COLOR_1);
   start_data_transfer();
@@ -372,6 +455,11 @@ fn initiate_teardowns() void {
     Ftype.reduce_or => {
       // same teardown as reduce_fadds -- pure control-wavelet/color
       // bookkeeping, no arithmetic dependence.
+      teardown_reduce_network();
+    },
+    Ftype.reduce_select_any => {
+      // same teardown as reduce_fadds/reduce_or -- pure control-wavelet/
+      // color bookkeeping, no dependence on the per-hop combine mechanics.
       teardown_reduce_network();
     }
   }
@@ -1390,6 +1478,126 @@ fn transfer_data_reduce_or() void {
   }
 }
 
+// Select-any counterpart of transfer_data_reduce()/transfer_data_reduce_or()
+// -- same root/non-root, extreme-PE/middle-PE branching and alternating-
+// color routing, but NO fused ALU combine exists for this op (see
+// select_merge_u32's own comment), so every hop that would be one fused
+// async instruction in reduce_fadds/reduce_or here becomes an explicit
+// receive (plain @mov32, reusing the existing generic fabin_to_mem/
+// mem_to_fabout helpers unchanged) followed by an ordinary synchronous
+// select_merge_u32() compute pass, then a plain forward.
+//
+// Only 2 buffers (send_buf/recv_buf), not 3 -- see reduce_select_any's own
+// comment for the in-place trick: a middle root merges its OWN value into
+// recv_buf right after its first incoming side lands (moved earlier than
+// you'd naively expect -- reduce_fadds/reduce_or do their "own copy" merge
+// LAST, since their fused op lets them do it in one shot regardless of
+// order). Doing it early means send_buf's value has already been consumed
+// by the time the second side needs somewhere to land, so send_buf's own
+// memory can BE that landing zone -- no separate scratch buffer needed.
+// Same idea for non-root middle PEs: their own recv_buf is never read by
+// anyone (only the root's matters to the caller), so it doubles as their
+// landing zone too, merged with send_buf in place before forwarding.
+fn transfer_data_reduce_select_any() void {
+
+  const count = cur_network_cfg.count;
+  const root = cur_network_cfg.root;
+  const sentinel = cur_network_cfg.sentinel;
+
+  reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, count);
+  reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, count);
+  reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, count);
+  reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, count);
+  mem = @set_dsd_length(mem, count);
+
+  if (pe_id == root and fsm_state.counter == 0) {
+    // Root, first pass: ingest one side raw into recv_buf (same "ingest
+    // pos first" idiom reduce_fadds/reduce_or use, per
+    // configure_reduce_network()'s own comment about WSE3 not supporting
+    // 2 FABIN source operands).
+    mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
+    switch (pe_id) {
+      0 => {
+        fabin_to_mem(mem, reduce_pos_fabin);
+      },
+      (NUM_PES - 1) => {
+        fabin_to_mem(mem, reduce_neg_fabin);
+      },
+      else => {
+        fabin_to_mem(mem, reduce_pos_fabin);
+      }
+    }
+    fsm_state.counter += 1;
+
+  } else if (pe_id == root and fsm_state.counter == 1) {
+    // Root, second pass: merge OWN value into recv_buf NOW (not saved for
+    // last) -- this consumes send_buf's value, freeing its memory to
+    // reuse as the landing zone for a middle root's second side.
+    select_merge_u32(fsm_state.recv_buf, fsm_state.recv_buf, fsm_state.send_buf, count, sentinel);
+    switch (pe_id) {
+      0 => {
+        // Extreme root: no second side exists -- done.
+        fsm_state.state = StateEnum.Callback;
+        @activate(ACTIVATE_FSM_TASK_ID);
+      },
+      (NUM_PES - 1) => {
+        fsm_state.state = StateEnum.Callback;
+        @activate(ACTIVATE_FSM_TASK_ID);
+      },
+      else => {
+        // Middle root: ingest side B directly into send_buf's now-free
+        // memory (in place -- no dedicated scratch buffer).
+        mem = @set_dsd_base_addr(mem, fsm_state.send_buf);
+        fabin_to_mem(mem, reduce_neg_fabin);
+        fsm_state.counter += 1;
+      }
+    }
+
+  } else if (pe_id == root) {
+    // Root, counter == 2 (middle root only): side B has landed in
+    // send_buf's repurposed memory -- merge it into recv_buf and finish.
+    select_merge_u32(fsm_state.recv_buf, fsm_state.send_buf, fsm_state.recv_buf, count, sentinel);
+    fsm_state.state = StateEnum.Callback;
+    @activate(ACTIVATE_FSM_TASK_ID);
+
+  } else if (pe_id == 0) {
+    // Extreme non-root: nothing arrives from "before" us -- just forward
+    // our own copy toward root. send_buf untouched, no merge needed.
+    mem = @set_dsd_base_addr(mem, fsm_state.send_buf);
+    mem_to_fabout(reduce_pos_fabout, mem);
+    fsm_state.state = StateEnum.Callback;
+
+  } else if (pe_id == NUM_PES - 1) {
+    mem = @set_dsd_base_addr(mem, fsm_state.send_buf);
+    mem_to_fabout(reduce_neg_fabout, mem);
+    fsm_state.state = StateEnum.Callback;
+
+  } else if (fsm_state.counter == 0) {
+    // Middle, non-root, first pass: ingest whatever's accumulated so far
+    // directly into recv_buf -- otherwise-unused memory on this PE, since
+    // only the root's recv_buf is ever read by the caller.
+    mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
+    if (pe_id < root) {
+      fabin_to_mem(mem, reduce_neg_fabin);
+    } else {
+      fabin_to_mem(mem, reduce_pos_fabin);
+    }
+    fsm_state.counter += 1;
+
+  } else {
+    // Middle, non-root, second pass: merge with our own copy IN PLACE in
+    // recv_buf, forward the result toward root.
+    select_merge_u32(fsm_state.recv_buf, fsm_state.recv_buf, fsm_state.send_buf, count, sentinel);
+    mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
+    if (pe_id < root) {
+      mem_to_fabout(reduce_pos_fabout, mem);
+    } else {
+      mem_to_fabout(reduce_neg_fabout, mem);
+    }
+    fsm_state.state = StateEnum.Callback;
+  }
+}
+
 // Function that dispatches appropriate type of data-transfer function depending
 // on the type of collective communication primitive being used
 fn transfer_data() void {
@@ -1407,6 +1615,12 @@ fn transfer_data() void {
       // named explicitly rather than folded into the else below --
       // two reduce variants silently sharing one else branch is a footgun.
       transfer_data_reduce_or();
+    },
+    Ftype.reduce_select_any => {
+      // named explicitly for the same reason reduce_or is -- three reduce
+      // variants silently sharing one else branch would be an even bigger
+      // footgun.
+      transfer_data_reduce_select_any();
     },
     else => {
       transfer_data_reduce();
@@ -1466,8 +1680,12 @@ comptime {
 var num_tds: u16 = 0;
 
 fn teardown_handler_0() void {
-  if (cur_network_cfg.type == Ftype.reduce_fadds or cur_network_cfg.type == Ftype.reduce_or) {
-    // both reduce ops use C0 and C1
+  if (cur_network_cfg.type == Ftype.reduce_fadds or cur_network_cfg.type == Ftype.reduce_or
+      or cur_network_cfg.type == Ftype.reduce_select_any) {
+    // all three reduce ops use C0 and C1 -- NOT exhaustiveness-checked
+    // (plain booleans, unlike initiate_teardowns()'s switch), so a missed
+    // case here is a SILENT C_LOCK-never-unblocks hang, not a compile
+    // error. Must stay in sync with every Ftype.reduce_* addition by hand.
     num_tds += 1;
     if (num_tds == 2){ // receive TD from C0 and C1
        num_tds = 0; // reset num_tds
@@ -1482,8 +1700,10 @@ fn teardown_handler_0() void {
 }
 
 fn teardown_handler_1() void {
-  // only reduce ops use C0 and C1
-  @assert(cur_network_cfg.type == Ftype.reduce_fadds or cur_network_cfg.type == Ftype.reduce_or);
+  // only reduce ops use C0 and C1 -- see teardown_handler_0's comment on
+  // why this must be kept in sync by hand with every Ftype.reduce_* addition.
+  @assert(cur_network_cfg.type == Ftype.reduce_fadds or cur_network_cfg.type == Ftype.reduce_or
+          or cur_network_cfg.type == Ftype.reduce_select_any);
   num_tds += 1;
   if (num_tds == 2){ // receive TD from C0 and C1
     num_tds = 0; // reset num_tds

@@ -352,6 +352,10 @@ def main():
       sym_direction_history = runner.get_id("direction_history")
       sym_transpose_tic_buffer = runner.get_id("transpose_tic_buffer")
       sym_transpose_toc_buffer = runner.get_id("transpose_toc_buffer")
+      sym_parent_resolve_tic_buffer = runner.get_id("parent_resolve_tic_buffer")
+      sym_parent_resolve_toc_buffer = runner.get_id("parent_resolve_toc_buffer")
+      sym_round_trip_start_buffer = runner.get_id("round_trip_start_buffer")
+      sym_round_trip_done_buffer = runner.get_id("round_trip_done_buffer")
 
     # load()/run() are called by SdkRuntime's own __enter__ in appliance mode.
 
@@ -418,9 +422,15 @@ def main():
       print("timing d2h readback (parent_local_buf -- the real BFS output)...")
       runner.launch("f_tic", nonblock=True)
 
-    parent_local_buf_1d = np.zeros(height * width * blk, np.uint32)
-    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+    # Phase B of the on-device parent resolution plan: bool_pe.csl already
+    # resolved each row's P per-PE candidates down to a single winner at
+    # PE-column 0, so only that one narrow column needs to leave the
+    # device -- the fix for the real d2h gRPC ~2GiB message-size ceiling
+    # this exact appliance path hit at RMAT s20 (see project memory).
+    # width=1 here, not width -- do not widen this back out.
+    parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
+    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, 1, height, blk,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
     d2h_cycles = None
@@ -476,13 +486,25 @@ def main():
       transpose_cycles = read_tic_toc_delta_appliance(
           runner, sym_transpose_tic_buffer, sym_transpose_toc_buffer, height, width)
 
+      # mpi_x.reduce_select_any()'s one-time end-of-run cost (Phase B of the
+      # on-device parent resolution plan) -- always fires once for
+      # is_iterative runs, unlike transpose_cycles' conditional switch.
+      parent_resolve_cycles = read_tic_toc_delta_appliance(
+          runner, sym_parent_resolve_tic_buffer, sym_parent_resolve_toc_buffer, height, width)
+
+      # Always-correct round-trip span, independent of max_rounds/ts_buf
+      # truncation -- see round_trip_start_buffer/round_trip_done_buffer's
+      # own declaration comment in bool_pe.csl.
+      round_trip_cycles = read_tic_toc_delta_appliance(
+          runner, sym_round_trip_start_buffer, sym_round_trip_done_buffer, height, width)
+
     # stop() is called by SdkRuntime's own __exit__ in appliance mode.
 
   end = time.time()
   print(f"*** Run done in {end-start}s")
 
   device_parent = extract_parent_result(
-      n, blk, P, np.reshape(parent_local_buf_1d, (height, width, blk), order="F"))
+      n, blk, P, np.reshape(parent_local_buf_1d, (height, 1, blk), order="F"))
   device_parent[source] = source
   device_visited = derive_visited_from_parent(n, device_parent, source)
 
@@ -550,7 +572,7 @@ def main():
     }
 
     for name, cycles in (("h2d_matrix", h2d_matrix_cycles), ("h2d_seed", h2d_seed_cycles),
-                         ("d2h", d2h_cycles)):
+                         ("d2h", d2h_cycles), ("parent_resolve", parent_resolve_cycles)):
       row[f"{name}_min_cycles"] = int(cycles.min())
       row[f"{name}_max_cycles"] = int(cycles.max())
       row[f"{name}_avg_cycles"] = f"{cycles.mean():.1f}"
@@ -558,7 +580,7 @@ def main():
             f"avg={cycles.mean():.1f}")
 
     row_cols, device_time_cycles, profiled_rounds = decode_phase_row(
-        ts_hwl_u32, height, width, max_rounds, rounds_completed)
+        ts_hwl_u32, height, width, max_rounds, rounds_completed, round_trip_cycles)
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
     row.update(row_cols)
 
@@ -613,8 +635,9 @@ def main():
       })
       print(f"saved per-PE timing grid to {pe_timing_out}")
 
-    device_time_cycles_with_transpose = device_time_cycles + int(transpose_cycles.max())
-    search_time_cycles = (int(h2d_seed_cycles.max()) + device_time_cycles_with_transpose
+    device_time_cycles_with_extras = (device_time_cycles + int(transpose_cycles.max())
+                                       + int(parent_resolve_cycles.max()))
+    search_time_cycles = (int(h2d_seed_cycles.max()) + device_time_cycles_with_extras
                            + int(d2h_cycles.max()))
     row["search_time_cycles"] = search_time_cycles
     print(f"[[ search_time_cycles (h2d_seed + device rounds [incl. transpose] + d2h parent "
@@ -637,9 +660,9 @@ def main():
           + ("" if is_symmetric else "  -- directed graph: not a Graph500-spec-comparable "
                                       "GTEPS, see m_convention"))
 
-    row["search_time_cycles_no_transfer"] = device_time_cycles_with_transpose
+    row["search_time_cycles_no_transfer"] = device_time_cycles_with_extras
     _, _, search_time_seconds_no_transfer, gteps_no_transfer = compute_m_and_gteps(
-        coo, device_visited, is_symmetric, device_time_cycles_with_transpose)
+        coo, device_visited, is_symmetric, device_time_cycles_with_extras)
     row["gteps_no_transfer"] = gteps_no_transfer
     print(f"[[ GTEPS w/o h2d_seed/d2h = {m} edges ({m_convention}) / "
           f"{search_time_seconds_no_transfer * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "

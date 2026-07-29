@@ -4,10 +4,15 @@
   standalone "h2d" bars (h2d_matrix, h2d_seed -- see bfs_timing.py's
   H2D_PARTS / GRAPH500_BENCHMARK.md for the Graph500-motivated split between
   the one-time matrix-structure upload and the per-search source-seed
-  upload) before round 0, and a standalone "d2h" bar (visited_buf +
-  parent_local_buf readback -- the actual BFS output, not run_bfs.py's own
-  rounds_completed/ts_buf instrumentation reads -- after the last round) --
-  the one-shot host<->device transfers that aren't part of any round.
+  upload) before round 0, and two standalone bars after the last round:
+  "resolve" (mpi_x.reduce_select_any()'s one-time on-device parent
+  resolution, Phase B of the on-device parent resolution plan -- see
+  bool_pe.csl's term_col_bcast_done()) then "d2h" (parent_local_buf
+  readback -- the actual BFS output, not run_bfs.py's own
+  rounds_completed/ts_buf instrumentation reads), in that chronological
+  order -- the one-shot host<->device transfers (plus the one-shot
+  on-device reduce immediately preceding them) that aren't part of any
+  round.
 
   Round bar height = bfs_timing.compute_round_summary's round_duration_cycles
   (straggler-PE span from that round's TS_VBCAST_ISSUE to its
@@ -109,6 +114,20 @@ ROUND_SEGMENT_LABELS = {
 # distinction (see GRAPH500_BENCHMARK.md).
 H2D_BASE_HEX = "#e87ba4"  # magenta
 D2H_COLOR = "#eb6834"  # orange
+
+# mpi_x.reduce_select_any()'s one-time end-of-run parent-resolution cost
+# (Phase B of the on-device parent resolution plan) -- also a one-shot
+# transfer-adjacent cost, not a per-round phase (it runs in
+# term_col_bcast_done(), strictly after the last round and strictly before
+# the host's own d2h read begins -- see run_bfs.py's own parent_resolve_cycles
+# readback comment), so it's drawn in the same ax_d2h panel as d2h, sharing
+# its y-scale, immediately to d2h's left in chronological order. Blue --
+# palette.md's slot 1, the lowest-index unused slot in the validated
+# 8-color categorical order (this file had already used slots 2/4/5/7/8;
+# blue+orange (slots 1+2) is one of the palette's own documented passing
+# ADJACENT pairs, the exact adjacency this panel needs since the two bars
+# sit right next to each other).
+PARENT_RESOLVE_COLOR = "#2a78d6"
 
 
 def _hex_to_rgb(h):
@@ -239,9 +258,16 @@ def plot_timing_row(row, out_path):
   channels = row["channels"]
 
   round_duration = parse_cycle_list(row["round_duration_cycles"]).astype(float)
-  assert len(round_duration) == rounds_completed, (
-      f"round_duration_cycles has {len(round_duration)} entries, expected "
-      f"rounds_completed={rounds_completed}")
+  # profiled_rounds (NOT rounds_completed) is authoritative for every
+  # per-round array's length below: bool_pe.csl's ts_buf (and thus every
+  # per-round phase timestamp) only has slots for max_rounds rounds --
+  # round_duration_cycles/local_compute_*_cycles/etc. are silently
+  # TRUNCATED to profiled_rounds = min(rounds_completed, max_rounds) once a
+  # BFS runs deeper than max_rounds (see decode_phase_row's own WARNING,
+  # bfs_timing.py) -- asserting against rounds_completed here would reject
+  # every such (deliberately truncated, still-correct-for-search_time_cycles)
+  # row instead of just plotting the rounds actually profiled.
+  profiled_rounds = len(round_duration)
 
   local_compute = parse_cycle_list(row["local_compute_max_cycles"]).astype(float)
   local_compute_min = parse_cycle_list(row["local_compute_min_cycles"]).astype(float)
@@ -259,9 +285,9 @@ def plot_timing_row(row, out_path):
   compute_split_stats = {}
   for part in COMPUTE_SPLIT_PARTS:
     part_max = parse_cycle_list(row[f"{part}_max_cycles"]).astype(float)
-    assert len(part_max) == rounds_completed, (
+    assert len(part_max) == profiled_rounds, (
         f"{part}_max_cycles has {len(part_max)} entries, expected "
-        f"rounds_completed={rounds_completed}")
+        f"profiled_rounds={profiled_rounds}")
     compute_split_stats[part] = {
         "max": part_max,
         "min": parse_cycle_list(row[f"{part}_min_cycles"]).astype(float),
@@ -271,8 +297,10 @@ def plot_timing_row(row, out_path):
   h2d_min = {p: int(row[f"{p}_min_cycles"]) for p in H2D_PARTS}
   h2d_max = {p: int(row[f"{p}_max_cycles"]) for p in H2D_PARTS}
   d2h_min, d2h_max = int(row["d2h_min_cycles"]), int(row["d2h_max_cycles"])
+  parent_resolve_min = int(row["parent_resolve_min_cycles"])
+  parent_resolve_max = int(row["parent_resolve_max_cycles"])
 
-  rounds = np.arange(rounds_completed)
+  rounds = np.arange(profiled_rounds)
 
   # h2d/d2h (one-shot transfers, tens of thousands of cycles) and the
   # per-round breakdown (hundreds to a couple thousand cycles) are two
@@ -291,9 +319,11 @@ def plot_timing_row(row, out_path):
   # value's size.
   per_bar_w_in = 1.3
   h2d_w_in = per_bar_w_in * len(H2D_PARTS)
-  d2h_w_in = per_bar_w_in * 1.3  # a little extra breathing room for one bar alone
-  round_w_in = max(0.95 * rounds_completed, 3.0)
-  compute_split_w_in = max(1.4 * rounds_completed, 3.6)
+  # parent_resolve + d2h now share this panel (2 bars, not 1) -- same
+  # per-bar width as h2d's panel, plus a little breathing room.
+  d2h_w_in = per_bar_w_in * 2 + 0.3
+  round_w_in = max(0.95 * profiled_rounds, 3.0)
+  compute_split_w_in = max(1.4 * profiled_rounds, 3.6)
   fig, (ax_h2d, ax_rounds, ax_d2h, ax_compute) = plt.subplots(
       1, 4, figsize=(h2d_w_in + round_w_in + d2h_w_in + compute_split_w_in, 6.5),
       gridspec_kw={"width_ratios": [h2d_w_in, round_w_in, d2h_w_in, compute_split_w_in],
@@ -316,18 +346,29 @@ def plot_timing_row(row, out_path):
 
   for i, part in enumerate(H2D_PARTS):
     add_solo_bar(ax_h2d, i, h2d_max[part], h2d_min[part], H2D_COLORS[part], part)
-  add_solo_bar(ax_d2h, 0, d2h_max, d2h_min, D2H_COLOR, "d2h")
-  transfer_ylim = 1.15 * max(*h2d_max.values(), d2h_max)
+  # parent_resolve drawn first (xpos=0), d2h second (xpos=1) -- matches
+  # their actual chronological order (the on-device reduce finishes before
+  # the host's own d2h read begins, see run_bfs.py's parent_resolve_cycles
+  # readback comment), same left-to-right-is-chronological convention the
+  # h2d panel's matrix->seed ordering already uses.
+  add_solo_bar(ax_d2h, 0, parent_resolve_max, parent_resolve_min, PARENT_RESOLVE_COLOR,
+               "parent_resolve")
+  add_solo_bar(ax_d2h, 1, d2h_max, d2h_min, D2H_COLOR, "d2h")
+  transfer_ylim = 1.15 * max(*h2d_max.values(), d2h_max, parent_resolve_max)
   ax_h2d.set_ylim(0, transfer_ylim)
   ax_d2h.set_ylim(0, transfer_ylim)
   ax_h2d.set_xlim(-0.8, len(H2D_PARTS) - 0.2)
-  ax_d2h.set_xlim(-0.9, 0.9)
+  ax_d2h.set_xlim(-0.8, 1.8)
   ax_h2d.set_xticks(range(len(H2D_PARTS)))
   ax_h2d.set_xticklabels(["matrix", "seed"])
-  ax_d2h.set_xticks([0])
-  ax_d2h.set_xticklabels(["d2h"])
+  ax_d2h.set_xticks([0, 1])
+  # short tick labels (matches "matrix"/"seed"/"d2h"'s own single-word
+  # convention -- "parent_resolve" would be wide enough to collide with
+  # the "d2h" tick right next to it at this panel width); the legend still
+  # carries the full "parent_resolve" name via add_solo_bar's own label=.
+  ax_d2h.set_xticklabels(["resolve", "d2h"])
 
-  bottom = np.zeros(rounds_completed)
+  bottom = np.zeros(profiled_rounds)
   transpose_heights = compute_split_stats["transpose"]["max"]
   segment_values = {
       "local_compute": local_compute,
@@ -423,9 +464,12 @@ def plot_timing_row(row, out_path):
 
   ax_h2d.set_ylabel("cycles", labelpad=8)
   ax_compute.set_ylabel("cycles", labelpad=8)
+  rounds_suffix = (f"{rounds_completed} rounds (only first {profiled_rounds} profiled -- "
+                    f"bump max_rounds for full detail)" if profiled_rounds < rounds_completed
+                    else f"{rounds_completed} rounds")
   fig.suptitle(f"Per-round phase timing -- {matrix}, {pe_grid} grid, source={source}, "
                f"channels={channels}\n"
-               f"n={row['n']}, nnz={row['nnz']}, {rounds_completed} rounds "
+               f"n={row['n']}, nnz={row['nnz']}, {rounds_suffix} "
                "(bar height = round_duration_cycles, + transpose_structure() on the switch round)",
                fontsize=10)
   for ax in (ax_h2d, ax_rounds, ax_d2h, ax_compute):

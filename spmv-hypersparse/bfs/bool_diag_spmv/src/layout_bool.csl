@@ -81,7 +81,7 @@ layout {
     @export_name("y_bitmap_reduced", [*]u32, true);
     @export_name("visited_bitmap", [*]u32, true);
     @export_name("rounds_completed", [*]u16, true);
-    @export_name("parent_local_buf", [*]u16, true);
+    @export_name("parent_local_buf", [*]u32, true);
 
     @export_name("mat_rows_buf", [*]u16, true);
     @export_name("mat_col_idx_buf", [*]u16, true);
@@ -101,6 +101,10 @@ layout {
     @export_name("tsc_end_buffer", [*]u16, true);
     @export_name("transpose_tic_buffer", [*]u16, true);
     @export_name("transpose_toc_buffer", [*]u16, true);
+    @export_name("round_trip_start_buffer", [*]u16, true);
+    @export_name("round_trip_done_buffer", [*]u16, true);
+    @export_name("parent_resolve_tic_buffer", [*]u16, true);
+    @export_name("parent_resolve_toc_buffer", [*]u16, true);
     @export_name("ts_buf", [*]u16, true);
     @export_name("nf_history", [*]u32, true);
     @export_name("direction_history", [*]u16, true);

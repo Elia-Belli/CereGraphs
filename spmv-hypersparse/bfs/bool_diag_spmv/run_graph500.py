@@ -266,6 +266,8 @@ def main():
   sym_ts_buf = runner.get_id("ts_buf")
   sym_tsc_start_buffer = runner.get_id("tsc_start_buffer")
   sym_tsc_end_buffer = runner.get_id("tsc_end_buffer")
+  sym_round_trip_start_buffer = runner.get_id("round_trip_start_buffer")
+  sym_round_trip_done_buffer = runner.get_id("round_trip_done_buffer")
 
   runner.load()
   runner.run()
@@ -346,9 +348,13 @@ def main():
     # transfer needs to be timed as the search's "output written to memory"
     # cost, and it's folded into search_time_cycles below.
     runner.launch("f_tic", nonblock=True)
-    parent_local_buf_1d = np.zeros(height * width * blk, np.uint32)
-    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+    # Phase B of the on-device parent resolution plan: bool_pe.csl already
+    # resolved each row's P per-PE candidates down to a single winner at
+    # PE-column 0, so only that one narrow column needs to leave the
+    # device. width=1 here, not width.
+    parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
+    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, 1, height, blk,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     runner.launch("f_toc", nonblock=False)  # blocks -> the d2h read above is done
     d2h_cycles = read_tic_toc_delta(runner, sym_tsc_start_buffer, sym_tsc_end_buffer,
@@ -366,8 +372,14 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     ts_hwl_u32 = np.reshape(ts_buf_1d, (height, width, ts_len), order="F")
 
+    # Always-correct round-trip span, independent of max_rounds/ts_buf
+    # truncation -- see round_trip_start_buffer/round_trip_done_buffer's
+    # own declaration comment in bool_pe.csl.
+    round_trip_cycles = read_tic_toc_delta(runner, sym_round_trip_start_buffer,
+                                            sym_round_trip_done_buffer, height, width)
+
     device_parent = extract_parent_result(
-        n, blk, P, np.reshape(parent_local_buf_1d, (height, width, blk), order="F"))
+        n, blk, P, np.reshape(parent_local_buf_1d, (height, 1, blk), order="F"))
     device_parent[source] = source
     device_visited = derive_visited_from_parent(n, device_parent, source)
 
@@ -387,7 +399,7 @@ def main():
               f"visited mismatches={n_mismatch}, invalid parents={len(bad_device)} ]]")
 
     row_cols, device_time_cycles, profiled_rounds = decode_phase_row(
-        ts_hwl_u32, height, width, max_rounds, rounds_completed, verbose=False)
+        ts_hwl_u32, height, width, max_rounds, rounds_completed, round_trip_cycles, verbose=False)
     search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles + int(d2h_cycles.max())
     m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(
         A_coo_static, device_visited, is_symmetric, search_time_cycles)

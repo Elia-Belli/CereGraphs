@@ -71,7 +71,7 @@ while true; do
       fi
     fi
     log "balancing $raw -> $matrix"
-    if ! timeout 3600 ./util/analyze --matrix "$raw" --rand 0 --fabx "$GRID" --faby "$GRID" --omatrix "$matrix" 2>&1 | tee -a "$LOG"; then
+    if ! timeout 3600 ./util/analyze --matrix "$raw" --symmetric --rand 0 --fabx "$GRID" --faby "$GRID" --omatrix "$matrix" 2>&1 | tee -a "$LOG"; then
       log "STOP: util/analyze failed at s${scale} -- matrix doesn't fit/balance on ${GRID}x${GRID}."
       exit 1
     fi

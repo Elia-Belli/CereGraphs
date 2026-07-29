@@ -228,7 +228,7 @@ void iterative_load_balance(
     idx_t nrows, idx_t ncols, int fabx, int faby,
     std::vector<std::pair<idx_t, int>> &nzrows,
     std::vector<std::pair<idx_t, int>> &nzcols, std::vector<idx_t> &iperm_r,
-    std::vector<idx_t> &iperm_c, std::vector<int> &buckets, bool symmetric) {
+    std::vector<idx_t> &iperm_c, std::vector<int> &buckets) {
 
   int bx = std::ceil((float)ncols / ((float)fabx));
   int by = std::ceil((float)nrows / ((float)faby));
@@ -261,9 +261,7 @@ void iterative_load_balance(
   double cur_lb = 0;
   double prev_lb = (double)nnz_total / (npes * (double)nnz_max);
   std::vector<std::tuple<int, int, bool>> rowload(faby);
-  std::vector<std::tuple<int, int, bool>> colload(fabx);
   std::vector<int> rowcnt(faby, 0);
-  std::vector<int> colcnt(fabx, 0);
 
   do {
     {
@@ -345,90 +343,15 @@ void iterative_load_balance(
 #endif
     }
 
-    if (symmetric) {
-      // A symmetric adjacency matrix needs a single permutation shared by
-      // rows and columns (row i and column i must stay the same vertex),
-      // so reuse the row assignment just computed above instead of
-      // optimizing an independent column permutation.
-      newiperm_c = newiperm_r;
-    } else {
-// choose new col mapping
-// auto rowhead = rowptr; // make a copy of rowptr
-#if SANITY_CHECK
-      newiperm_c.assign(ncols, -1);
-#endif
-      colcnt.assign(fabx, 0);
-      buckets.assign(fabx * faby, 0);
-      colload.assign(fabx, std::tuple<int, int, bool>(0, 0, false));
-      //      for each column in order of decreasing nnz in the column, choose a
-      //      processor column so that the heaviest loaded PE is loaded least
-      //      given the current row mapping
-      int minpx = 0;
-
-      for (idx_t i = 0; i < ncols; i++) {
-        auto col = nzcols[i].first;
-// find the processor col on which the heaviest loaded PE is loaded
-// least
-// col should go on minpx;
-#if SANITY_CHECK
-        assert(colcnt[minpx] < bx);
-#endif
-        int newcolidx = minpx * bx + colcnt[minpx];
-        newiperm_c[col] = newcolidx;
-        colcnt[minpx]++;
-        if (minpx * bx + colcnt[minpx] >=
-            std::min(idx_t((minpx + 1) * bx), ncols))
-          std::get<2>(colload[minpx]) = true;
-
-        // update the load matrix
-        for (auto ptr = colptr[col]; ptr < colptr[col + 1]; ptr++) {
-          auto permrow = newiperm_r[rowidx[ptr]];
-          idx_t py = (permrow / by) % faby;
-          buckets[minpx * faby + py]++;
-        }
-
-        // now check the load in the proc col
-        auto maxpy = -1;
-        int maxloady = 0;
-        for (int py = 0; py < faby; py++) {
-          int load = buckets[minpx * faby + maxpy];
-          if (load >= maxloady) {
-            maxloady = load;
-            maxpy = py;
-          }
-        }
-        std::get<0>(colload[minpx]) = maxpy;
-        std::get<1>(colload[minpx]) = maxloady;
-
-        auto it = std::min_element(
-            colload.begin(), colload.end(),
-            [](std::tuple<int, int, bool> &l, std::tuple<int, int, bool> &r) {
-              if (std::get<2>(l)) {
-                return false;
-              } else if (std::get<2>(r)) {
-                return true;
-              } else {
-                return std::get<1>(l) < std::get<1>(r);
-              }
-            });
-        minpx = std::distance(colload.begin(), it);
-#if SANITY_CHECK
-        if (i < ncols - 1)
-          assert(colcnt[minpx] < bx);
-#endif
-      }
-
-#if SANITY_CHECK
-      for (idx_t i = 0; i < ncols; i++) {
-        assert(newiperm_c[i] >= 0);
-      }
-      idx_t tot_buckets = 0;
-      for (auto b : buckets) {
-        tot_buckets += b;
-      }
-      assert(tot_buckets == nnz_total);
-#endif
-    }
+    // A graph's adjacency matrix needs a single permutation shared by rows
+    // and columns (row i and column i must stay the same vertex) so that a
+    // source vertex survives balancing -- reuse the row assignment just
+    // computed above instead of optimizing an independent column
+    // permutation. (There used to be an independent-column-optimization
+    // branch here for callers that didn't need vertex identity preserved;
+    // it was removed since every caller now requires --symmetric or
+    // --shared-perm, which both need this sharing.)
+    newiperm_c = newiperm_r;
 
     distribute_permute(rowptr, colidx, bx, by, fabx, faby, newiperm_r,
                        newiperm_c, buckets);
@@ -484,9 +407,33 @@ int main(int argc, char *argv[]) {
       .help("treat the matrix as a symmetric (undirected graph) adjacency "
             "matrix and force a single shared row/column permutation, so "
             "row i and column i keep referring to the same vertex after "
-            "balancing")
+            "balancing. REFUSES to run if the matrix isn't actually "
+            "structurally symmetric (A == A^T) -- use --shared-perm instead "
+            "for a genuinely directed graph that still needs vertex-identity- "
+            "preserving balancing")
       .default_value(false)
       .implicit_value(true);
+
+  program.add_argument("--shared-perm")
+      .help("like --symmetric's row/column-permutation-sharing behavior "
+            "(needed for --operm to have a single well-defined answer), but "
+            "WITHOUT requiring the input matrix to be structurally "
+            "symmetric -- for a genuinely directed graph (e.g. a web/"
+            "hyperlink graph) that should be balanced as directed, not "
+            "symmetrized, but still needs a coherent vertex identity across "
+            "row/column roles for a canonical BFS source vertex to survive "
+            "balancing. Mutually exclusive with --symmetric (which also "
+            "implies this sharing, plus the structural-symmetry check).")
+      .default_value(false)
+      .implicit_value(true);
+
+  program.add_argument("--operm")
+      .help("write the balancing permutation to this file (one line per "
+            "original vertex id i, containing its balanced-matrix vertex "
+            "id, i.e. line i+1 holds iperm_r[i]) -- lets a caller translate "
+            "a known original-graph vertex (e.g. a canonical BFS source) "
+            "into its corresponding vertex id in the balanced matrix")
+      .default_value(std::string(""));
 
   try {
     program.parse_args(argc, argv);
@@ -503,6 +450,30 @@ int main(int argc, char *argv[]) {
   auto faby = program.get<int>("--faby");
   auto randperm = program.get<int>("--rand");
   auto symmetric = program.get<bool>("--symmetric");
+  auto shared_perm = program.get<bool>("--shared-perm");
+  auto operm = program.get<std::string>("--operm");
+
+  if (symmetric && shared_perm) {
+    std::cerr << "--symmetric and --shared-perm are mutually exclusive "
+                 "(--symmetric already implies --shared-perm's row/column "
+                 "sharing, plus the structural-symmetry check --shared-perm "
+                 "deliberately skips)" << std::endl;
+    std::exit(1);
+  }
+  if (!symmetric && !shared_perm) {
+    std::cerr << "one of --symmetric or --shared-perm is required: "
+                 "balancing always preserves a single shared row/column "
+                 "vertex identity now, so a caller must declare whether the "
+                 "input is a verified structurally-symmetric graph "
+                 "(--symmetric) or a directed graph that still needs a "
+                 "coherent source vertex (--shared-perm)" << std::endl;
+    std::exit(1);
+  }
+  // share_row_col_perm: true whenever row i and column i must keep
+  // referring to the same vertex after balancing -- both --symmetric and
+  // --shared-perm want this (now mandatory), they only differ on whether
+  // the input matrix is required to already be structurally symmetric.
+  bool share_row_col_perm = symmetric || shared_perm;
 
   /* size of the core rectangle must be positive */
   assert(0 < fabx);
@@ -534,17 +505,23 @@ int main(int argc, char *argv[]) {
     remove_duplicates(edges);
   }
 
-  if (symmetric) {
+  if (share_row_col_perm) {
     if (m != n || fabx != faby) {
-      std::cerr << "--symmetric requires a square matrix and a square PE "
-                   "grid (a single shared row/column permutation only "
-                   "makes sense when rows and columns share an index "
+      std::cerr << "--symmetric/--shared-perm require a square matrix and a "
+                   "square PE grid (a single shared row/column permutation "
+                   "only makes sense when rows and columns share an index "
                    "space): got " << m << "x" << n << " matrix, " << fabx
                 << "x" << faby << " grid" << std::endl;
       std::exit(1);
     }
+  }
+  if (symmetric) {
     // verify A == A^T structurally: edge (col,row) must have a matching
-    // (row,col) counterpart, i.e. the edge set is closed under swap.
+    // (row,col) counterpart, i.e. the edge set is closed under swap. Only
+    // required for --symmetric -- --shared-perm deliberately allows a
+    // genuinely directed (non-symmetric) matrix through, since it shares
+    // the row/column permutation for vertex-identity reasons only, not to
+    // claim the graph is undirected.
     std::vector<edge_t> fwd = edges;
     std::vector<edge_t> rev(edges.size());
     for (size_t i = 0; i < edges.size(); i++) {
@@ -555,7 +532,9 @@ int main(int argc, char *argv[]) {
     if (fwd != rev) {
       std::cerr << "--symmetric was requested but " << matrix
                 << " is not structurally symmetric (A != A^T) -- refusing "
-                   "to balance it as an undirected graph" << std::endl;
+                   "to balance it as an undirected graph. If it's genuinely "
+                   "directed and you still want vertex-identity-preserving "
+                   "balancing, use --shared-perm instead." << std::endl;
       std::exit(1);
     }
   }
@@ -661,20 +640,10 @@ int main(int argc, char *argv[]) {
       iperm_r[perm_r[i]] = i;
     }
 
-    if (symmetric) {
-      // keep row and column permutations identical, so this diagnostic
-      // random baseline stays a valid graph relabeling too.
-      iperm_c = iperm_r;
-    } else {
-      // first generate an identity perm vec
-      std::vector<idx_t> perm_c(ncols);
-      std::iota(perm_c.begin(), perm_c.end(), 0);
-      std::random_shuffle(perm_c.begin(), perm_c.end());
-      // now generate the inverse perm
-      for (idx_t i = 0; i < (idx_t)perm_c.size(); i++) {
-        iperm_c[perm_c[i]] = i;
-      }
-    }
+    // keep row and column permutations identical, so this diagnostic
+    // random baseline stays a valid graph relabeling too (balancing always
+    // shares the row/column permutation now).
+    iperm_c = iperm_r;
 
     distribute_permute(rowptr, colidx, bx, by, fabx, faby, iperm_r, iperm_c,
                        buckets);
@@ -694,7 +663,7 @@ int main(int argc, char *argv[]) {
 
   iterative_load_balance(rowptr, colidx, colptr, rowidx, nrows, ncols, fabx,
                          faby, sorted_nzrows, sorted_nzcols, iperm_r, iperm_c,
-                         buckets, symmetric);
+                         buckets);
   max_nnz = *std::max_element(buckets.begin(), buckets.end());
   std::cout << "Permuted Max loaded PE has " << max_nnz << " nz" << std::endl;
 #if SANITY_CHECK
@@ -725,6 +694,23 @@ int main(int argc, char *argv[]) {
     std::cout << "(8) output A(P,Q) to a mtx file " << omatrix << std::endl;
     write_matrix(omatrix, nrows, ncols, nnz, cooRowInd, cooColInd, cooVal,
                  iperm_r, iperm_c);
+  }
+
+  if (operm != "") {
+    std::cout << "(9) output balancing permutation to " << operm << std::endl;
+    std::ofstream permfile;
+    permfile.open(operm, std::ios::out);
+    // --symmetric or --shared-perm guaranteed iperm_c == iperm_r above, so
+    // iperm_r alone fully describes the (single, shared) vertex mapping. One line per
+    // ORIGINAL vertex id (0-based, matching the input SNAP/edge-list
+    // numbering), each line holding that vertex's id in the balanced
+    // matrix written above (also 0-based, unlike write_matrix's own
+    // 1-based MTX output -- this file is meant for direct use as a
+    // --source value, which is 0-based).
+    for (idx_t i = 0; i < (idx_t)iperm_r.size(); i++) {
+      permfile << iperm_r[i] << std::endl;
+    }
+    permfile.close();
   }
 
   if (NULL != cooRowInd) {

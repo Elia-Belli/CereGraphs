@@ -1,0 +1,61 @@
+// Standalone, isolated correctness test for collectives_2d/pe.csl's new
+// reduce_select_any() -- the on-device parent resolution plan's Stage 0
+// (see the plan / GRAPH500_BENCHMARK.md for the overall motivation: the
+// real d2h gRPC message-size ceiling this collective ultimately fixes).
+// No matrix/BFS logic at all: each PE seeds a test buffer (mix of sentinel
+// and real, non-colliding AND colliding rows -- see the driver script),
+// mpi_x.reduce_select_any() resolves each ROW toward a compile-time-chosen
+// root column (mpi_x is the row-wise collectives instance, same convention
+// as bool_pe.csl), and the host checks the root's result against the
+// correctness property (non-sentinel iff some real candidate existed, and
+// always a genuine member of the row's candidate set -- NOT a specific
+// expected value, since which one wins among several valid candidates is
+// deliberately unspecified). Only the x-dimension is instantiated, same as
+// layout_reduce_or_test.csl.
+
+param pcols: u16;
+param prows: u16;
+param count: u16;    // number of u32 words per PE
+param root: u16;     // row-reduce root column index (varied across compiles by the driver)
+param sentinel: u32; // "no candidate" marker
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width = pcols,
+    .height = prows,
+    });
+
+const c2d = @import_module("./collectives_2d/params.csl");
+
+layout {
+    @set_rectangle(pcols, prows);
+
+    var px: u16 = 0;
+    while (px < pcols) : (px += 1) {
+        const memcpy_params = memcpy.get_params(px);
+
+        var py: u16 = 0;
+        while (py < prows) : (py += 1) {
+            // y_colors/y_entrypoints unused (only mpi_x is instantiated) --
+            // see layout_reduce_or_test.csl's own comment for why they're
+            // still required.
+            const c2d_params = c2d.get_params(px, py, .{
+                .x_colors = .{ @get_color(0), @get_color(1) },
+                .x_entrypoints = .{ @get_local_task_id(14), @get_local_task_id(15) },
+                .y_colors = .{ @get_color(4), @get_color(5) },
+                .y_entrypoints = .{ @get_local_task_id(16), @get_local_task_id(17) },
+            });
+            @set_tile_code(px, py, "pe_reduce_select_test.csl", .{
+                .memcpy_params = memcpy_params,
+                .c2d_params = c2d_params,
+                .count = count,
+                .root = root,
+                .sentinel = sentinel,
+            });
+        } // while py
+    } // while px
+
+    @export_name("send_buf", [*]u32, true);
+    @export_name("recv_buf", [*]u32, true);
+
+    @export_name("f_run", fn()void);
+}

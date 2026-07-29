@@ -70,24 +70,27 @@
 //
 // Each PE keeps parent_local_buf, indexed identically to x_bitmap/y_bitmap
 // (dense over its row-block), holding a column it has recorded for each
-// local row -- stored as a LOCAL column index (0..blk-1), not the global
-// vertex id, which keeps this buffer u16-safe at any n (see PARENT_NONE's
-// own comment). The tie-break for multiple local columns hitting the same
-// row in the same discovery round is intentionally NOT the lowest global
-// index -- any candidate gated by visited_bitmap above is already a legal
-// one-hop-closer parent, so there's no correctness reason to prefer the
-// minimum one, and dropping that comparison saves a compare per row-hit
-// (see the parent-tracking pass in compute() below: whichever local column
-// is walked last for a given row wins). Because different PEs in the SAME
-// row cover different column ranges, extract_parent_result() in
-// ../device_io.py reconstructs each candidate's global vertex id
-// (pcol_id*blk + local column, using the pcol_id it already knows from the
-// readback layout) and then still combines each row's P per-PE candidates
+// local row -- stored as the FULL GLOBAL vertex id (pcol_id*blk + local
+// column), computed on-device at write time (Phase A of the on-device
+// parent resolution plan -- previously this stored just the bare local
+// column index, u16-safe at any n, with the global id reconstructed
+// host-side instead; see git history / project memory for that older
+// design if needed). The tie-break for multiple local columns hitting the
+// same row in the same discovery round is intentionally NOT the lowest
+// global index -- any candidate gated by visited_bitmap above is already a
+// legal one-hop-closer parent, so there's no correctness reason to prefer
+// the minimum one, and dropping that comparison saves a compare per
+// row-hit (see the parent-tracking pass in compute() below: whichever
+// local column is walked last for a given row wins). Because different
+// PEs in the SAME row cover different column ranges, extract_parent_result()
+// in ../device_io.py still combines each row's P per-PE candidates
 // host-side after memcpy_d2h (via min(), for lack of any on-device
-// min/select primitive -- <collectives_2d> has no min-reduce) -- this
-// remains correct since the min of several legal predecessors is itself a
-// legal predecessor, even though it's no longer "the true global lowest
-// index" in the old sense.
+// min/select primitive -- <collectives_2d> has no min-reduce, though a
+// select-any reduce is planned as a follow-up Phase B to move this
+// combine on-device and shrink the d2h transfer) -- this remains correct
+// since the min of several legal predecessors is itself a legal
+// predecessor, even though it's no longer "the true global lowest index"
+// in the old sense.
 
 param memcpy_params;
 param c2d_params;
@@ -112,6 +115,15 @@ const term_col_bcast_done_task_id: local_task_id = @get_local_task_id(19);
 // distributes visited_bitmap across each row before compute() runs -- see the
 // module docstring above and visited_bcast_done() below.
 const visited_bcast_done_task_id: local_task_id = @get_local_task_id(20);
+// callback for the one-time, end-of-run parent resolution reduce (Phase B
+// of the on-device parent resolution plan) -- see parent_resolve_done()
+// below. id 21 (the naive next-free-slot guess after 10-20 above) was
+// tried first and rejected by cslc itself at compile time ("task ID '21'
+// bound to more than one task" -- memcpy's own LOCAL_MEMCPYD2H_DATA task,
+// confirming layout_bool.csl's "21-23, 27-30, 33-37ish reserved by
+// memcpy" comment for real, not just in theory). 24 confirmed free by the
+// same real compile-time check.
+const parent_resolve_done_task_id: local_task_id = @get_local_task_id(24);
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 
@@ -125,6 +137,23 @@ const timestamp = @import_module("<time>");
 var tsc_start_buffer = @zeros([timestamp.tsc_size_words]u16);
 var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
 
+// Always-correct round-trip span markers, INDEPENDENT of max_rounds/ts_buf
+// truncation (see record_ts()'s own max_rounds gate a few lines below --
+// ts_buf simply has no slot to write into for any round >= max_rounds).
+// round_trip_start_buffer is captured exactly once, at round 0's own
+// TS_VBCAST_ISSUE (see start_spmv()); round_trip_done_buffer is captured
+// unconditionally on EVERY round's TS_TERM_COL_BCAST_DONE (see
+// term_col_bcast_done()), overwriting the same buffer each time -- so
+// whatever round BFS actually converges on, this naturally ends up holding
+// that TRUE final round's timestamp, never a truncated max_rounds-1 one.
+// Fixes a real bug: total_runtime_cycles/search_time_cycles were silently
+// WRONG (computed from round max_rounds-1's timestamp, not the true last
+// round's) whenever rounds_completed > max_rounds -- see bfs_timing.py's
+// compute_round_summary for the host-side fallback that now uses this
+// pair instead in that case.
+var round_trip_start_buffer = @zeros([timestamp.tsc_size_words]u16);
+var round_trip_done_buffer = @zeros([timestamp.tsc_size_words]u16);
+
 // Brackets transpose_structure()'s one-time cost (see term_col_bcast_done())
 // explicitly, instead of leaving it as an unattributed gap inside
 // total_runtime_cycles -- same raw-timestamp mechanism as record_ts()
@@ -136,6 +165,26 @@ var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
 // too, not just an aggregate cost.
 var transpose_tic_buffer = @zeros([timestamp.tsc_size_words]u16);
 var transpose_toc_buffer = @zeros([timestamp.tsc_size_words]u16);
+
+// Same idea, for the one-time end-of-run mpi_x.reduce_select_any() call
+// (Phase B of the on-device parent resolution plan, see
+// term_col_bcast_done()'s termination branch) -- without this, its cost
+// would be an unattributed gap the same way transpose's was before
+// transpose_tic_buffer/toc_buffer existed: it runs strictly AFTER the last
+// round's own TERM_COL_BCAST_DONE timestamp and BEFORE the host's own
+// f_tic/f_toc d2h bracket even starts (f_spmv_iter's single blocking
+// launch doesn't return to the host until this reduce has also finished),
+// so none of decode_phase_row's per-round windows span it and it would
+// otherwise silently understate search_time_cycles/GTEPS. Unlike
+// transpose, this always fires exactly once per is_iterative run (not
+// conditionally), so tic/toc are captured unconditionally around the
+// reduce_select_any call itself, not around a maybe-skipped branch --
+// tic is captured right before issuing the (async) reduce, toc inside its
+// callback (parent_resolve_done()), so this correctly measures the whole
+// async operation's wall-clock span, not just the issuing call's own
+// (near-instant) return.
+var parent_resolve_tic_buffer = @zeros([timestamp.tsc_size_words]u16);
+var parent_resolve_toc_buffer = @zeros([timestamp.tsc_size_words]u16);
 
 // Per-round, per-phase timing (f_spmv_iter only -- see record_ts() below).
 // One raw hardware timestamp is captured at each of these round-boundary
@@ -457,33 +506,48 @@ var popcnt_scratch = @zeros([2 * BITMAP_WORDS]u16);
 var popcnt_src_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &popcnt_scratch, .extent = 2 * BITMAP_WORDS });
 const popcnt_dst_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &popcnt_scratch, .extent = 2 * BITMAP_WORDS });
 
-// sentinel meaning "no candidate parent seen". Only needs to exceed the max
-// valid LOCAL column index (blk-1), not the max global vertex index --
-// parent_local_buf stores a local column index, not a global vertex id (see
-// its own comment below), so this is independent of n and already safely
-// satisfied by preprocess_bool.py's own blk < 65535 assertion.
-const PARENT_NONE: u16 = 65535;
+// sentinel meaning "no candidate parent seen". Phase A of the u32
+// global-id migration (see the-poster-submission's on-device parent
+// resolution plan): parent_local_buf now stores the FULL global vertex id
+// (pcol_id*blk + local column), not a local column index, so this sentinel
+// must exceed the max real GLOBAL vertex id (n-1), not just blk-1 --
+// widened to u32::MAX accordingly. Safe since n <= P*blk, comfortably under
+// u32 range per preprocess_bool.py's own blk < u16::max assertion.
+const PARENT_NONE: u32 = 4294967295;
 
 // parent_local_buf: this PE's own candidate parent, dense over its
 // row-block like x_bitmap, PERSISTED across rounds (never reset
-// except at a fresh f_spmv_iter call in start_spmv()) -- holds the LOCAL
-// column index (0..blk-1, see compute()) this PE has recorded for each
-// local row, across every round. Deliberately not the global vertex id:
-// every candidate compared/stored for a given PE shares that PE's own
-// pcol_id, so keeping just the local index is equivalent (see compute()'s
-// own comment) while keeping this buffer u16-safe regardless of n. The
-// global vertex id (pcol_id*blk + local column) is reconstructed host-side
-// in device_io.py's extract_parent_result(), which already knows each
-// slice's pcol_id from the readback layout, before combining each row's P
-// per-PE candidates (see the module docstring above for why that combine
-// step is needed at all, and why it's a min rather than a specific pick).
-var parent_local_buf = @zeros([blk]u16);
+// except at a fresh f_spmv_iter call in start_spmv()) -- holds the FULL
+// GLOBAL vertex id (pcol_id*blk + local column) this PE has recorded for
+// each local row, across every round. Widened from a local-column-index-only
+// u16 encoding (Phase A of the on-device parent resolution plan) to a u32
+// global id (Phase A), and now (Phase B) the send_buf for a one-time,
+// end-of-run mpi_x.reduce_select_any() call (see term_col_bcast_done()
+// below) that resolves each row's P per-PE candidates down to a single
+// winner AT PE-COLUMN 0 -- host readback only needs parent_relay_result's
+// column-0 slice afterward, cutting the d2h transfer P-fold versus reading
+// back every column's independent copy (see device_io.py's
+// extract_parent_result(), now much simpler since the per-row combine
+// happens here instead of host-side).
+var parent_local_buf = @zeros([blk]u32);
+// recv_buf for the parent-resolution reduce -- meaningful ONLY at PE-column
+// 0 after f_spmv_iter converges (every other column's copy is a
+// non-root reduce participant, same "only the aggregation point's copy is
+// real" convention y_bitmap_reduced already uses for the diagonal).
+// No third scratch buffer needed -- reduce_select_any's own in-place
+// design (see its comment in collectives_2d/pe.csl) reuses
+// parent_local_buf's memory as the landing zone for a middle root's
+// second incoming side once its original value has already been merged
+// into parent_relay_result, and reuses each non-root PE's own
+// parent_relay_result as its landing zone (otherwise entirely unused on
+// non-root PEs). Only 2 buffers total, matching reduce_or/reduce_fadds.
+var parent_relay_result = @zeros([blk]u32);
 
 var ptr_x_bitmap: [*]u32 = &x_bitmap;
 var ptr_y_bitmap_reduced: [*]u32 = &y_bitmap_reduced;
 var ptr_visited_bitmap: [*]u32 = &visited_bitmap;
 var ptr_rounds_completed: [*]u16 = &rounds_completed;
-var ptr_parent_local_buf: [*]u16 = &parent_local_buf;
+var ptr_parent_relay_result: [*]u32 = &parent_relay_result;
 var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
 var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
 var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
@@ -509,6 +573,10 @@ var ptr_tsc_start_buffer: [*]u16 = &tsc_start_buffer;
 var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
 var ptr_transpose_tic_buffer: [*]u16 = &transpose_tic_buffer;
 var ptr_transpose_toc_buffer: [*]u16 = &transpose_toc_buffer;
+var ptr_round_trip_start_buffer: [*]u16 = &round_trip_start_buffer;
+var ptr_round_trip_done_buffer: [*]u16 = &round_trip_done_buffer;
+var ptr_parent_resolve_tic_buffer: [*]u16 = &parent_resolve_tic_buffer;
+var ptr_parent_resolve_toc_buffer: [*]u16 = &parent_resolve_toc_buffer;
 var ptr_ts_buf: [*]u16 = &ts_buf;
 var ptr_nf_history: [*]u32 = &nf_history;
 var ptr_direction_history: [*]u16 = &direction_history;
@@ -586,6 +654,10 @@ fn start_spmv() void {
         rounds_completed[0] = 0;
         ts_round = rounds_completed[0];
         record_ts(ts_round, TS_VBCAST_ISSUE);
+        // Unconditional (not max_rounds-gated) -- see round_trip_start_buffer's
+        // own declaration comment. Runs exactly once, right here, since
+        // start_spmv() only ever begins round 0 once per f_spmv_iter call.
+        timestamp.get_timestamp(&round_trip_start_buffer);
         if (ts_round < max_rounds) {
             direction_history[ts_round] = 0; // round 0 always starts top-down
         }
@@ -755,14 +827,13 @@ fn compute_topdown() void {
                 const k = mat_rows_buf[loc + j]; // dense row index, 0..blk-1
                 y_bitmap[k >> 5] |= (@as(u32, 1) << (k & 31));
                 if (is_iterative) {
-                    // Store the LOCAL column index c directly, not the global vertex id
-                    // (pcol_id*blk+c) -- keeps parent_local_buf/PARENT_NONE at u16 regardless
-                    // of n, since c is always < blk (already independently bounded, see
-                    // PARENT_NONE's own comment below). The global id is reconstructed
-                    // host-side in device_io.py's extract_parent_result(), which already
-                    // knows each slice's pcol_id from the readback layout.
+                    // Compute the FULL global vertex id on-device (Phase A of the
+                    // u32 migration) instead of storing the bare local column index --
+                    // pcol_id/blk are u16, so the product must be done in u32 arithmetic
+                    // to avoid silently truncating for any pcol_id*blk >= 65536.
                     if ((visited_bitmap[k >> 5] >> (k & 31)) & 1 == 0) {
-                        parent_local_buf[k] = c;
+                        const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
+                        parent_local_buf[k] = global_c;
                     }
                 }
             }
@@ -795,7 +866,10 @@ fn compute_bottomup() void {
             if ((x_bitmap[c >> 5] >> (c & 31)) & 1 != 0) {
                 y_bitmap[r >> 5] |= (@as(u32, 1) << (r & 31));
                 if (is_iterative) {
-                    parent_local_buf[r] = c;
+                    // See compute_topdown()'s matching comment -- same global-id
+                    // computation, u32 arithmetic required.
+                    const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
+                    parent_local_buf[r] = global_c;
                 }
                 break; // first hit wins -- no need to look at r's other columns
             }
@@ -960,6 +1034,11 @@ task term_row_bcast_done() void {
 task term_col_bcast_done() void {
 
     record_ts(ts_round, TS_TERM_COL_BCAST_DONE);
+    // Unconditional (not max_rounds-gated), overwritten every round -- see
+    // round_trip_done_buffer's own declaration comment. Whichever round
+    // this task last runs in (i.e. the true final round, whatever its
+    // index), this buffer ends up holding that round's timestamp.
+    timestamp.get_timestamp(&round_trip_done_buffer);
     // col-bcast done: every PE now holds the termination condition
 
     // Phase D telemetry: nf_history[ts_round] is round ts_round's OWN
@@ -1007,10 +1086,29 @@ task term_col_bcast_done() void {
 
         // Start with Phase 1 again: row-bcast updated visited bitmap
         mpi_x.broadcast(prow_id, &visited_bitmap, BITMAP_WORDS, visited_bcast_done_task_id);
-   
+
     } else {
-        sys_mod.unblock_cmd_stream();
+        // BFS has converged. One-time, end-of-run parent resolution (Phase B
+        // of the on-device parent resolution plan): resolve each row's P
+        // per-PE candidates down to a single winner at PE-column 0, instead
+        // of leaving that combine to the host after a full P-wide transfer
+        // (see parent_local_buf's own declaration comment). Runs exactly
+        // once per f_spmv_iter call, never mid-round -- safe to reuse mpi_x's
+        // colors/queues/DSRs here since all other mpi_x traffic for this run
+        // has already fully torn down by the time termination is reached.
+        if (is_iterative) {
+            timestamp.get_timestamp(&parent_resolve_tic_buffer);
+            mpi_x.reduce_select_any(0, &parent_local_buf, &parent_relay_result,
+                                     PARENT_NONE, blk, parent_resolve_done_task_id);
+        } else {
+            sys_mod.unblock_cmd_stream();
+        }
     }
+}
+
+task parent_resolve_done() void {
+    timestamp.get_timestamp(&parent_resolve_toc_buffer);
+    sys_mod.unblock_cmd_stream();
 }
 
 comptime {
@@ -1021,12 +1119,17 @@ comptime {
     @bind_local_task(term_row_bcast_done, term_row_bcast_done_task_id);
     @bind_local_task(term_col_bcast_done, term_col_bcast_done_task_id);
     @bind_local_task(visited_bcast_done, visited_bcast_done_task_id);
+    @bind_local_task(parent_resolve_done, parent_resolve_done_task_id);
 
     @export_symbol(ptr_x_bitmap, "x_bitmap");
     @export_symbol(ptr_y_bitmap_reduced, "y_bitmap_reduced");
     @export_symbol(ptr_visited_bitmap, "visited_bitmap");
     @export_symbol(ptr_rounds_completed, "rounds_completed");
-    @export_symbol(ptr_parent_local_buf, "parent_local_buf");
+    // Exported name stays "parent_local_buf" (host-side callers' runner.get_id
+    // lookups are unchanged) but now points at parent_relay_result -- the
+    // POST-REDUCE buffer, meaningful only at PE-column 0 -- instead of each
+    // PE's own raw candidate. See parent_relay_result's own declaration comment.
+    @export_symbol(ptr_parent_relay_result, "parent_local_buf");
     @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
     @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
     @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");
@@ -1043,6 +1146,10 @@ comptime {
     @export_symbol(ptr_tsc_end_buffer, "tsc_end_buffer");
     @export_symbol(ptr_transpose_tic_buffer, "transpose_tic_buffer");
     @export_symbol(ptr_transpose_toc_buffer, "transpose_toc_buffer");
+    @export_symbol(ptr_round_trip_start_buffer, "round_trip_start_buffer");
+    @export_symbol(ptr_round_trip_done_buffer, "round_trip_done_buffer");
+    @export_symbol(ptr_parent_resolve_tic_buffer, "parent_resolve_tic_buffer");
+    @export_symbol(ptr_parent_resolve_toc_buffer, "parent_resolve_toc_buffer");
     @export_symbol(ptr_ts_buf, "ts_buf");
     @export_symbol(ptr_nf_history, "nf_history");
     @export_symbol(ptr_direction_history, "direction_history");

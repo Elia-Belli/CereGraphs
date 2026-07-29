@@ -367,14 +367,18 @@ def main():
     return int(np.reshape(buf_1d, (height, width, 1), order="F")[(0, 0, 0)])
 
   def read_parent_local_buf():
-    # unlike x_bitmap/y_bitmap_reduced/visited_bitmap, parent_local_buf is meaningful at
-    # EVERY PE (not just the diagonal) -- read back the full rectangle,
-    # same u16-over-u32-wire convention as read_rounds_completed above.
-    buf_1d = np.zeros(height * width * blk, np.uint32)
-    runner.memcpy_d2h(buf_1d, sym_parent_local_buf, 0, 0, width, height, blk,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+    # Phase B of the on-device parent resolution plan: by the time
+    # f_spmv_iter's single launch below returns, bool_pe.csl has already
+    # resolved each row's P per-PE candidates down to a single winner at
+    # PE-column 0 (term_col_bcast_done()'s reduce_select_any call, which
+    # only runs once BFS has fully converged -- exactly the state this
+    # function is called in) -- so only that one narrow column needs to
+    # leave the device. width=1 here, not width.
+    buf_1d = np.zeros(height * 1 * blk, np.uint32)
+    runner.memcpy_d2h(buf_1d, sym_parent_local_buf, 0, 0, 1, height, blk,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
-    return np.reshape(buf_1d, (height, width, blk), order="F")
+    return np.reshape(buf_1d, (height, 1, blk), order="F")
 
   print("step 2: on-device iterative -- one f_spmv_iter launch, runs until the "
         "on-device termination relay stops it (see module docstring)")

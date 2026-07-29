@@ -223,37 +223,39 @@ def read_tic_toc_delta(runner, sym_tsc_start, sym_tsc_end, height, width):
 
 
 def compute_round_summary(raw_slots, profiled_rounds):
-  """Robust, non-decomposed round/runtime timing -- deliberately NOT trying
-  to further split a round's communication phases into wait vs real cost
-  (see compute_skew_adjusted's own docstring / GRAPH500_BENCHMARK.md
-  sections 10-13 for why that turned out to be a hard, still-unresolved
-  problem on its own -- put aside rather than fixed further here). Two
-  straggler-PE spans instead, both justified as genuine synchronization
-  points rather than assumptions about internal chain structure:
+  """Robust, non-decomposed PER-ROUND timing -- deliberately NOT trying to
+  further split a round's communication phases into wait vs real cost (see
+  compute_skew_adjusted's own docstring / GRAPH500_BENCHMARK.md sections
+  10-13 for why that turned out to be a hard, still-unresolved problem on
+  its own -- put aside rather than fixed further here).
 
-  - total_runtime_cycles: max over PEs of (last profiled round's
-    TS_TERM_COL_BCAST_DONE - round 0's TS_VBCAST_ISSUE) -- the straggler
-    PE's own first-phase-to-last-phase span, a solid estimate of total
-    on-device BFS time. Doesn't account for the very first broadcast's own
-    initial fabric fill delay -- acceptable, a one-time cost diluted across
-    every round that follows, not a per-round recurring one.
-  - round_duration_cycles: per round, max over PEs of (that SAME round's
+  - round_duration_cycles: per round, max over PEs of (that round's
     TS_TERM_COL_BCAST_DONE - TS_VBCAST_ISSUE) -- justified because the
     termination relay forces every PE to agree on nz_total before ANY PE
     can issue the next round's visited_bcast, so this genuinely is a hard
     synchronization boundary (unlike the relay's own internal sub-phases,
     where no such cross-PE guarantee holds).
 
-  Returns (total_runtime_cycles: int, round_duration_cycles: (profiled_rounds,)
-  int64 array)."""
+  Does NOT compute total_runtime_cycles any more -- that used to be `max
+  over PEs of (done[-1] - issue[0])` using this SAME max_rounds-truncated
+  `raw_slots` data, which was silently WRONG whenever the BFS actually ran
+  more rounds than max_rounds could store in ts_buf (done[-1] would be
+  round max_rounds-1's timestamp, not the true final round's -- ts_buf has
+  no slot for anything past max_rounds at all, see bool_pe.csl's
+  record_ts()). total_runtime_cycles is now computed by the caller from
+  round_trip_start_buffer/round_trip_done_buffer instead (see
+  decode_phase_row) -- two dedicated buffers captured UNCONDITIONALLY every
+  run, independent of max_rounds/ts_buf sizing entirely.
+
+  Returns round_duration_cycles: (profiled_rounds,) int64 array."""
   issue = raw_slots["ts_vbcast_issue"][:profiled_rounds]        # (rounds, height, width)
   done = raw_slots["ts_term_col_bcast_done"][:profiled_rounds]  # (rounds, height, width)
   round_duration_cycles = (done - issue).max(axis=(1, 2))
-  total_runtime_cycles = int((done[-1] - issue[0]).max())
-  return total_runtime_cycles, round_duration_cycles
+  return round_duration_cycles
 
 
-def decode_phase_row(ts_hwl_u32, height, width, max_rounds, rounds_completed, verbose=True):
+def decode_phase_row(ts_hwl_u32, height, width, max_rounds, rounds_completed,
+                      round_trip_cycles, verbose=True):
   """Decode one search's ts_buf into per-phase min/max/avg CSV columns
   (semicolon-joined per-round strings, same shape run_bfs.py has always
   logged), PLUS the skew-adjusted counterpart for every phase that has one
@@ -270,32 +272,52 @@ def decode_phase_row(ts_hwl_u32, height, width, max_rounds, rounds_completed, ve
   `relay_critical_path_cycles` (see compute_skew_adjusted's docstring) --
   logged as its own column and used in place of relay_total's raw max here.
 
+  `round_trip_cycles`: per-PE (height*width,) int64 array from
+  read_tic_toc_delta(round_trip_start_buffer, round_trip_done_buffer) --
+  the caller's job to read back (same pattern as h2d/d2h/transpose), since
+  it's a plain tic/toc pair, not part of ts_buf. Captured UNCONDITIONALLY
+  every run regardless of max_rounds (see bool_pe.csl's own declaration
+  comment for round_trip_start_buffer/round_trip_done_buffer), so its max
+  across PEs is always the TRUE total_runtime_cycles -- unlike ts_buf's own
+  TS_VBCAST_ISSUE/TS_TERM_COL_BCAST_DONE slots, which simply don't exist
+  for any round >= max_rounds. Used both to fix total_runtime_cycles
+  (always) and, when rounds_completed > max_rounds, as device_time_cycles
+  itself in place of the (silently-truncated-to-max_rounds-rounds) adjusted
+  phase sum -- a coarser number in that case (no skew-adjustment), but a
+  CORRECT one, which the truncated sum is not.
+
   Shared by run_bfs.py (one search, verbose=True) and run_graph500.py (64
   searches, verbose=False to avoid flooding stdout with a full phase
   breakdown per search).
 
   Returns (row_cols, device_time_cycles, profiled_rounds)."""
-  if rounds_completed > max_rounds:
+  truncated = rounds_completed > max_rounds
+  if truncated:
     print(f"[[ WARNING: BFS ran {rounds_completed} rounds but max_rounds={max_rounds} -- "
-          f"only the first {max_rounds} rounds were timestamped; bump max_rounds to "
-          "profile the rest ]]")
+          f"only the first {max_rounds} rounds were timestamped (per-round phase breakdown "
+          f"below is INCOMPLETE); bump max_rounds to profile the rest. "
+          f"total_runtime_cycles/search_time_cycles/GTEPS remain CORRECT regardless -- "
+          f"they use round_trip_start_buffer/round_trip_done_buffer, not ts_buf. ]]")
 
   phase_cycles, raw_slots, profiled_rounds = decode_pe_phase_cycles(
       ts_hwl_u32, height, width, max_rounds, rounds_completed)
   skew = compute_skew_adjusted(phase_cycles, raw_slots, height, width)
   relay_critical_path_cycles = skew["relay_critical_path_cycles"]
 
-  total_runtime_cycles, round_duration_cycles = compute_round_summary(raw_slots, profiled_rounds)
+  round_duration_cycles = compute_round_summary(raw_slots, profiled_rounds)
+  total_runtime_cycles = int(round_trip_cycles.max())
 
   row_cols = {}
   row_cols["round_duration_cycles"] = ";".join(str(int(v)) for v in round_duration_cycles)
   row_cols["total_runtime_cycles"] = total_runtime_cycles
   if verbose:
-    print(f"  round_duration_cycles (straggler span, VBCAST_ISSUE->TERM_COL_BCAST_DONE): "
+    print(f"  round_duration_cycles (straggler span, VBCAST_ISSUE->TERM_COL_BCAST_DONE, "
+          f"first {profiled_rounds} of {rounds_completed} rounds): "
           f"{round_duration_cycles.tolist()}")
-    print(f"  total_runtime_cycles (straggler span, round 0 VBCAST_ISSUE -> last round "
-          f"TERM_COL_BCAST_DONE): {total_runtime_cycles}  (sum of round_duration_cycles above: "
-          f"{int(round_duration_cycles.sum())})")
+    print(f"  total_runtime_cycles (straggler span, round_trip_start_buffer -> "
+          f"round_trip_done_buffer -- always the TRUE final round, independent of max_rounds): "
+          f"{total_runtime_cycles}  (sum of the {profiled_rounds}-round breakdown above: "
+          f"{int(round_duration_cycles.sum())}{', INCOMPLETE' if truncated else ''})")
 
   device_time_max_by_name = {}  # what device_time_cycles actually sums -- adjusted where possible
   for name, start_slot, end_slot in PHASES:
@@ -334,7 +356,14 @@ def decode_phase_row(ts_hwl_u32, height, width, max_rounds, rounds_completed, ve
     print(f"  relay_critical_path_cycles (skew-adjusted, replaces relay_total's raw max in "
           f"search_time_cycles): {relay_critical_path_cycles.tolist()}")
 
-  device_time_cycles = sum(int(device_time_max_by_name[name].sum()) for name in SEARCH_TIME_PHASES)
+  if truncated:
+    # The adjusted-phase-sum approach below only ever summed the first
+    # max_rounds rounds -- silently wrong here (could be a tiny fraction of
+    # the true total for a big-diameter graph). Fall back to the reliable
+    # round-trip span: coarser (no skew-adjustment breakdown), but correct.
+    device_time_cycles = total_runtime_cycles
+  else:
+    device_time_cycles = sum(int(device_time_max_by_name[name].sum()) for name in SEARCH_TIME_PHASES)
   return row_cols, device_time_cycles, profiled_rounds
 
 
