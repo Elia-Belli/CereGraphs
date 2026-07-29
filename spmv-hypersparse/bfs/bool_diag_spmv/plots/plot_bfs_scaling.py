@@ -3,9 +3,17 @@
 one bar per input graph (RMAT at various scales AND SNAP graphs -- RMAT's
 diameter barely grows with scale, which is exactly why SNAP graphs are in
 the mix; see this repo's own bfs_timing.csv), stacked/split by color into
-h2d_matrix / h2d_seed / compute / d2h, y-axis in cycles. This is the
-PRIMARY performance plot (per-input phase split); a summary table
+h2d_matrix / h2d_seed / compute / resolve / d2h, y-axis in cycles. This is
+the PRIMARY performance plot (per-input phase split); a summary table
 condensing the same data is a planned follow-up, not built here.
+
+"compute" is search_time_cycles_no_transfer with parent_resolve_max_cycles
+(mpi_x.reduce_select_any()'s one-time end-of-run reduce, treated as
+transfer-adjacent overhead, not on-device round work) split back out into
+its own "resolve" segment -- see plot_bfs_timing.py's PARENT_RESOLVE_COLOR
+for the same convention. Without this split, "compute" would silently
+include a cost that grows from a small fraction to the large majority of
+that column's own height as scale/grid grow.
 
 Reuses bfs/bool_diag_spmv/plots/plot_bfs_timing.py's exact categorical
 palette (H2D_BASE_HEX magenta shades for h2d_matrix/h2d_seed, local_compute
@@ -34,10 +42,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 # Exact palette from plot_bfs_timing.py -- see that file's own H2D_BASE_HEX/
-# D2H_COLOR/ROUND_SEGMENT_COLORS/hue_shades for the full rationale.
+# D2H_COLOR/ROUND_SEGMENT_COLORS/PARENT_RESOLVE_COLOR/hue_shades for the
+# full rationale.
 H2D_BASE_HEX = "#e87ba4"  # magenta
 COMPUTE_COLOR = "#eda100"  # yellow (local_compute)
 D2H_COLOR = "#eb6834"  # orange
+RESOLVE_COLOR = "#2a78d6"  # blue (mpi_x.reduce_select_any()'s one-time parent resolve)
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_MUTED = "#898781"
 GRIDLINE = "#e1e0d9"
@@ -72,11 +82,20 @@ def hue_shades(base_hex, n):
 
 H2D_MATRIX_COLOR, H2D_SEED_COLOR = hue_shades(H2D_BASE_HEX, 2)
 
+# search_time_cycles_no_transfer (rounds + the one-time transpose_structure()
+# + the one-time parent_resolve reduce) still has parent_resolve folded in --
+# split it back out into its own "resolve" segment (same convention
+# plot_bfs_timing.py already uses) rather than mislabeling it as "compute";
+# parent_resolve grows from a small fraction to the large majority of this
+# column as scale/grid grow, so leaving it lumped into "compute" would
+# increasingly mislabel most of that segment's own height.
 SEGMENTS = [
-    ("h2d_matrix_max_cycles", "h2d (matrix)", H2D_MATRIX_COLOR),
-    ("h2d_seed_max_cycles", "h2d (seed)", H2D_SEED_COLOR),
-    ("search_time_cycles_no_transfer", "compute", COMPUTE_COLOR),
-    ("d2h_max_cycles", "d2h", D2H_COLOR),
+    (lambda row: int(row["h2d_matrix_max_cycles"]), "h2d (matrix)", H2D_MATRIX_COLOR),
+    (lambda row: int(row["h2d_seed_max_cycles"]), "h2d (seed)", H2D_SEED_COLOR),
+    (lambda row: int(row["search_time_cycles_no_transfer"]) - int(row["parent_resolve_max_cycles"]),
+     "compute", COMPUTE_COLOR),
+    (lambda row: int(row["parent_resolve_max_cycles"]), "resolve", RESOLVE_COLOR),
+    (lambda row: int(row["d2h_max_cycles"]), "d2h", D2H_COLOR),
 ]
 
 
@@ -120,7 +139,7 @@ def main():
 
   totals = []
   for row in rows:
-    total = sum(int(row[col]) for col, _label, _color in SEGMENTS)
+    total = sum(value_fn(row) for value_fn, _label, _color in SEGMENTS)
     totals.append(total)
   max_total = max(totals) if totals else 1
   ax.set_ylim(0, max_total * 1.08)
@@ -131,8 +150,8 @@ def main():
     xpos = i
     total = totals[i]
     bottom = 0
-    for col, _label, color in SEGMENTS:
-      height = int(row[col])
+    for value_fn, _label, color in SEGMENTS:
+      height = value_fn(row)
       ax.bar([xpos], [height], width=bar_width, bottom=bottom, color=color,
              edgecolor=SURFACE, linewidth=0.5, zorder=3)
       if height > 0 and total > 0:
@@ -161,7 +180,7 @@ def main():
   ax.set_xticks(range(n_bars))
   ax.set_xticklabels(xticklabels, color=TEXT_PRIMARY, fontsize=8)
   ax.set_ylabel("cycles", color=TEXT_PRIMARY)
-  ax.set_title("BFS timing by input graph: h2d (matrix/seed) / compute / d2h split",
+  ax.set_title("BFS timing by input graph: h2d (matrix/seed) / compute / resolve / d2h split",
                 color=TEXT_PRIMARY)
   ax.spines["top"].set_visible(False)
   ax.spines["right"].set_visible(False)
