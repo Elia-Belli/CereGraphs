@@ -95,7 +95,15 @@ six `mat_rows_buf` call sites (`run_bfs.py`, `run_bfs.appliance.py`,
 **Verified on real hardware**: berkstan @ 750x750 now completes end-to-end
 (h2d succeeds, 131 rounds, scipy cross-check OK, 0 mismatches, GTEPS=0.108
 incl. transfer / 0.256 excl.). Small-scale regression (`rmat_s10@4x4`)
-confirmed byte-for-byte unchanged single-call behavior.
+confirmed byte-for-byte unchanged single-call behavior. Also verified the
+**canonical-root case** that used to fail at h2d before this fix: original
+SNAP vertex 546279, translated via `snap_berkstan.balanced750x750.operm`
+line 546280 → balanced index 353938 (`--shared-perm` balancing preserved
+vertex identity correctly) — h2d now succeeds and the scipy cross-check
+passes with 0 mismatches, confirming the post-balancing vertex mapping is
+still correct with the chunked transfer. (Visited count is small, 18/685500
+— expected, not a bug: berkstan is directed, and this particular vertex has
+a small out-component from that direction.)
 
 ### 4b. `h2d_matrix` cycle-count stat is garbage — separate, pre-existing bug (open)
 While cross-checking timing after the #4 fix (real appliance runs of
