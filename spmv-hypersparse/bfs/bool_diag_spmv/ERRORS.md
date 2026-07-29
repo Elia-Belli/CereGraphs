@@ -173,14 +173,38 @@ ld.lld: error: ran out of PE memory for task table
 ld.lld: error: ran out of PE memory for data (section .data.hi)
 ```
 **Where**: topcats and livejournal, consistently, both before and after
-the v3 directedness fix.
+the v3 directedness fix. **Also confirmed 2026-07-29 on as-Skitter
+(n=1.70M) and cit-Patents (n=3.77M)** — both new to the pipeline this
+session, both hit at 750x750, first attempt.
 **Cause**: `blk = ceil(n/P)` grows with `n` at fixed `P=750`; each PE's
 static-memory footprint (bitmaps, buffers, task table) scales with `blk`.
 topcats (n≈1.79M) and livejournal (n≈4.85M) simply need more per-PE static
 memory than a 750x750 grid provides — a real, hardware-imposed compile-time
 ceiling, confirmed independent of the symmetrization bug (both graphs
 failed identically before and after that fix). Would need a larger PE grid
-or a smaller per-PE working set to lift.
+or a smaller per-PE working set to lift. as-Skitter's n (1.70M) sitting
+right at the same threshold as topcats (1.79M) is consistent with this
+being an n-driven ceiling, not a per-graph quirk.
+**New diagnostic detail (2026-07-29, skitter/patents)**: alongside the
+usual `.bss`/task-table/`.data.hi` overflow lines, both also produced
+`ld.lld: error: section .bss virtual/load address range overlaps with
+.filters` at consistent addresses (`.filters` at `[0xF680, 0xF6DF]` both
+times; `.bss` starting at `0x46D8`/`0x4720` and overflowing into that
+range) — a genuine static memory layout conflict, not new information
+about the failure mode itself, just a second linker diagnostic for the
+same overflow. **Important secondary finding**: after these real overflow
+errors, the log also fills with `ld.lld: error: cannot open
+/tmp/cslc-<hash>/cslc-<hash>.o: No such file or directory` — dozens of
+repeats of the SAME single hash within one compile attempt (not a
+different hash per attempt, unlike issue #12's pattern). This is a
+**downstream symptom of this same PE-memory-overflow failure** (the build
+system's retry/cleanup logic re-touching an object file already torn down
+after the genuine link failure), NOT an independent instance of issue
+#12's remote-scratch-eviction flake, despite the superficially similar
+"cannot open ... .o" message. Don't misdiagnose future occurrences of this
+message as #12 without first checking for the `.bss`/task-table overflow
+lines earlier in the same log — if they're present, it's #8, and retrying
+will not help (deterministic capacity, not a transient).
 **Status**: real, open, not attempted to fix this session (would require
 either more PEs or reducing static memory per PE, e.g. narrower bitmaps).
 
@@ -326,11 +350,30 @@ enough skew (1102) to fit; the corrected graph doesn't fit at all right
 now. Those CSV rows and plots were removed rather than left looking valid.
 **Status**: code fix is in and verified correct at the matrix-construction
 level; berkstan itself is back to **Open** (needs a bigger grid, joining
-#8) until a coarser-than-750×750 option exists. **pokec, topcats,
-livejournal all need the same regenerate+rebalance treatment** — not done
-yet this session; their currently-published results (pokec especially,
-currently marked OK) were computed under the same pre-fix direction and
-must be treated as unverified until redone.
+#8) until a coarser-than-750×750 option exists.
+
+**Update — real-hardware confirmation, and topcats reconfirmed**:
+- **pokec**: regenerated + rebalanced + rerun on real hardware (source=0,
+  balanced index) post-fix. Result: `rounds_completed=11`,
+  `visited_count=1,504,295/1,633,500`, `m_edges_traversed=30,159,128`.
+  This matches an independently-published reference table for pokec
+  (diameter 11, ~30.1M explored edges out of 30.6M total) almost exactly —
+  genuine on-silicon confirmation of the fix, not just the host-side
+  simulation berkstan got. The old pre-fix pokec row (source=1178437,
+  computed under the wrong direction) should be treated as superseded.
+- **topcats**: regenerated + rebalanced under the fix. `max_local_nnz`
+  went from 398 (pre-fix) to **2179** (post-fix) — same "in-degree skew
+  far worse than out-degree" pattern as berkstan, confirmed directly this
+  time (raw degree check: berkstan max out=249 vs max in=84,208; RMAT s20
+  by contrast is exactly out=in=64,701 at every percentile, structurally
+  symmetric, hence completely unaffected by this whole bug). Recompiled
+  at 750×750: fails, same PE static-memory ceiling as before (246
+  `ran out of PE memory` errors this time, more than berkstan's ~100+) —
+  not a new failure, an already-failing case failing more decisively.
+- **livejournal**: still not regenerated/retested this session — same
+  treatment needed, expected to follow the same pattern (already failed
+  pre-fix, and directed hyperlink/social graphs so far all show worse
+  in-degree skew post-fix).
 
 ## Summary table
 
@@ -351,4 +394,4 @@ must be treated as unverified until redone.
 | 12 | linker file-vanished flake | s21 (4/4), livejournal (1x), orkut (1/1) | compile-farm scratch/container lifecycle (probable), correlates with the 3 largest jobs in the suite | **Open**, not retried further |
 | 13 | transient 503 upload error | pokec (1st attempt) | connectivity flake (probable) | Resolved on retry |
 | 14 | "failed to terminate linker workers" | topcats | secondary message alongside #8 | Not independent |
-| 15 | directed BFS = ancestor not descendant reachability | berkstan (546279 test vs. reference table), affects all 4 directed SNAP graphs | edge-list loader fed row=src into a kernel that natively computes ancestor-of-frontier | **Fixed** (code, `graph_loader.py`); reopens berkstan/#8, pokec/topcats/livejournal need re-verification |
+| 15 | directed BFS = ancestor not descendant reachability | berkstan (546279 test vs. reference table); pokec confirmed correct on real hardware (matches reference diameter/EE); topcats reconfirmed still fails (max_local_nnz 398→2179) | edge-list loader fed row=src into a kernel that natively computes ancestor-of-frontier | **Fixed** (code, `graph_loader.py`, verified on real hardware via pokec); berkstan/topcats blocked by #8; livejournal untested |
