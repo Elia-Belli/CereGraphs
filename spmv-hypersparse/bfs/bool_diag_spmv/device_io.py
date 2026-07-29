@@ -42,6 +42,52 @@ def hwl_to_oned_colmajor(height: int, width: int, pe_length: int, A_hwl: np.ndar
   return A_1d
 
 
+# The SDK's real wire payload is always 4 bytes/element (memcpy_h2d hard-
+# asserts src.dtype.itemsize == 4 internally), regardless of the data_type
+# kwarg -- that only controls device-side unpacking. This is also
+# grpc.max_send_message_length's value; the SDK's own internal chunker
+# leaves ~zero headroom for its message envelope and off-by-a-few-dozen-
+# bytes overflows right at this boundary (confirmed against the installed
+# cerebras/sdk/client/sdk_appliance_client.py -- see ERRORS.md #4).
+_H2D_WIRE_ITEMSIZE = 4
+_H2D_MAX_MESSAGE_LENGTH = (1024**3 * 2) - 1024
+
+
+def memcpy_h2d_chunked(runner, dest_sym, A_hwl: np.ndarray, height: int, width: int,
+                       elt_per_pe: int, dtype, data_type, order, nonblock: bool,
+                       max_bytes_per_call: int = 1_610_612_736):
+  """memcpy_h2d wrapper that splits large transfers into multiple PE-row-band
+  calls, each safely under the ~2GiB gRPC message-size ceiling -- works
+  around a real ceiling this repo hit uploading mat_rows_buf for graphs
+  with high per-PE nonzero skew (berkstan, orkut; see ERRORS.md #4). Below
+  max_bytes_per_call (default 1.5GiB, real margin under the 2,147,482,624-
+  byte ceiling -- not the vendor chunker's near-zero margin), this is a
+  single unchanged memcpy_h2d call, identical to every pre-existing caller.
+
+  Chunks along the PE-row (`height`) axis, not `elt_per_pe` -- x/y are
+  documented, precedented origin offsets in this codebase (the
+  reduce_select_any d2h fix already narrows `w`); a nonzero starting offset
+  into elt_per_pe has no precedent here and is unverified, so this is the
+  lower-risk axis to split on."""
+  total_bytes = _H2D_WIRE_ITEMSIZE * height * width * elt_per_pe
+  if total_bytes <= max_bytes_per_call:
+    A_1d = hwl_to_oned_colmajor(height, width, elt_per_pe, A_hwl, dtype)
+    runner.memcpy_h2d(dest_sym, A_1d, 0, 0, width, height, elt_per_pe,
+                       streaming=False, data_type=data_type, order=order, nonblock=nonblock)
+    return
+
+  num_chunks = -(-total_bytes // max_bytes_per_call)  # ceil div
+  row_chunk = -(-height // num_chunks)  # ceil div
+  assert _H2D_WIRE_ITEMSIZE * row_chunk * width * elt_per_pe <= max_bytes_per_call
+  y0 = 0
+  while y0 < height:
+    h = min(row_chunk, height - y0)
+    chunk_1d = hwl_to_oned_colmajor(h, width, elt_per_pe, A_hwl[y0:y0 + h], dtype)
+    runner.memcpy_h2d(dest_sym, chunk_1d, 0, y0, width, h, elt_per_pe,
+                       streaming=False, data_type=data_type, order=order, nonblock=True)
+    y0 += h
+
+
 def oned_to_hwl_colmajor(height: int, width: int, pe_length: int, A_1d: np.ndarray, dtype):
   """
     Given a 1-D tensor A_1d[height*width*pe_length], transform it to

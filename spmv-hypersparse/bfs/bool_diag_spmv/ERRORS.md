@@ -56,29 +56,67 @@ non-"ish" collision.
 
 ## Confirmed causes — in our own Python/methodology code
 
-### 4. h2d gRPC message-size ceiling (matrix-structure upload) — UNFIXED
+### 4. h2d gRPC message-size ceiling (matrix-structure upload) — FIXED
 ```
 grpc._channel._InactiveRpcError: StatusCode.RESOURCE_EXHAUSTED
 "Sent message larger than max (2147482669 vs. 2147482624)"
 ```
-**Where**: orkut (expected, 117M nnz) — and, more importantly, **berkstan**,
-even after the directedness fix gave it its true, non-fabricated edge count
-(7,600,595 nnz, matching SNAP's own documented total exactly).
-**Cause**: this is the *other* side of error #1's ceiling — the matrix
-structure itself (`mat_rows_buf`) is uploaded host→device as one
-`memcpy_h2d` sized by `max_local_nnz` (the worst-case per-PE nonzero count
-after load-balancing), not total nnz. Web graphs like berkstan have far
-more extreme power-law degree skew than social graphs (pokec) or synthetic
-RMAT — no balancing scheme fully flattens that, so `max_local_nnz` alone is
-enough to blow the same ~2GiB ceiling even with a perfectly correct,
-un-inflated edge count. This resolved an apparent size paradox the user
-caught (berkstan, fewer total edges than pokec, still failing) — the h2d
-cost tracks `max_local_nnz`, not total nnz.
-**Status**: real, confirmed, **not fixed this session** — only the d2h side
-(#1) got the on-device-reduce treatment. A real fix would need either a
-coarser PE grid (spreads nnz over more PEs, lowering `max_local_nnz`) or
-chunking the h2d transfer into multiple sub-2GiB calls. Flagged as future
-work.
+**Where**: berkstan (confirmed, real edge count, 7,600,595 nnz — matching
+SNAP's own documented total exactly), orkut (expected, largest matrix in
+the suite).
+**Cause, now fully pinned down** (previously only "probable"): the failing
+call, `runner.memcpy_h2d(sym_mat_rows_buf, ...)`, uploads the matrix
+structure sized by `max_local_nnz` (worst-case per-PE nonzero count after
+balancing), not total nnz — web graphs like berkstan have far more extreme
+per-PE degree skew than social graphs (pokec) or synthetic RMAT, so
+`max_local_nnz` alone blows the ~2GiB ceiling even with a correct,
+un-inflated edge count. Reading the actually-installed SDK client
+(`cerebras/sdk/client/sdk_appliance_client.py`) confirmed the exact
+mechanism: the wire payload is always `4 * width * height * elt_per_pe`
+bytes regardless of `data_type` (u16 data gets pre-widened to u32 before
+ever reaching the wire), and the SDK's *own* internal chunker has an
+off-by-protobuf-envelope bug — it sizes chunk 0 to exactly
+`MAX_MESSAGE_LENGTH` (2,147,482,624) raw bytes, then the enclosing protobuf
+message serializes ~24-45 bytes larger, tripping the identically-valued
+`grpc.max_send_message_length` ceiling. For berkstan @ 750x750
+(`max_local_nnz=1102`, computed directly from the on-disk balanced matrix):
+`4*750*750*1102 = 2,479,500,000` bytes → the buggy first chunk serializes to
+exactly 2,147,482,669 — the literal reported figure.
+**Fix**: `device_io.py::memcpy_h2d_chunked` — chunk *our own* calls along
+the PE-row axis (not the vendor's buggy internal chunker, and not the
+`elt_per_pe` depth axis, which has no precedent/confirmed offset support in
+this codebase) into pieces safely under the ceiling (1.5GiB default, real
+margin vs. the vendor's ~30-byte margin), so the vendor's internal chunker
+never needs to trigger a second chunk. Below the threshold it's a single
+unchanged call (zero behavior change for every other graph). Wired into all
+six `mat_rows_buf` call sites (`run_bfs.py`, `run_bfs.appliance.py`,
+`run_graph500.py`, `run_host_driven_bfs.py`, `run_single_spmv.py`,
+`run_transpose_device_test.py`).
+**Verified on real hardware**: berkstan @ 750x750 now completes end-to-end
+(h2d succeeds, 131 rounds, scipy cross-check OK, 0 mismatches, GTEPS=0.108
+incl. transfer / 0.256 excl.). Small-scale regression (`rmat_s10@4x4`)
+confirmed byte-for-byte unchanged single-call behavior.
+
+### 4b. `h2d_matrix` cycle-count stat is garbage — separate, pre-existing bug (open)
+While cross-checking timing after the #4 fix (real appliance runs of
+berkstan, s18, s20 @ 750x750, host-side `time` vs. the script's own printed
+stats), the `h2d_matrix: min=/max=/avg=` line printed a nonsense cycle count
+in *all three* runs (29.5B, 72.2B, and 595B cycles respectively — none
+plausible at 875MHz). Critically, **s18 and s20 never touch the new
+chunking path at all** (single-call, `max_local_nnz` far below the
+threshold) and still show garbage — proving this is a pre-existing bug in
+the `h2d_matrix` timing readout itself (most likely a 32-bit on-device
+cycle-counter wraparound not handled by the delta computation), unrelated
+to chunking, just never noticed before because every prior large-graph run
+either failed outright (this same #4 ceiling) or was small enough to finish
+before anyone looked closely at this one diagnostic line. **Does not affect
+correctness**: `search_time_cycles`/GTEPS use a different, confirmed-correct
+mechanism (`round_trip_start_buffer`/`round_trip_done_buffer`), and the
+script's own `WARNING` already notes `total_runtime_cycles`/`GTEPS` "remain
+CORRECT regardless." Old CSV rows/plots for berkstan/s18/s20 @ 750x750 that
+carried this garbage value were replaced with fresh reruns (cleanup, not a
+fix). **Status**: open, cosmetic/diagnostic-only, not chased further this
+session.
 
 ### 5. Blanket symmetrization of SNAP graphs fabricated edges
 **Where**: v2 of the SNAP pipeline (before this fix), all 5 graphs.
@@ -180,8 +218,9 @@ original on 8 random test matrices.
 ld.lld: error: cannot open /tmp/cslc-<hash>/cslc-<hash>.o: No such file or directory
 ```
 **Where**: livejournal (once), **RMAT s21 (4/4 attempts)**, and **orkut
-(1/1 attempt)** (a different `cslc-<hash>` every single time, so not a
-stuck stale artifact — a fresh failure each attempt).
+(3/3 attempts across two separate sessions)** (a different `cslc-<hash>`
+every single time, so not a stuck stale artifact — a fresh failure each
+attempt).
 **Probable cause**: `cslc`'s two-step build (emit per-unit `.o` files into a
 per-job scratch dir, then `ld.lld` links them) runs on ALCF's remote
 compile-farm container. The `.o` file being gone by link time means the
@@ -195,12 +234,14 @@ circumstantial evidence for a **timeout- or resource-linked eviction on the
 compile-farm side for long-running/large compiles**, not pure random
 flake. This can't be confirmed from the client side (no visibility into
 the remote container's lifecycle). Retrying did not resolve it for s21
-after 4 attempts; orkut was not retried at all given it's the single
-largest job in the whole suite and thus the least likely candidate for a
-retry to help. Treated as an open, size-correlated infrastructure
-limitation rather than a transient to retry through indefinitely, per
-direct user decision on 2026-07-28 (made for s21, applied consistently to
-orkut for the same reason).
+after 4 attempts; orkut was retried once more in a later session (2
+attempts, both failed identically with different hashes) specifically to
+test the h2d chunking fix (#4) against it -- never got the chance, since it
+still can't get past compile. Treated as an open, size-correlated
+infrastructure limitation rather than a transient to retry through
+indefinitely, per direct user decision on 2026-07-28 (made for s21, applied
+consistently to orkut for the same reason, reaffirmed 2026-07-29 after the
+fresh 2/2 failure).
 
 ### 13. Transient gRPC `503`/`UNAVAILABLE` during artifact upload
 ```
@@ -234,7 +275,8 @@ cause.
 | 1 | d2h gRPC 2GiB ceiling | RMAT s20 | design flaw (P copies transferred) | **Fixed** (`reduce_select_any`) |
 | 2 | PE mem overflow (new collective) | pokec/topcats | 3-buffer design | **Fixed** (2-buffer redesign) |
 | 3 | task id collision | compile-time | id 21 not actually free | **Fixed** (moved to 24) |
-| 4 | h2d gRPC 2GiB ceiling | berkstan, orkut | `max_local_nnz` skew | **Open** |
+| 4 | h2d gRPC 2GiB ceiling | berkstan (verified fixed), orkut | `max_local_nnz` skew + vendor SDK chunker envelope-overflow bug | **Fixed** (`memcpy_h2d_chunked`) |
+| 4b | `h2d_matrix` stat garbage | berkstan/s18/s20 @ 750x750 | likely 32-bit cycle-counter wraparound in that stat's readout | **Open** (cosmetic; GTEPS unaffected) |
 | 5 | fabricated symmetrization | v2 SNAP pipeline | wrong default (`A\|A^T` for directed graphs) | **Fixed** (opt-in `--symmetrize`) |
 | 6 | scrambled source vertex | any SNAP run | `--rand 0` doesn't disable base permutation | **Fixed** (`--operm`) |
 | 7 | raw/unbalanced SNAP fails | user experiment | real degree skew, no balancing | N/A (balancing required) |

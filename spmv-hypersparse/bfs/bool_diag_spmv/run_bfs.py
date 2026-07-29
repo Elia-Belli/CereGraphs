@@ -64,7 +64,8 @@ from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, comput
                          save_pe_phase_cycles)
 from bfs_tree_plot import build_digraph, invalid_parents, render_tree_comparison
 from device_io import (csl_compile_core, derive_visited_from_parent,
-                        extract_parent_result, hwl_to_oned_colmajor, single_source_seed_pe)
+                        extract_parent_result, hwl_to_oned_colmajor, memcpy_h2d_chunked,
+                        single_source_seed_pe)
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
@@ -315,10 +316,8 @@ def main():
     print("timing h2d: matrix structure upload (Graph500-style 'construction')...")
     runner.launch("f_tic", nonblock=True)
 
-  mat_rows_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz, mat_rows_buf, np.uint32)
-  runner.memcpy_h2d(sym_mat_rows_buf, mat_rows_buf_1d, 0, 0, width, height, max_local_nnz,
-                     streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                     order=MemcpyOrder.COL_MAJOR, nonblock=True)
+  memcpy_h2d_chunked(runner, sym_mat_rows_buf, mat_rows_buf, height, width, max_local_nnz,
+                     np.uint32, MemcpyDataType.MEMCPY_16BIT, MemcpyOrder.COL_MAJOR, True)
   mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
                                             np.uint32)
   runner.memcpy_h2d(sym_mat_col_idx_buf, mat_col_idx_buf_1d, 0, 0, width, height,
@@ -684,6 +683,26 @@ def main():
     print(f"[[ GTEPS w/o h2d_seed/d2h = {m} edges ({m_convention}) / "
           f"{search_time_seconds_no_transfer * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
           f"{gteps_no_transfer:.6f} GTEPS ]]")
+
+    # Console-only, NOT a new CSV column: parent_resolve (mpi_x.reduce_
+    # select_any()'s one-time end-of-run reduce) is real on-device work, but
+    # a single end-of-run step rather than per-round communication, and its
+    # share of device_time_cycles_with_extras above grows from a small
+    # fraction at small scale/grid to the large majority at large scale/grid
+    # -- print the further-excluded figure too so a live run's own terminal
+    # output isn't misleadingly dominated by it. search_time_cycles_no_transfer/
+    # gteps_no_transfer themselves are left as originally defined (host
+    # h2d_seed/d2h excluded only) since bfs_timing.csv is an append-only log
+    # with no schema-version marker -- redefining that column's meaning here
+    # would silently make historical and future rows mean different things
+    # under the same name.
+    device_time_cycles_excl_parent_resolve = (device_time_cycles_with_extras
+                                               - int(parent_resolve_cycles.max()))
+    _, _, search_time_seconds_excl_resolve, gteps_excl_resolve = compute_m_and_gteps(
+        coo, device_visited, is_symmetric, device_time_cycles_excl_parent_resolve)
+    print(f"[[ GTEPS w/o h2d_seed/d2h/parent_resolve = {m} edges ({m_convention}) / "
+          f"{search_time_seconds_excl_resolve * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
+          f"{gteps_excl_resolve:.6f} GTEPS ]]")
 
     csv_path = args.csv
     if csv_path is None:

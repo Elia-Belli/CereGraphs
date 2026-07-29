@@ -59,7 +59,8 @@ from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode
                          read_tic_toc_delta)
 from bfs_tree_plot import invalid_parents
 from device_io import (csl_compile_core, derive_visited_from_parent,
-                        extract_parent_result, hwl_to_oned_colmajor, single_source_seed_pe)
+                        extract_parent_result, hwl_to_oned_colmajor, memcpy_h2d_chunked,
+                        single_source_seed_pe)
 
 from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
     MemcpyDataType, MemcpyOrder, SdkRuntime,
@@ -279,10 +280,8 @@ def main():
   print("timing h2d: matrix structure upload (Kernel 1, construction -- done once)...")
   runner.launch("f_tic", nonblock=True)
 
-  mat_rows_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz, mat_rows_buf, np.uint32)
-  runner.memcpy_h2d(sym_mat_rows_buf, mat_rows_buf_1d, 0, 0, width, height, max_local_nnz,
-                     streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                     order=MemcpyOrder.COL_MAJOR, nonblock=True)
+  memcpy_h2d_chunked(runner, sym_mat_rows_buf, mat_rows_buf, height, width, max_local_nnz,
+                     np.uint32, MemcpyDataType.MEMCPY_16BIT, MemcpyOrder.COL_MAJOR, True)
   mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
                                             np.uint32)
   runner.memcpy_h2d(sym_mat_col_idx_buf, mat_col_idx_buf_1d, 0, 0, width, height,

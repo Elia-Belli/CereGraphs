@@ -29,7 +29,8 @@ import math
 import os
 
 import numpy as np
-from device_io import csl_compile_core, hwl_to_oned_colmajor, single_source_seed_pe
+from device_io import (csl_compile_core, hwl_to_oned_colmajor, memcpy_h2d_chunked,
+                        single_source_seed_pe)
 from graph_loader import load_graph
 from preprocess_bool import preprocess
 from run_transpose_test import cycle_leader_transpose_inplace
@@ -126,10 +127,8 @@ def main():
   runner.load()
   runner.run()
 
-  mat_rows_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz, mat_rows_buf, np.uint32)
-  runner.memcpy_h2d(sym_mat_rows_buf, mat_rows_buf_1d, 0, 0, width, height, max_local_nnz,
-                     streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                     order=MemcpyOrder.COL_MAJOR, nonblock=True)
+  memcpy_h2d_chunked(runner, sym_mat_rows_buf, mat_rows_buf, height, width, max_local_nnz,
+                     np.uint32, MemcpyDataType.MEMCPY_16BIT, MemcpyOrder.COL_MAJOR, True)
   mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
                                             np.uint32)
   runner.memcpy_h2d(sym_mat_col_idx_buf, mat_col_idx_buf_1d, 0, 0, width, height,

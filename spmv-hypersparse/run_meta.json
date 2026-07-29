@@ -3954,6 +3954,461 @@
                 }
             },
             "coordinator_ip_port": "10.125.8.101:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-cvvjeaap7zuzqwrpwbsuaq",
+            "workflow_id": "wflow-tcfjpgduvza35kpqalqy2zopbe",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-cvvjeaap7zuzqwrpwbsuaq",
+            "start_time": "2026-07-29T11:19:38Z",
+            "scheduled_time": "2026-07-29T11:19:58Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.9.193:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-n7eaklocc5apnjb4uwmxj4",
+            "workflow_id": "wflow-im244d6bv5asnmiyl7ndniowbm",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-n7eaklocc5apnjb4uwmxj4",
+            "start_time": "2026-07-29T11:23:40Z",
+            "scheduled_time": "2026-07-29T11:24:30Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.8.109:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-u29bnbyg2dmcgmeenbb4xh",
+            "workflow_id": "wflow-dsv6uxw5fzcvnbkjmze6k43xju",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-u29bnbyg2dmcgmeenbb4xh",
+            "start_time": "2026-07-29T11:28:44Z",
+            "scheduled_time": "2026-07-29T11:29:04Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.9.222:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-aq7ptqpwn9gqhn7sytmcqc",
+            "workflow_id": "wflow-mtu7vsmo3zevri6gbrgjyjvqj4",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-aq7ptqpwn9gqhn7sytmcqc",
+            "start_time": "2026-07-29T11:33:14Z",
+            "scheduled_time": "2026-07-29T11:33:34Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.8.118:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-hjns9jxkaqwe8axzyttpwl",
+            "workflow_id": "wflow-nzthyvfdsjadzj7a2tyqb4wsme",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-hjns9jxkaqwe8axzyttpwl",
+            "start_time": "2026-07-29T11:52:32Z",
+            "scheduled_time": "2026-07-29T11:52:52Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.9.249:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-kokguc6bncox4kfp4ccm7g",
+            "workflow_id": "wflow-hpqec7tja5dpbkeomtfvye62la",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-kokguc6bncox4kfp4ccm7g",
+            "start_time": "2026-07-29T11:55:30Z",
+            "scheduled_time": "2026-07-29T11:55:50Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.9.56:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-tcfdxoxtfrceq6zjbqc53c",
+            "workflow_id": "wflow-dtgrnzxf2fhexkdxpc6ai3brna",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-tcfdxoxtfrceq6zjbqc53c",
+            "start_time": "2026-07-29T12:01:18Z",
+            "scheduled_time": "2026-07-29T12:01:58Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.8.104:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-mn4tdc4n6p6pzhg8txwcax",
+            "workflow_id": "wflow-qcuzpadl4rf2xg6upxi6ajkyia",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-mn4tdc4n6p6pzhg8txwcax",
+            "start_time": "2026-07-29T12:08:10Z",
+            "scheduled_time": "2026-07-29T12:15:00Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.9.234:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-erhpvxa3skxmwpbbgntuzg",
+            "workflow_id": "wflow-4uavsfhnzngnbfhgiaekuuuw7a",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-erhpvxa3skxmwpbbgntuzg",
+            "start_time": "2026-07-29T12:20:42Z",
+            "scheduled_time": "2026-07-29T12:21:22Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.9.1:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-ymfk7xxn6wcaodu66lqfer",
+            "workflow_id": "wflow-ii7qalsoezazbk4ih4qryphziq",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-ymfk7xxn6wcaodu66lqfer",
+            "start_time": "2026-07-29T12:44:56Z",
+            "scheduled_time": "2026-07-29T12:52:46Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.9.13:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-krrvtob2yo47fzl9ztkukf",
+            "workflow_id": "wflow-slwbiwogjbdvbe6b6otv2w6tgi",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-krrvtob2yo47fzl9ztkukf",
+            "start_time": "2026-07-29T13:04:30Z",
+            "scheduled_time": "2026-07-29T13:11:10Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.9.242:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-lqam4b3x7kuzhkam4tab4b",
+            "workflow_id": "wflow-wbhpjamitfdkbknnjdzjrnxfvq",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-lqam4b3x7kuzhkam4tab4b",
+            "start_time": "2026-07-29T13:26:54Z",
+            "scheduled_time": "2026-07-29T13:27:14Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.8.160:9000"
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-homr38tkfv6nyvcifkvuf4",
+            "workflow_id": "wflow-orxtixnetrhgrneokpgcpgikrm",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-homr38tkfv6nyvcifkvuf4",
+            "start_time": "2026-07-29T13:34:11Z",
+            "scheduled_time": "2026-07-29T13:36:41Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02",
+                "cer-anl-wse001-cs-sy01",
+                "cer-anl-wse002-cs-sy01",
+                "cer-anl-wse002-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                },
+                "cer-anl-wse002-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            },
+            "coordinator_ip_port": "10.125.8.143:9000"
         }
     ],
     "execute_jobs": [
@@ -5647,6 +6102,116 @@
             ],
             "system_versions": {
                 "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            }
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-bqutgwszbtbim9tm7hbhab",
+            "workflow_id": "wflow-yhakjegvyber7nh5cdb6n2kpy4",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-bqutgwszbtbim9tm7hbhab",
+            "start_time": "2026-07-29T11:37:07Z",
+            "scheduled_time": "2026-07-29T11:37:27Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy01"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy01": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            }
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-denuz4uhdjbuwgrjgdfbiw",
+            "workflow_id": "wflow-2w3u32vx6ffilpuec46yrhzsa4",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-denuz4uhdjbuwgrjgdfbiw",
+            "start_time": "2026-07-29T11:53:31Z",
+            "scheduled_time": "2026-07-29T11:53:51Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            }
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-n83aqtfek6mb5fdw8osu9d",
+            "workflow_id": "wflow-eob3kq5rx5fmpmbhjyvtjwt6bi",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-n83aqtfek6mb5fdw8osu9d",
+            "start_time": "2026-07-29T12:27:05Z",
+            "scheduled_time": "2026-07-29T12:27:25Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            }
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-vofdkm7j2aplsgu9qs5l4z",
+            "workflow_id": "wflow-dckeodfjoza77bmvbm5oodgeza",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-vofdkm7j2aplsgu9qs5l4z",
+            "start_time": "2026-07-29T12:59:03Z",
+            "scheduled_time": "2026-07-29T12:59:23Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse001-cs-sy02"
+            ],
+            "system_versions": {
+                "cer-anl-wse001-cs-sy02": {
+                    "execmode": "WEIGHT_STREAMING"
+                }
+            }
+        },
+        {
+            "namespace": "job-operator",
+            "id": "wsjob-gkwbgaxkwje6nprspek3u7",
+            "workflow_id": "wflow-gpi7l3ih2fexlf3wmzgxr4h3cy",
+            "log_path": "/n1/wsjob/workdir/job-operator/wsjob-gkwbgaxkwje6nprspek3u7",
+            "start_time": "2026-07-29T13:17:37Z",
+            "scheduled_time": "2026-07-29T13:17:57Z",
+            "software_versions": {
+                "appliance-client": "2.10.0",
+                "cbcore": "2.10.0-202602281136-11-32008fd8",
+                "cluster-server": "3.2.1-202605191112-863-addb76f2+addb76f210",
+                "job-operator": "3.2.1-202605191112-863-addb76f2+addb76f210"
+            },
+            "systems": [
+                "cer-anl-wse002-cs-sy01"
+            ],
+            "system_versions": {
+                "cer-anl-wse002-cs-sy01": {
                     "execmode": "WEIGHT_STREAMING"
                 }
             }
