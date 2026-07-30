@@ -42,7 +42,6 @@ GRIDLINE = "#e1e0d9"
 BASELINE = "#c3c2b7"
 SURFACE = "#fcfcfb"
 BLUE = "#2a78d6"
-ORANGE = "#eb6834"
 
 
 def read_mtx(path):
@@ -68,14 +67,14 @@ def sequential_ramp(base_hex, n):
       "blue_seq", [tuple(base * (1 - f) + white * f) for f in fracs])
 
 
-def plot_sparsity(n_raw, rows_raw, cols_raw, n_bal, rows_bal, cols_bal, grid, out_path):
-  fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
+def plot_sparsity(n_raw, rows_raw, cols_raw, n_bal, rows_bal, cols_bal, out_path):
+  fig, axes = plt.subplots(1, 2, figsize=(11, 5.5), gridspec_kw={"wspace": 0.06})
   panels = [
-      (axes[0], "Before -- original RMAT vertex order", rows_raw, cols_raw, n_raw, False),
-      (axes[1], "After -- balanced, identity-preserving permutation", rows_bal, cols_bal, n_bal, True),
+      (axes[0], "Original", rows_raw, cols_raw, n_raw, True),
+      (axes[1], "Balanced", rows_bal, cols_bal, n_bal, False),
   ]
-  for ax, title, rows, cols, n, draw_grid in panels:
-    ax.scatter(cols, rows, s=0.6, c=BLUE, marker="s", linewidths=0, rasterized=True)
+  for ax, title, rows, cols, n, show_ylabel in panels:
+    ax.scatter(cols, rows, s=0.6, c=BLUE, marker="s", linewidths=0, rasterized=False)
     ax.set_xlim(0, n)
     ax.set_ylim(n, 0)
     ax.set_aspect("equal")
@@ -84,19 +83,25 @@ def plot_sparsity(n_raw, rows_raw, cols_raw, n_bal, rows_bal, cols_bal, grid, ou
     for spine in ax.spines.values():
       spine.set_color(BASELINE)
     ax.tick_params(colors=TEXT_MUTED, labelsize=8)
-    if draw_grid:
-      step = n / grid
-      for g in range(1, grid):
-        ax.axhline(g * step, color=ORANGE, linewidth=0.7, alpha=0.7)
-        ax.axvline(g * step, color=ORANGE, linewidth=0.7, alpha=0.7)
+    ax.set_xlabel("vertex index (column)", color=TEXT_PRIMARY, fontsize=9)
+    if show_ylabel:
+      ax.set_ylabel("vertex index (row)", color=TEXT_PRIMARY, fontsize=9)
+    else:
+      # Same 0..n range as the left panel (shared axis convention) -- the
+      # tick numbers (and the ticks themselves) would just duplicate what's
+      # already readable there.
+      ax.tick_params(left=False, labelleft=False)
 
-  fig.suptitle(f"Same {len(rows_raw):,} nonzeros, before vs. after balancing "
-               f"({grid}x{grid} PE grid)", color=TEXT_PRIMARY, fontsize=12)
+  fig.suptitle("Non-Zero Elements Layout across PE Grid", color=TEXT_PRIMARY, fontsize=12)
   fig.patch.set_facecolor(SURFACE)
-  # scatter layers are rasterized (set above) so the SVG stays small even at
-  # 20k+ points; axes/text/gridlines remain real vector elements.
+  # scatter layers are real vector paths now (rasterized=False above), not
+  # embedded bitmaps -- the SVG is bigger at 20k+ points, but every mark
+  # stays editable/recolorable downstream instead of being a dead pixel blob.
   fig.savefig(out_path, dpi=220, bbox_inches="tight")
   print(f"wrote {out_path}")
+  png_path = os.path.splitext(out_path)[0] + ".png"
+  fig.savefig(png_path, dpi=220, bbox_inches="tight")
+  print(f"wrote {png_path}")
 
 
 def block_counts(rows, cols, n, grid):
@@ -111,41 +116,61 @@ def block_counts(rows, cols, n, grid):
 def plot_nnz_per_pe(blocks_before, blocks_after, out_path):
   vmax = max(blocks_before.max(), blocks_after.max())
   cmap = sequential_ramp(BLUE, 256)
-  fig, axes = plt.subplots(1, 2, figsize=(10, 4.6))
+  fig, axes = plt.subplots(1, 2, figsize=(11, 5.5), gridspec_kw={"wspace": 0.06})
   panels = [
-      (axes[0], "Before (naive grid chop)", blocks_before),
-      (axes[1], "After (balanced)", blocks_after),
+      (axes[0], "Original", blocks_before, True),
+      (axes[1], "Balanced", blocks_after, False),
   ]
   im = None
-  for ax, title, blocks in panels:
-    im = ax.imshow(blocks, cmap=cmap, vmin=0, vmax=vmax, origin="upper")
+  for ax, title, blocks, show_yticklabels in panels:
     grid = blocks.shape[0]
+    # pcolormesh instead of imshow, rasterized=False -- imshow always embeds
+    # a bitmap in SVG output with no vector option; pcolormesh draws each
+    # cell as a real vector quad. Edges offset by -0.5 so cell i's center
+    # lands on integer i, matching imshow's own pixel-center convention (and
+    # this function's existing tick/text placement at integer coordinates).
+    edges = np.arange(grid + 1) - 0.5
+    im = ax.pcolormesh(edges, edges, blocks, cmap=cmap, vmin=0, vmax=vmax, rasterized=False)
+    ax.set_xlim(-0.5, grid - 0.5)
+    ax.set_ylim(grid - 0.5, -0.5)  # inverted to match imshow's origin="upper"
+    ax.set_aspect("equal")
     for i in range(grid):
       for j in range(grid):
         v = blocks[i, j]
         color = "white" if v > vmax * 0.6 else TEXT_PRIMARY
         ax.text(j, i, f"{v}", ha="center", va="center", fontsize=8, color=color)
-        if i == j:
-          ax.add_patch(plt.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False,
-                                      edgecolor=ORANGE, linewidth=1.6))
     ax.set_xticks(range(grid))
     ax.set_yticks(range(grid))
     ax.set_xticklabels(range(grid), fontsize=7, color=TEXT_MUTED)
-    ax.set_yticklabels(range(grid), fontsize=7, color=TEXT_MUTED)
+    ax.set_xlabel("PE column", color=TEXT_PRIMARY, fontsize=9)
+    if show_yticklabels:
+      ax.set_yticklabels(range(grid), fontsize=7, color=TEXT_MUTED)
+      ax.set_ylabel("PE row", color=TEXT_PRIMARY, fontsize=9)
+    else:
+      # Same 0..grid-1 PE-row range as the left panel (shared axis
+      # convention) -- the tick numbers (and the ticks themselves) would
+      # just duplicate it.
+      ax.tick_params(left=False, labelleft=False)
     ax.set_title(title, color=TEXT_PRIMARY, fontsize=11)
     ax.set_facecolor(SURFACE)
     for spine in ax.spines.values():
       spine.set_visible(False)
 
   cbar = fig.colorbar(im, ax=axes, fraction=0.025, pad=0.03)
-  cbar.set_label("nnz per PE", color=TEXT_PRIMARY)
+  cbar.set_label("Non-Zero Elements per PE", color=TEXT_PRIMARY)
   cbar.ax.tick_params(colors=TEXT_MUTED)
+  # Colorbar.solids defaults to rasterized=True regardless of the mappable's
+  # own type -- force it vector too, so the SVG has no embedded bitmaps left.
+  cbar.solids.set_rasterized(False)
 
-  fig.suptitle("Nonzeros per PE block: naive chop vs. balanced "
-               "(orange = block-diagonal, px == py)", color=TEXT_PRIMARY, fontsize=12)
+  fig.suptitle("Non-Zero Elements Distribution across PE grid",
+               color=TEXT_PRIMARY, fontsize=12)
   fig.patch.set_facecolor(SURFACE)
   fig.savefig(out_path, dpi=220, bbox_inches="tight")
   print(f"wrote {out_path}")
+  png_path = os.path.splitext(out_path)[0] + ".png"
+  fig.savefig(png_path, dpi=220, bbox_inches="tight")
+  print(f"wrote {png_path}")
   print(f"before: min={blocks_before.min()} max={blocks_before.max()} "
         f"(ratio {blocks_before.max() / max(1, blocks_before.min()):.1f}x)")
   print(f"after:  min={blocks_after.min()} max={blocks_after.max()} "
@@ -165,7 +190,7 @@ def main():
   n_bal, _, rows_bal, cols_bal = read_mtx(args.balanced)
 
   os.makedirs(args.outdir, exist_ok=True)
-  plot_sparsity(n_raw, rows_raw, cols_raw, n_bal, rows_bal, cols_bal, args.grid,
+  plot_sparsity(n_raw, rows_raw, cols_raw, n_bal, rows_bal, cols_bal,
                 os.path.join(args.outdir, "sparsity_before_after.svg"))
 
   blocks_before = block_counts(rows_raw, cols_raw, n_raw, args.grid)

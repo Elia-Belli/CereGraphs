@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 #
 # Downloads real-world SNAP graph datasets (web-BerkStan, com-orkut,
-# soc-pokec, wiki-topcats, soc-LiveJournal1) into data/snap/ as raw
-# .txt.gz edge lists -- unlike gen_rmat.py's synthetic graphs, these are
-# fetched, not generated. Immediately usable via --infile_mtx as-is: no MTX
-# conversion needed, bool_diag_spmv/graph_loader.py's edge-list support
-# reads a SNAP .txt.gz file directly.
+# soc-pokec, wiki-topcats, soc-LiveJournal1, as-Skitter, cit-Patents) into
+# data/snap/ as raw .txt.gz edge lists -- unlike gen_rmat.py's synthetic
+# graphs, these are fetched, not generated. Immediately usable via
+# --infile_mtx as-is: no MTX conversion needed, bool_diag_spmv/graph_loader.py's
+# edge-list support reads a SNAP .txt.gz file directly.
 #
 # Usage: benchmarks/download_snap_graphs.sh [name ...]
-#   No args: downloads all five datasets below. Otherwise downloads only the
+#   No args: downloads all seven datasets below. Otherwise downloads only the
 #   named subset (e.g. `download_snap_graphs.sh berkstan` to skip waiting on
 #   orkut/livejournal's much larger downloads).
 #
-# NOTE: all five URLs (including orkut's SNAP_URL_OVERRIDE path) were
-# independently verified against snap.stanford.edu on 2026-07-28 from
-# cer-usn-01 -- if a fetch 404s again later, check https://snap.stanford.edu/
-# data/ and fix the matching entry in SNAP_FILES/SNAP_URL_OVERRIDE below.
+# NOTE: the original five URLs (including orkut's SNAP_URL_OVERRIDE path)
+# were independently verified against snap.stanford.edu on 2026-07-28 from
+# cer-usn-01; skitter/patents were verified (200 OK) on 2026-07-29 -- if a
+# fetch 404s again later, check https://snap.stanford.edu/data/ and fix the
+# matching entry in SNAP_FILES/SNAP_URL_OVERRIDE below.
 
 set -e
 
@@ -27,6 +28,8 @@ declare -A SNAP_FILES=(
   [pokec]="soc-pokec-relationships.txt.gz"
   [topcats]="wiki-topcats.txt.gz"
   [livejournal]="soc-LiveJournal1.txt.gz"
+  [skitter]="as-skitter.txt.gz"
+  [patents]="cit-Patents.txt.gz"
 )
 
 # Per-dataset URL override for entries that don't live directly under
@@ -39,7 +42,7 @@ declare -A SNAP_URL_OVERRIDE=(
 
 names=("$@")
 if [ ${#names[@]} -eq 0 ]; then
-  names=(berkstan orkut pokec topcats livejournal)
+  names=(berkstan orkut pokec topcats livejournal skitter patents)
 fi
 
 mkdir -p data/snap

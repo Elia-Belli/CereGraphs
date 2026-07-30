@@ -34,7 +34,13 @@ export NO_PROXY="$no_proxy"
 
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
 
-NAMES=(berkstan pokec topcats orkut livejournal)
+# Optional name args (matches download_snap_graphs.sh/prep_snap_v3.sh's own
+# convention) -- e.g. `run_snap_sweep.sh skitter patents` to run just the
+# new two without re-running the other five.
+NAMES=("$@")
+if [ ${#NAMES[@]} -eq 0 ]; then
+  NAMES=(berkstan pokec topcats orkut livejournal skitter patents)
+fi
 
 log "=== run_snap_sweep starting: ${NAMES[*]} @ ${GRID}x${GRID} ==="
 
