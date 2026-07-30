@@ -39,6 +39,12 @@ BLUE = "#2a78d6"  # same accent used for "RMAT" throughout this repo's plots
 ORANGE = "#eb6834"  # communication-bound pole of the comm/compute diverging panel
 AQUA = "#1baf7a"  # compute-bound pole of the comm/compute diverging panel
 NEUTRAL_MID = "#f0efec"  # this repo's documented diverging-pair midpoint
+# best-per-row cell callout -- a single dark violet, distinct from every hue
+# used in either panel's own colormap (blue, orange, aqua, gray). Dark enough
+# to stay legible against both the darkest cells (base BLUE/ORANGE) and the
+# lightest ones, so it doesn't need to switch shade per cell like the
+# ordinary (non-highlighted) cell text below does.
+BEST_HIGHLIGHT = "#5b2a86"
 
 RMAT_RE = re.compile(r"^rmat_s(\d+)_e16\.balanced(\d+)x(\d+)\.mtx$")
 
@@ -220,7 +226,7 @@ def main():
       # (matrix-fill function, label, cmap, vmin, vmax, cell text formatter,
       #  colorbar label, log-scale color+values)
       (gteps_excl_parent_resolve,
-       "GTEPS (excl. host transfer + parent resolve, log scale)", gteps_cmap, None, None,
+       "GTEPS (excl. host transfer + parent resolve)", gteps_cmap, None, None,
        lambda v, _vmax: f"{v:.2g}", "GTEPS (log)", True),
       (pct_communication,
        "% time in communication (vs. compute)", comm_cmap, 0, 100,
@@ -259,16 +265,29 @@ def main():
       im = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=panel_vmax, aspect="auto", origin="lower")
 
     # Hatch every missing cell so "not run / failed" is never confused with
-    # a real, low value.
+    # a real, low value. The best-GTEPS PE grid for each RMAT scale (picked
+    # once from the GTEPS panel, see best_j_per_row above) is called out on
+    # BOTH panels as bold, underlined text in the violet BEST_HIGHLIGHT
+    # shades, so it reads at a glance instead of requiring the reader to
+    # spot a thin box outline.
     for i in range(len(scales)):
       for j in range(len(grids)):
         if np.isnan(grid_mat[i, j]):
           ax.add_patch(plt.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False,
                                       hatch="////", edgecolor=BASELINE, linewidth=0))
+          continue
+        is_best = best_j_per_row[i] == j
+        cell_label = fmt(grid_mat[i, j], panel_vmax)
+        if is_best:
+          color = BEST_HIGHLIGHT
         else:
-          ax.text(j, i, fmt(grid_mat[i, j], panel_vmax), ha="center", va="center",
-                   fontsize=7,
-                   color=TEXT_PRIMARY if contrast_fn(grid_mat[i, j]) < 0.6 else "white")
+          color = "white" if contrast_fn(grid_mat[i, j]) >= 0.6 else TEXT_PRIMARY
+        ax.text(j, i, cell_label, ha="center", va="center", fontsize=7,
+                fontweight="bold" if is_best else "normal", color=color, zorder=7)
+        if is_best:
+          half_width = min(0.42, 0.09 + 0.09 * len(cell_label))
+          ax.plot([j - half_width, j + half_width], [i - 0.19, i - 0.19],
+                  color=color, linewidth=1.4, solid_capstyle="butt", zorder=7)
 
     # Dark staircase border between the run region and the never-run (OOM)
     # region -- every missing cell here is a small-grid/large-scale
@@ -298,21 +317,18 @@ def main():
       ax.text(nan_j.mean(), nan_i.mean(), "OOM", ha="center", va="center",
               fontsize=15, fontweight="bold", color=TEXT_MUTED, zorder=4)
 
-    # Outline each row's best-GTEPS cell (the PE grid size that gets the most
-    # GTEPS at that RMAT scale) on BOTH panels, so the % communication panel
-    # shows what that same choice costs in communication share.
-    for i, j_best in enumerate(best_j_per_row):
-      if j_best is not None:
-        ax.add_patch(plt.Rectangle((j_best - 0.5, i - 0.5), 1, 1, fill=False,
-                                    edgecolor=TEXT_PRIMARY, linewidth=1.0, zorder=5))
-
     ax.set_xticks(range(len(grids)))
     ax.set_xticklabels([f"{g}x{g}" for g in grids], rotation=45, ha="right", fontsize=8,
                         color=TEXT_MUTED)
     ax.set_yticks(range(len(scales)))
-    ax.set_yticklabels([f"s{s}" for s in scales], fontsize=8, color=TEXT_MUTED)
+    if ax is axes[0]:
+      ax.set_yticklabels([f"s{s}" for s in scales], fontsize=8, color=TEXT_MUTED)
+    else:
+      # Same RMAT-scale rows as the left panel (shared y-axis convention) --
+      # the tick labels (and the ticks themselves) would just duplicate it.
+      ax.tick_params(left=False, labelleft=False)
     ax.set_xlabel("PE grid", color=TEXT_PRIMARY)
-    ax.set_title(label, color=TEXT_PRIMARY, fontsize=11)
+    ax.set_title(label, color=TEXT_PRIMARY, fontsize=13)
     ax.set_facecolor(SURFACE)
     for spine in ax.spines.values():
       spine.set_visible(False)
@@ -323,9 +339,8 @@ def main():
 
   axes[0].set_ylabel("RMAT scale", color=TEXT_PRIMARY)
 
-  fig.suptitle("RMAT: GTEPS and communication share across scale x PE-grid-size "
-               "(hatched = not run / failed)",
-               color=TEXT_PRIMARY, fontsize=12)
+  fig.suptitle("Performance and Communication share across Scales and PE Grids",
+               color=TEXT_PRIMARY, fontsize=14)
   fig.patch.set_facecolor(SURFACE)
 
   os.makedirs(os.path.dirname(args.out), exist_ok=True)
