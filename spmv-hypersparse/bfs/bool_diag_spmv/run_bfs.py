@@ -18,7 +18,7 @@
      intentionally kept as its own separate script, not folded in here.
   3. **timing** (default on, --notimings to skip): per-round phase cycle
      counts (bfs_timing.py/record_ts()), h2d/d2h transfer cycles, and a
-     Graph500-style GTEPS estimate (see GRAPH500_BENCHMARK.md) -- appended
+     Graph500-style GTEPS estimate (see docs/GRAPH500_BENCHMARK.md) -- appended
      as one row to bfs_timing.csv, plus the per-round stacked-bar plot
      (plot_bfs_timing.py, h2d/rounds/d2h/local_compute-split panels side by
      side in one PNG) saved to plots/timing/.
@@ -59,9 +59,9 @@ from scipy.sparse.csgraph import breadth_first_order
 # sibling directory now, not this same one.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots"))
 import plot_bfs_timing
-from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, compute_skew_adjusted,
-                         decode_pe_phase_cycles, decode_phase_row, read_tic_toc_delta,
-                         save_pe_phase_cycles)
+from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, check_round_vs_total_communication,
+                         compute_m_and_gteps, decode_pe_phase_cycles, decode_phase_row,
+                         read_tic_toc_delta, save_pe_phase_cycles)
 from bfs_tree_plot import build_digraph, invalid_parents, render_tree_comparison
 from device_io import (csl_compile_core, derive_visited_from_parent,
                         extract_parent_result, hwl_to_oned_colmajor, memcpy_h2d_chunked,
@@ -194,7 +194,7 @@ def main():
   is_symmetric = None
   if need_timing:
     # Graph500's own m formula (the undirected dedup rule, see
-    # GRAPH500_BENCHMARK.md section 4) only makes sense for a symmetrized
+    # docs/GRAPH500_BENCHMARK.md section 4) only makes sense for a symmetrized
     # graph -- true for gen_rmat.py's output but NOT guaranteed for an
     # arbitrary --infile_mtx. The BFS kernel itself has no such requirement
     # (correct on any square boolean matrix, directed or not) -- only
@@ -206,7 +206,7 @@ def main():
             "style) -- using the directed edges-traversed formula instead of Graph500's own "
             "undirected dedup rule; not directly comparable to a Graph500-spec TEPS number, but "
             "still a real, meaningful edges-traversed count for this graph. See "
-            "GRAPH500_BENCHMARK.md section 4. ]]")
+            "docs/GRAPH500_BENCHMARK.md section 4. ]]")
 
   A_csc = A_csr.tocsc(copy=True)
   A_csc = A_csc.sorted_indices()
@@ -369,7 +369,7 @@ def main():
 
   if need_timing:
     # Graph500's own output is exactly the predecessor/parent array (see
-    # GRAPH500_BENCHMARK.md section 1 -- the reference implementation's
+    # docs/GRAPH500_BENCHMARK.md section 1 -- the reference implementation's
     # run_bfs(root, pred) signature) -- no separate "visited" readback is
     # part of the spec, and derive_visited_from_parent() below recovers it
     # from parent_local_buf alone, so only that one transfer needs to be
@@ -382,7 +382,7 @@ def main():
   # PE-column 0 (see term_col_bcast_done()'s reduce_select_any call), so
   # only that one narrow column needs to leave the device -- the fix for
   # the real d2h gRPC ~2GiB message-size ceiling (see project memory /
-  # GRAPH500_BENCHMARK.md). width=1 here, not width -- do not widen this
+  # docs/GRAPH500_BENCHMARK.md). width=1 here, not width -- do not widen this
   # back out, that's the whole point.
   parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
   runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, 1, height, blk,
@@ -555,7 +555,8 @@ def main():
       print(f"  {name:>18s}: min={int(cycles.min())} max={int(cycles.max())} "
             f"avg={cycles.mean():.1f}")
 
-    row_cols, device_time_cycles, profiled_rounds = decode_phase_row(
+    (row_cols, device_time_cycles, profiled_rounds, round_duration_cycles,
+     local_compute_max_cycles, local_term_cond_max_cycles) = decode_phase_row(
         ts_hwl_u32, height, width, max_rounds, rounds_completed, round_trip_cycles)
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
     row.update(row_cols)
@@ -594,23 +595,15 @@ def main():
              else "  (0 -- switch never fired)"))
 
     if args.dump_pe_timing:
-      phase_cycles, raw_slots, _ = decode_pe_phase_cycles(ts_hwl_u32, height, width, max_rounds,
-                                                           rounds_completed)
-      # skew-adjusted per-phase wait/adjusted grids + the honest end-to-end
-      # relay_critical_path_cycles scalar (see bfs_timing.compute_skew_adjusted's
-      # own docstring / GRAPH500_BENCHMARK.md section 10) -- folded straight
-      # into phase_cycles since save_pe_phase_cycles just splats **phase_cycles
-      # into the npz regardless of which keys are in it.
-      skew = compute_skew_adjusted(phase_cycles, raw_slots, height, width)
-      print(f"  relay_critical_path_cycles (real relay span, skew excluded): "
-            f"{skew['relay_critical_path_cycles'].tolist()}")
-      phase_cycles.update(skew)
-      # also keep the raw absolute per-slot timestamps (prefixed to avoid
-      # colliding with phase/skew names) -- otherwise a future change to
-      # compute_skew_adjusted's own methodology can only be re-verified by
-      # re-running the device, since decode_pe_phase_cycles() normally
-      # discards these after computing phase diffs.
-      phase_cycles.update({f"raw_{name}": grid for name, grid in raw_slots.items()})
+      phase_cycles, round_start, round_end, _ = decode_pe_phase_cycles(
+          ts_hwl_u32, height, width, max_rounds, rounds_completed)
+      # Raw per-PE local_compute/local_term_cond grids, plus the two raw
+      # round-boundary grids (round_start/round_end) round_time is built
+      # from -- everything decode_pe_phase_cycles can still produce now
+      # that the per-communication-phase skew-adjustment machinery (which
+      # used to also live here) has been removed as unreliable (see
+      # docs/GRAPH500_BENCHMARK.md).
+      phase_cycles.update({"raw_round_start": round_start, "raw_round_end": round_end})
 
       matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
       run_id = f"{matrix_stem}_{np_cols}x{np_rows}_src{source}"
@@ -639,20 +632,20 @@ def main():
       })
       print(f"saved per-PE timing grid to {pe_timing_out}")
 
-    # transpose_structure()'s one-time cost and mpi_x.reduce_select_any()'s
-    # one-time end-of-run cost (straggler-PE max, matching the convention
-    # every other cycle count here uses) are folded in explicitly -- none
-    # of decode_phase_row's phase windows span either gap (see each's own
-    # readback comment above), so device_time_cycles would otherwise
-    # silently exclude both from search_time_cycles and GTEPS, overstating
-    # the kernel's speed by exactly those costs.
-    device_time_cycles_with_extras = (device_time_cycles + int(transpose_cycles.max())
-                                       + int(parent_resolve_cycles.max()))
-    search_time_cycles = (int(h2d_seed_cycles.max()) + device_time_cycles_with_extras
+    # device_time_cycles (from decode_phase_row) is now total_runtime_cycles:
+    # the whole-run round_trip_start_buffer -> round_trip_done_buffer span,
+    # which already includes transpose_structure()'s cost (it runs inside
+    # that same span) and already EXCLUDES parent_resolve (round_trip_done_
+    # buffer is captured before parent_resolve starts -- see bool_pe.csl).
+    # So the on-device total INCLUDING parent_resolve just needs it added
+    # back in; the full search_time_cycles then adds the host transfer
+    # brackets on top.
+    search_time_cycles_no_transfer = device_time_cycles + int(parent_resolve_cycles.max())
+    search_time_cycles = (int(h2d_seed_cycles.max()) + search_time_cycles_no_transfer
                            + int(d2h_cycles.max()))
     row["search_time_cycles"] = search_time_cycles
-    print(f"[[ search_time_cycles (h2d_seed + device rounds [incl. transpose] + d2h parent "
-          f"readback, GRAPH500_BENCHMARK.md section 3): {search_time_cycles} ]]")
+    print(f"[[ search_time_cycles (h2d_seed + device rounds [incl. transpose, parent_resolve] "
+          f"+ d2h parent readback, docs/GRAPH500_BENCHMARK.md section 3): {search_time_cycles} ]]")
 
     coo = A_csr.tocoo()
     m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(
@@ -672,37 +665,38 @@ def main():
                                       "GTEPS, see m_convention"))
 
     # search_time_cycles minus the two host-transfer brackets (h2d_seed,
-    # d2h) -- isolates on-device round work from host<->device transfer
-    # overhead, since those transfers can otherwise dominate search_time_cycles
-    # for small/fast graphs. Same quantity decode_phase_row already computed
-    # as device_time_cycles; just also logged as its own trailing CSV column.
-    row["search_time_cycles_no_transfer"] = device_time_cycles_with_extras
+    # d2h) -- isolates on-device work (rounds + transpose + parent_resolve)
+    # from host<->device transfer overhead, since those transfers can
+    # otherwise dominate search_time_cycles for small/fast graphs.
+    row["search_time_cycles_no_transfer"] = search_time_cycles_no_transfer
     _, _, search_time_seconds_no_transfer, gteps_no_transfer = compute_m_and_gteps(
-        coo, device_visited, is_symmetric, device_time_cycles_with_extras)
+        coo, device_visited, is_symmetric, search_time_cycles_no_transfer)
     row["gteps_no_transfer"] = gteps_no_transfer
     print(f"[[ GTEPS w/o h2d_seed/d2h = {m} edges ({m_convention}) / "
           f"{search_time_seconds_no_transfer * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
           f"{gteps_no_transfer:.6f} GTEPS ]]")
 
-    # Console-only, NOT a new CSV column: parent_resolve (mpi_x.reduce_
-    # select_any()'s one-time end-of-run reduce) is real on-device work, but
-    # a single end-of-run step rather than per-round communication, and its
-    # share of device_time_cycles_with_extras above grows from a small
-    # fraction at small scale/grid to the large majority at large scale/grid
-    # -- print the further-excluded figure too so a live run's own terminal
-    # output isn't misleadingly dominated by it. search_time_cycles_no_transfer/
-    # gteps_no_transfer themselves are left as originally defined (host
-    # h2d_seed/d2h excluded only) since bfs_timing.csv is an append-only log
-    # with no schema-version marker -- redefining that column's meaning here
-    # would silently make historical and future rows mean different things
-    # under the same name.
-    device_time_cycles_excl_parent_resolve = (device_time_cycles_with_extras
-                                               - int(parent_resolve_cycles.max()))
+    # Console-only, NOT a CSV column: device_time_cycles itself already
+    # excludes parent_resolve (mpi_x.reduce_select_any()'s one-time
+    # end-of-run reduce, real on-device work but a single end-of-run step
+    # rather than per-round communication, whose share of on-device time
+    # grows from a small fraction at small scale/grid to the large majority
+    # at large scale/grid) -- print the further-excluded figure too so a
+    # live run's own terminal output isn't misleadingly dominated by it.
     _, _, search_time_seconds_excl_resolve, gteps_excl_resolve = compute_m_and_gteps(
-        coo, device_visited, is_symmetric, device_time_cycles_excl_parent_resolve)
+        coo, device_visited, is_symmetric, device_time_cycles)
     print(f"[[ GTEPS w/o h2d_seed/d2h/parent_resolve = {m} edges ({m_convention}) / "
           f"{search_time_seconds_excl_resolve * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
           f"{gteps_excl_resolve:.6f} GTEPS ]]")
+
+    # Consistency check (see check_round_vs_total_communication's own
+    # docstring): sum(round_time - round_compute) across rounds should be
+    # close to device_time - total_compute (compute = local_compute +
+    # local_term_cond, summed over rounds, + transpose) -- a large mismatch
+    # is a real signal, not just normal per-round straggler variance.
+    check_round_vs_total_communication(
+        round_duration_cycles, local_compute_max_cycles, local_term_cond_max_cycles,
+        device_time_cycles, transpose_cycles.max())
 
     csv_path = args.csv
     if csv_path is None:

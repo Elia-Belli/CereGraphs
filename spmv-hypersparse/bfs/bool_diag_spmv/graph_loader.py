@@ -83,7 +83,7 @@ def _load_edgelist(path):
   # the standard "vertices reachable via out-edges from source" semantics a
   # directed BFS is expected to have. Verified against real SNAP ground
   # truth (berkstan vertex 546279: forward reaches 459,847, reverse reaches
-  # 18; pre-fix, sourcing from 546279 gave 18 -- see ERRORS.md). Irrelevant
+  # 18; pre-fix, sourcing from 546279 gave 18 -- see docs/ERRORS.md). Irrelevant
   # for RMAT (self-symmetric, doesn't use this loader) and for orkut
   # (symmetrize() is its own transpose-symmetric fixed point, A+A^T ==
   # A^T+A, so this swap is a no-op there either way).

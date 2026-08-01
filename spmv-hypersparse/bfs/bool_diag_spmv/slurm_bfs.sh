@@ -34,7 +34,7 @@ fi
 
 # 1) Generate the scaleX/edgefactor16/seed0 R-MAT graph
 if [ ! -f "$MTX" ]; then
-  cs_python benchmarks/gen_rmat.py ${SCALE} 16 0 "$MTX"
+  cs_python datasets/gen_rmat.py ${SCALE} 16 0 "$MTX"
 fi
 
 # 2) Load-balance it for a GxG PE grid via util/analyze

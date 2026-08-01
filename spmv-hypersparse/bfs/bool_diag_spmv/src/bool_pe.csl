@@ -186,75 +186,31 @@ var transpose_toc_buffer = @zeros([timestamp.tsc_size_words]u16);
 var parent_resolve_tic_buffer = @zeros([timestamp.tsc_size_words]u16);
 var parent_resolve_toc_buffer = @zeros([timestamp.tsc_size_words]u16);
 
-// Per-round, per-phase timing (f_spmv_iter only -- see record_ts() below).
-// One raw hardware timestamp is captured at each of these round-boundary
-// points; host-side (bfs_timing.py, used by run_bfs.py) subtracts
-// consecutive pairs (as 48-bit values, cerebras.sdk.sdk_utils.make_u48) to
-// get each phase's elapsed cycles, and MID-1/MID-2 vs. the rest gives
-// min/max/avg across
-// PEs once every PE's copy is read back. Two consecutive slots delimit one
-// phase; where a task immediately re-issues the next collective with no
-// other work in between, its entry timestamp doubles as both the previous
-// phase's end and the next phase's start (see the call sites below):
-//   0 TS_VBCAST_ISSUE        -- before mpi_x.broadcast(visited_bitmap)
-//   1 TS_VBCAST_DONE         -- entry of visited_bcast_done() (visited
-//                                bcast end / vertical x_bitmap bcast start)
-//   2 TS_COMPUTE_ENTRY       -- entry of compute() (vertical bcast end /
-//                                local compute start)
-//   3 TS_COMPUTE_RESET_DONE  -- between compute()'s buffer resets (y_bitmap
-//                                and y_bitmap_reduced, both BITMAP_WORDS =
-//                                ceil(blk/32) words) and the actual compact
-//                                boolean multiply -- isolates the resets
-//                                from the sparse work itself (see
-//                                bfs_timing.py's local_compute_reset)
-//   4 TS_COMPUTE_EXPAND_ENTRY -- immediately after the compact boolean
-//                                multiply (sets bits in y_bitmap, one per
-//                                real local row hit; also inline-merges
-//                                parent_local_buf, see its own comment), at
-//                                the exact same point as TS_REDUCE_ISSUE
-//                                below -- reduce_or consumes y_bitmap
-//                                directly, so there's no expand step left
-//                                between them any more (there was, before
-//                                <collectives_2d> grew an OR-reduce);
-//                                local_compute_expand reads ~0 cycles from
-//                                here on, by design, not a bug. Kept (not
-//                                deleted) for CSV/schema continuity -- see
-//                                bfs_timing.py's local_compute_reset/
-//                                local_compute_compact/local_compute_expand
-//                                (a prior two-pass split experiment did use
-//                                this slot as a real Phase A/B boundary --
-//                                see compute()'s own comment for why it was
-//                                reverted)
-//   5 TS_REDUCE_ISSUE        -- before mpi_x.reduce_or in compute() (see
-//                                TS_COMPUTE_EXPAND_ENTRY just above)
-//   6 TS_REDUCE_DONE         -- entry of reduce_done() (reduce end / local
-//                                term-condition start)
-//   7 TS_RELAY_ISSUE         -- before mpi_y.broadcast(nz_local) in
-//                                reduce_done() (local term-cond end /
-//                                relay phase A start)
-//   8 TS_TERM_COL_DONE       -- entry of term_col_done() (relay phase A
-//                                [col-bcast, rooted at each column's own
-//                                diagonal -- was a col-reduce] end / phase
-//                                B start)
-//   9 TS_TERM_ROW_DONE       -- entry of term_row_done() (relay phase B
-//                                [row-reduce] end / phase C start)
-//   10 TS_TERM_ROW_BCAST_DONE -- entry of term_row_bcast_done() (relay
-//                                phase C [row-bcast] end / phase D start)
-//   11 TS_TERM_COL_BCAST_DONE -- entry of term_col_bcast_done() (relay
-//                                phase D [col-bcast] end / relay total end)
+// Per-round timing (f_spmv_iter only -- see record_ts() below). One raw
+// hardware timestamp is captured at each of these round-boundary points;
+// host-side (bfs_timing.py, used by run_bfs.py) subtracts consecutive
+// pairs (as 48-bit values, cerebras.sdk.sdk_utils.make_u48) to get
+// local_compute/local_term_cond's elapsed cycles (max across PEs once
+// every PE's copy is read back), and TS_VBCAST_ISSUE/TS_TERM_COL_BCAST_DONE
+// additionally bound the whole round (round_time, see compute_round_summary
+// in bfs_timing.py). This buffer used to also bracket the individual
+// communication phases (visited_bcast/vertical_bcast/reduce/relay) for a
+// skew-adjustment scheme that was found unreliable and removed (see
+// GRAPH500_BENCHMARK.md) -- only the two REAL local-work phases (compute,
+// term_cond) and the two round-boundary markers survive:
+//   0 TS_VBCAST_ISSUE        -- before mpi_x.broadcast(visited_bitmap); round start
+//   1 TS_COMPUTE_ENTRY       -- entry of compute(); local compute start
+//   2 TS_REDUCE_ISSUE        -- before mpi_x.reduce_or in compute(); local compute end
+//   3 TS_REDUCE_DONE         -- entry of reduce_done(); local term-cond start
+//   4 TS_RELAY_ISSUE         -- before mpi_y.broadcast(nz_local) in reduce_done(); local term-cond end
+//   5 TS_TERM_COL_BCAST_DONE -- entry of term_col_bcast_done(); round end
 const TS_VBCAST_ISSUE: u16 = 0;
-const TS_VBCAST_DONE: u16 = 1;
-const TS_COMPUTE_ENTRY: u16 = 2;
-const TS_COMPUTE_RESET_DONE: u16 = 3;
-const TS_COMPUTE_EXPAND_ENTRY: u16 = 4;
-const TS_REDUCE_ISSUE: u16 = 5;
-const TS_REDUCE_DONE: u16 = 6;
-const TS_RELAY_ISSUE: u16 = 7;
-const TS_TERM_COL_DONE: u16 = 8;
-const TS_TERM_ROW_DONE: u16 = 9;
-const TS_TERM_ROW_BCAST_DONE: u16 = 10;
-const TS_TERM_COL_BCAST_DONE: u16 = 11;
-const NUM_TS_SLOTS: u16 = 12;
+const TS_COMPUTE_ENTRY: u16 = 1;
+const TS_REDUCE_ISSUE: u16 = 2;
+const TS_REDUCE_DONE: u16 = 3;
+const TS_RELAY_ISSUE: u16 = 4;
+const TS_TERM_COL_BCAST_DONE: u16 = 5;
+const NUM_TS_SLOTS: u16 = 6;
 
 // flat [max_rounds][NUM_TS_SLOTS][3]u16, row-major (round slowest, then
 // slot, then the 3 raw timestamp words) -- see record_ts() for the index
@@ -672,9 +628,6 @@ fn start_spmv() void {
 }
 
 task visited_bcast_done() void {
-
-    record_ts(ts_round, TS_VBCAST_DONE);
-
     // Phase 2: broadcast x_bitmap down the column
     mpi_y.broadcast(pcol_id, &x_bitmap, BITMAP_WORDS, compute_task_id);
 }
@@ -886,10 +839,6 @@ task compute() void {
     @mov32(y_bitmap_dsd, fill_bitmap_u32);
     @mov32(y_bitmap_reduced_dsd, fill_bitmap_u32);
 
-    if (is_iterative) {
-        record_ts(ts_round, TS_COMPUTE_RESET_DONE);
-    }
-
     // Phase 3: dispatch to whichever traversal strategy this round is
     // using -- only the LOCAL computation differs (see the plan); the
     // reset above and the reduce below are shared, unmodified either way.
@@ -899,14 +848,7 @@ task compute() void {
         compute_topdown();
     }
 
-    // TS_COMPUTE_EXPAND_ENTRY is recorded at the same point as
-    // TS_REDUCE_ISSUE now -- there's no expand step left between them
-    // (reduce_or below consumes y_bitmap directly), so local_compute_expand
-    // reads ~0 cycles from here on. Kept (not deleted) for CSV/schema
-    // continuity with existing timing runs; this is the honest reflection
-    // of "this phase no longer does anything," not a bug.
     if (is_iterative) {
-        record_ts(ts_round, TS_COMPUTE_EXPAND_ENTRY);
         record_ts(ts_round, TS_REDUCE_ISSUE);
     }
 
@@ -995,8 +937,6 @@ task reduce_done() void {
 // blocks on its own fabric queue waiting for real data -- it doesn't
 // require the root to have already called broadcast() first.
 task term_col_done() void {
-
-    record_ts(ts_round, TS_TERM_COL_DONE);
     // column-bcast done: every row now holds this column's shared value in
     // its own nz_local (phase 6's broadcast overwrote it in place)
 
@@ -1006,25 +946,19 @@ task term_col_done() void {
                             1, term_row_done_task_id);
     } else {
         // Non-MID PEs skip to Phase 9:
-        record_ts(ts_round, TS_TERM_ROW_DONE);
-        record_ts(ts_round, TS_TERM_ROW_BCAST_DONE);
         mpi_y.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_col_bcast_done_task_id);
     }
 }
 
 
 task term_row_done() void {
-
-    record_ts(ts_round, TS_TERM_ROW_DONE);
     // row-reduce done: (MID, MID) now holds final termination condition.
-    
+
     // Phase 8: Flood it back out, row first...
     mpi_x.broadcast(MID, @ptrcast([*]u32, &nz_total), 1, term_row_bcast_done_task_id);
 }
 
 task term_row_bcast_done() void {
-
-    record_ts(ts_round, TS_TERM_ROW_BCAST_DONE);
     // row-bcast done: al PEs on MID row hold the termination condition
 
     // Phase 9: bcast term condition on every col (non-MID PEs are already waiting)

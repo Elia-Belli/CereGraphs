@@ -6,7 +6,7 @@ holds multiple **versions** of the SpMV kernel side by side — each is
 self-contained (its own CSL source, its own host driver, its own
 compile+run script) and independently comparable via the shared benchmark
 harness. Versions are grouped into `spmv/` (SpMV-only designs) and `bfs/`
-(BFS-capable designs); `data/`, `util/`, and `benchmarks/` are shared across
+(BFS-capable designs); `data/`, `util/`, and `datasets/` are shared across
 both groups.
 
 ## Layout
@@ -43,18 +43,16 @@ both groups.
   versions and benchmarks: the repo's original small test matrix
   (`rmat4.4x4.lb.mtx`) plus synthetic RMAT/GRAPH500-style and uniform-random
   matrices generated for benchmarking (regenerable — see
-  `benchmarks/gen_rmat.py`).
+  `datasets/gen_rmat.py`).
 - **`util/`** — `analyze.cpp`, a load-balancing tool: given a matrix and a
   PE grid shape, searches for a row/column permutation minimizing the
   variance of nonzeros per PE block. Version-agnostic (operates purely on
   the matrix file); build with the commands in its header comment.
-- **`benchmarks/`** — timing comparison scripts across versions
-  (`bench_orig_timing.py`, `bench_bool_timing.py`, shared helpers in
-  `bench_common.py`/`bench_log.py`), raw results (`bench_results.jsonl`),
-  and the write-up of everything measured so far (`bench_notes.md` —
-  load-balancing impact, sparsity sensitivity, grid-size sensitivity,
-  GRAPH500 rules-compliance research). Read `bench_notes.md` before assuming
-  either version's relative performance in an untested regime.
+- **`datasets/`** — matrix generation and acquisition only: `gen_rmat.py`
+  (synthetic RMAT/GRAPH500-style matrices), `download_snap_graphs.sh` +
+  `snap_to_mtx.py` + `prep_snap.sh` (real-world SNAP graphs, downloaded
+  and converted/balanced to Matrix Market). The old cross-version timing
+  comparison scripts and their raw results/plots were removed as outdated.
 
 ## Quick start
 
@@ -72,21 +70,13 @@ cd spmv/sdk-hypersparse-spmv && ./commands_wse2.sh    # or: cd bfs/bool_diag_spm
 (`bool_diag_spmv/` is WSE-2 only, unchanged by the WSE-3 work).
 
 The benchmark scripts do **not** self-relocate — invoke them from *this*
-repo root (not from inside `benchmarks/`), with matrix paths relative to
-this root too:
-
-```
-cs_python benchmarks/bench_orig_timing.py --infile_mtx=data/<matrix>.mtx --num_pe_cols=N --num_pe_rows=N --driver=cslc --arch=wse2
-cs_python benchmarks/bench_bool_timing.py --infile_mtx=data/<matrix>.mtx --num_pe_cols=N --num_pe_rows=N --driver=cslc --arch=wse2
-```
-
-(Run separately, not in the same process — the simulator can't be
-instantiated twice in one process.) Same rule for `benchmarks/gen_rmat.py`:
-run it as `cs_python benchmarks/gen_rmat.py <scale> <edgefactor> <seed>
-data/<out>.mtx` from this repo root, not from inside `benchmarks/`.
+repo root (not from inside `datasets/`), with matrix paths relative to
+this root too: run `datasets/gen_rmat.py` as `cs_python
+datasets/gen_rmat.py <scale> <edgefactor> <seed> data/<out>.mtx` from this
+repo root, not from inside `datasets/`.
 
 `util/analyze` is a plain native binary (not containerized), so it has no
-such restriction — see `benchmarks/bench_notes.md` for example invocations.
+such restriction — it can be run from anywhere with ordinary relative paths.
 
 ## Adding a future version
 
@@ -94,5 +84,5 @@ If/when a further-optimized or BFS-capable iteration is built, give it its
 own directory (`<name>/` with its own `src/`, host driver, and README,
 following the pattern above) under `spmv/` (SpMV-only) or `bfs/`
 (BFS-capable) as appropriate, rather than branching inside an existing
-version — that's what keeps the benchmark comparison in `benchmarks/`
+version — that's what keeps the benchmark comparison in `datasets/`
 meaningful across versions.

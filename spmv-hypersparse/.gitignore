@@ -1,4 +1,0 @@
-# operational run/debug logs -- can grow unbounded (100s of MB) from
-# long-running sweeps; never meant to be versioned
-*.log
-*.nohup.out

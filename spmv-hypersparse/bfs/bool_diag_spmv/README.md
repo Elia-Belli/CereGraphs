@@ -75,7 +75,7 @@ what's genuinely done versus what's still a stub.
   plot (`--notimings` to skip, which also skips the tsc instrumentation
   itself and its real transfer-time cost). See "`run_bfs.py` vs. the two
   test scripts" below for why this is a separate thing from
-  `run_host_driven_bfs.py`, and `GRAPH500_BENCHMARK.md` for the GTEPS
+  `run_host_driven_bfs.py`, and `docs/GRAPH500_BENCHMARK.md` for the GTEPS
   methodology. `--dump-pe-timing` (off by default) additionally saves the
   full per-PE-per-round-per-phase cycle grid to a `.npz` file, inside
   `plots/heatmap/<matrix>_<grid>_src<N>/` -- the same per-run folder
@@ -112,7 +112,7 @@ what's genuinely done versus what's still a stub.
   are outlined and the relay's aggregation point (`(MID, MID)`) is
   starred; `--cmap` picks any matplotlib colormap (default `magma`).
   Standalone only -- never touches the device, purely a re-plot of
-  already-saved data. See `GRAPH500_BENCHMARK.md` section 8 for what this
+  already-saved data. See `docs/GRAPH500_BENCHMARK.md` section 8 for what this
   revealed about the termination relay's cost.
 - `run_graph500.py` — the full Graph500-shaped benchmark: one compile, one
   matrix upload (timed once as construction, excluded from every search),
@@ -126,7 +126,7 @@ what's genuinely done versus what's still a stub.
   `visited_buf`/`rounds_completed`/`parent_local_buf`/`ts_round` on every
   fresh `f_spmv_iter()` call, so no other host-side reset is needed. Per-
   search scipy correctness checking is on by default (`--nocorrectness` to
-  skip). See `GRAPH500_BENCHMARK.md` for the full methodology and current
+  skip). See `docs/GRAPH500_BENCHMARK.md` for the full methodology and current
   status.
 - `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test on
   `../../data/rmat4.4x4.lb.mtx` at a 4x4 grid, for WSE-2 and WSE-3 respectively.
@@ -137,7 +137,7 @@ what's genuinely done versus what's still a stub.
   `run_host_driven_bfs.py` instead of `run_single_spmv.py`.
 - `commands_wse3_graph500.sh` — same compile as `commands_wse3.sh`, but runs
   `run_graph500.py` (16 searches over the same tiny 4x4 fixture, kept small
-  purely so this stays a fast smoke test — see `GRAPH500_BENCHMARK.md` for a
+  purely so this stays a fast smoke test — see `docs/GRAPH500_BENCHMARK.md` for a
   real-scale run).
 
 ### `run_bfs.py` vs. the two test scripts
@@ -155,7 +155,7 @@ its own `--nocorrectness` check is a single-source scipy cross-check, not
 `run_host_driven_bfs.py`'s stress test, which stays its own script rather
 than being folded in. `run_graph500.py` reuses that same per-search scipy
 check across many roots in one compiled session, rather than adding a
-fourth, separate correctness mechanism — see `GRAPH500_BENCHMARK.md` for
+fourth, separate correctness mechanism — see `docs/GRAPH500_BENCHMARK.md` for
 why it's the right tool once you want an actual GTEPS number instead of
 one root's tree.
 
@@ -312,16 +312,14 @@ for:
 - **No weights.** Only structural nonzero-ness is tracked (`mat_vals_buf` is
   gone entirely) — this also roughly halves the per-nonzero memory footprint
   versus `sdk-hypersparse-spmv`, which matters for surviving a poorly load-balanced
-  matrix (see `../../benchmarks/bench_notes.md`: this kernel compiled and ran on
-  an unbalanced GRAPH500-style matrix that made `sdk-hypersparse-spmv`'s linker run
-  out of PE memory).
+  matrix (this kernel compiled and ran on an unbalanced GRAPH500-style matrix
+  that made `sdk-hypersparse-spmv`'s linker run out of PE memory).
 
 In exchange: measured ~4-8x faster than `sdk-hypersparse-spmv` on every matrix/grid
 combination tried so far (uniform-random, GRAPH500-style RMAT at varying
-sparsity, varying grid size, balanced and unbalanced) — see
-`../../benchmarks/bench_notes.md` for the full set of measurements and caveats
-(the two kernels solve related but not identical problems, so treat this as
-"cost of this design" rather than a pure implementation bake-off).
+sparsity, varying grid size, balanced and unbalanced) -- the two kernels
+solve related but not identical problems, so treat this as "cost of this
+design" rather than a pure implementation bake-off.
 
 ## Requirements
 
@@ -372,7 +370,7 @@ Notes:
 - `--infile_mtx` just needs to point at a square `.mtx` file. `../../data/`
   already has a range of RMAT sizes to try: `rmat_s5_e4.mtx` (32x32),
   `rmat_s6_e4.mtx` (64x64), `rmat_s7_e4.mtx` (128x128), `rmat_s8_e4.mtx`
-  (256x256), up to `rmat_s14_e16.mtx` (16384x16384) — see `../../benchmarks/`
+  (256x256), up to `rmat_s14_e16.mtx` (16384x16384) — see `../../datasets/`
   for how these were generated (`gen_rmat.py`) and load-balanced.
 - `--fabric-dims`/`--fabric-offsets` are optional — both scripts compute a
   large-enough fabric from the grid size and `--width-west-buf`/
@@ -423,7 +421,6 @@ What's still missing (see the `TODO`s in `bool_pe.csl`):
 
 Also worth reconsidering before going further: whether the hypersparse
 compressed-column format (inherited unchanged from `sdk-hypersparse-spmv`) is even
-warranted for GRAPH500-scale sparsity — measurements in
-`../../benchmarks/bench_notes.md` suggest local blocks touch 28-57% of their own
-column range even after load-balancing, nowhere near what that format is
-optimized for.
+warranted for GRAPH500-scale sparsity — early measurements suggested local
+blocks touch 28-57% of their own column range even after load-balancing,
+nowhere near what that format is optimized for.

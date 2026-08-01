@@ -114,13 +114,10 @@ concentrated design), and `O(P)` communication rounds per phase instead of
 clock first, since PE tsc counters aren't synchronized at boot. Then:
 `cycles_send = max(time_end) - min(time_start)` (each adjusted by the
 reference clock), `time_send_us = (cycles_send / 0.85) * 1e-3` (850MHz
-clock), and `bandwidth = (2*nnz+m)*4 / time_send_us` MB/s. Note
-`../../benchmarks/bench_orig_timing.py` deliberately does *not* use this
-methodology (it skips `f_sync` for a simplified, uncalibrated comparison
-against `bool_diag_spmv` — see `../../benchmarks/bench_notes.md`); use `run.py`
+clock), and `bandwidth = (2*nnz+m)*4 / time_send_us` MB/s. Use `run.py`
 directly (or `commands_wse2.sh`) for this version's own calibrated numbers.
 
-## Known limitations (see `../../benchmarks/bench_notes.md` for measurements)
+## Known limitations
 
 - Compile-time buffer sizes (`max_local_nnz` etc.) are the *max* over all PEs
   — a poorly load-balanced matrix (e.g. a GRAPH500/RMAT-style graph with hub
@@ -128,12 +125,10 @@ directly (or `commands_wse2.sh`) for this version's own calibrated numbers.
   larger than the average PE needs, up to the point of a **linker failure**
   ("ran out of PE memory") for skewed-enough inputs. `../../util/analyze.cpp`
   (a separate tool in this repo) computes a row/column permutation that
-  minimizes this skew — see the load-balancing section of
-  `../../benchmarks/bench_notes.md` for how much it helps.
+  minimizes this skew.
 - Measured against `bool_diag_spmv` (a boolean-semiring, diagonal-reduce
   redesign) on the same matrices, this kernel is consistently ~4-8x slower
   for the workload `bool_diag_spmv` targets — expected, since that redesign
   gives up the `P^2` distribution and ping-pong-compatible layout described
   above in exchange for a cheaper single-source-broadcast /
-  single-target-reduce communication pattern. See
-  `../../benchmarks/bench_notes.md` for the full comparison and caveats.
+  single-target-reduce communication pattern.

@@ -102,7 +102,7 @@ for case in "${CASES[@]}"; do
   if [ ! -f "$matrix" ]; then
     if [ ! -f "$raw" ]; then
       echo "-- generating $raw"
-      cs_python benchmarks/gen_rmat.py "$scale" "$edgefactor" 0 "$raw"
+      cs_python datasets/gen_rmat.py "$scale" "$edgefactor" 0 "$raw"
     fi
     echo "-- balancing $raw -> $matrix (util/analyze, ${grid}x${grid} grid)"
     ./util/analyze --matrix "$raw" --symmetric --rand 0 --fabx "$grid" --faby "$grid" --omatrix "$matrix"

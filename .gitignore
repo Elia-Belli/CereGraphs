@@ -6,6 +6,8 @@ wio_flows*
 wsjob-*
 cs_*
 __pycache__/
+*.log
+*.nohup.out
 
 
 sim_stats.json

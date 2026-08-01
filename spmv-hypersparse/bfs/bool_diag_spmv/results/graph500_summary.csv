@@ -1,2 +1,0 @@
-timestamp,infile_mtx,n,nnz,pe_grid,channels,matrix_symmetric,num_searches,num_correctness_fail,construction_time_seconds,harmonic_mean_gteps,min_gteps,median_gteps,max_gteps
-2026-07-13T11:28:22.456965+00:00,rmat4.4x4.lb.mtx,16,108,4x4,1,False,16,0,1.1238857142857142e-05,0.004893378081420373,0.004238048255448918,0.005333731022410583,0.005426979842646299

@@ -59,11 +59,12 @@ GRID_LADDER = [4, 8, 16, 32, 64, 128, 256, 512, 750]
 # situation shows up again; remove it once that cell has a fresh row.
 STALE_KEYS = set()
 
-# on-device phases that make up "compute" (bfs_timing.py's SEARCH_TIME_PHASES
-# entries deliberately excluded from skew-adjustment, as real local work
-# rather than cross-PE wait) -- the rest of search_time_cycles_no_transfer
-# (minus parent_resolve_max_cycles, see pct_communication) is "communication"
-# (bcast/reduce/relay).
+# the two REAL local-work phases (bfs_timing.py's PHASES -- each bracketed
+# by a PE's own entry/exit timestamps, nothing to adjust) make up "compute";
+# the rest of search_time_cycles_no_transfer (minus parent_resolve_max_cycles,
+# see pct_communication) is "communication" (bcast/reduce/relay, computed as
+# a remainder, not individually measured -- see docs/GRAPH500_BENCHMARK.md for why
+# a per-phase skew-adjusted breakdown was tried and abandoned as unreliable).
 COMPUTE_COLS = ["local_compute_max_cycles", "local_term_cond_max_cycles"]
 
 # parent_resolve_max_cycles (the end-of-run parent-array resolve/readback,

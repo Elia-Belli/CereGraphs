@@ -48,7 +48,7 @@ def hwl_to_oned_colmajor(height: int, width: int, pe_length: int, A_hwl: np.ndar
 # grpc.max_send_message_length's value; the SDK's own internal chunker
 # leaves ~zero headroom for its message envelope and off-by-a-few-dozen-
 # bytes overflows right at this boundary (confirmed against the installed
-# cerebras/sdk/client/sdk_appliance_client.py -- see ERRORS.md #4).
+# cerebras/sdk/client/sdk_appliance_client.py -- see docs/ERRORS.md #4).
 _H2D_WIRE_ITEMSIZE = 4
 _H2D_MAX_MESSAGE_LENGTH = (1024**3 * 2) - 1024
 
@@ -59,7 +59,7 @@ def memcpy_h2d_chunked(runner, dest_sym, A_hwl: np.ndarray, height: int, width: 
   """memcpy_h2d wrapper that splits large transfers into multiple PE-row-band
   calls, each safely under the ~2GiB gRPC message-size ceiling -- works
   around a real ceiling this repo hit uploading mat_rows_buf for graphs
-  with high per-PE nonzero skew (berkstan, orkut; see ERRORS.md #4). Below
+  with high per-PE nonzero skew (berkstan, orkut; see docs/ERRORS.md #4). Below
   max_bytes_per_call (default 1.5GiB, real margin under the 2,147,482,624-
   byte ceiling -- not the vendor chunker's near-zero margin), this is a
   single unchanged memcpy_h2d call, identical to every pre-existing caller.
@@ -201,7 +201,7 @@ def extract_parent_result(n, blk, P, parent_hwl):
   the result at a FIXED PE-column (0) for every row so the host can read
   back a plain narrow rectangle instead of the full P-wide grid this used
   to require (the fix for the real d2h gRPC ~2GiB message-size ceiling --
-  see project memory / GRAPH500_BENCHMARK.md). No per-row combine needed
+  see project memory / docs/GRAPH500_BENCHMARK.md). No per-row combine needed
   here any more -- just decode column 0's global ids and map the sentinel
   to -1. `P` is accepted but unused (kept for call-site stability across
   this repo's four callers)."""

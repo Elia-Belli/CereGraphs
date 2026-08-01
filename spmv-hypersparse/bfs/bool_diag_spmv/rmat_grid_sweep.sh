@@ -68,7 +68,7 @@ ensure_raw() {
   local scale="$1" raw="$2"
   if [ -f "$raw" ]; then return 0; fi
   log "generating $raw"
-  if ! timeout 3600 cs_python benchmarks/gen_rmat.py "$scale" "$EDGEFACTOR" 0 "$raw" 2>&1 | tee -a "$LOG"; then
+  if ! timeout 3600 cs_python datasets/gen_rmat.py "$scale" "$EDGEFACTOR" 0 "$raw" 2>&1 | tee -a "$LOG"; then
     return 1
   fi
 }
@@ -121,7 +121,7 @@ run_case() {
     fi
     if grep -qE "cannot open .*\.o: No such file or directory" "$COMPILE_LOG" && [ "$attempt" -lt "$MAX_LINKER_RETRIES" ]; then
       attempt=$((attempt+1))
-      log "RETRY: s${scale} @ ${grid}x${grid} -- known linker file-vanished flake (ERRORS.md #12), retry ${attempt}/${MAX_LINKER_RETRIES}"
+      log "RETRY: s${scale} @ ${grid}x${grid} -- known linker file-vanished flake (docs/ERRORS.md #12), retry ${attempt}/${MAX_LINKER_RETRIES}"
       continue
     fi
     log "FAILED: s${scale} @ ${grid}x${grid} compile step failed (see log above) -- skipping this grid."

@@ -2,7 +2,7 @@
 """ plot a single bfs_timing.csv row (one run_bfs.py run) as a stacked
   bar chart: one bar per BFS round (left to right), bracketed by two
   standalone "h2d" bars (h2d_matrix, h2d_seed -- see bfs_timing.py's
-  H2D_PARTS / GRAPH500_BENCHMARK.md for the Graph500-motivated split between
+  H2D_PARTS / docs/GRAPH500_BENCHMARK.md for the Graph500-motivated split between
   the one-time matrix-structure upload and the per-search source-seed
   upload) before round 0, and two standalone bars after the last round:
   "resolve" (mpi_x.reduce_select_any()'s one-time on-device parent
@@ -17,7 +17,7 @@
   Round bar height = bfs_timing.compute_round_summary's round_duration_cycles
   (straggler-PE span from that round's TS_VBCAST_ISSUE to its
   TS_TERM_COL_BCAST_DONE) -- NOT a sum of individually skew-adjusted
-  sub-phases. GRAPH500_BENCHMARK.md sections 10-13 found that decomposing
+  sub-phases. docs/GRAPH500_BENCHMARK.md sections 10-13 found that decomposing
   a round's communication phases (broadcasts/reduces/the termination
   relay) into "real cost" vs "cross-PE wait" is a hard, still-unresolved
   problem on its own -- repeatedly produced results (impossible negative
@@ -51,18 +51,6 @@
   max-height segment -- the other two segments don't get this treatment
   (local_term_cond is a diagonal-only fixed cost with little PE variance to
   show; communication is a remainder, not a directly-measured quantity).
-
-  A fourth panel, to the right of h2d/rounds/d2h, breaks local_compute down
-  further into its own three consecutive sub-phases (local_compute_reset --
-  zeroing y_flags/parent_compact/y_local_buf/y_buf, whose cost tracks blk,
-  not local sparsity; local_compute_compact -- the compact boolean multiply
-  over y_flags/parent_compact; local_compute_expand -- expanding that
-  compact result to the dense y_local_buf; see bool_pe.csl's compute() and
-  TS_COMPUTE_RESET_DONE/TS_COMPUTE_EXPAND_ENTRY) as grouped per-round bars,
-  same min/avg tick convention, to see which of the three actually
-  dominates local_compute's cost -- in particular, whether "compact" time
-  is genuinely the sparse multiply or actually the (sparsity-independent)
-  buffer reset.
 
   This module is importable (plot_timing_row(row, out_path)) -- run_bfs.py
   calls it directly after appending a row, so one run_bfs.py invocation
@@ -111,7 +99,7 @@ ROUND_SEGMENT_LABELS = {
 # (magenta, orange), not a round-segment color. h2d_matrix/h2d_seed share
 # the magenta hue (2 shades, "one hue family = related sub-parts") since
 # they're both "h2d", just split per Graph500's construction-vs-per-search
-# distinction (see GRAPH500_BENCHMARK.md).
+# distinction (see docs/GRAPH500_BENCHMARK.md).
 H2D_BASE_HEX = "#e87ba4"  # magenta
 D2H_COLOR = "#eb6834"  # orange
 
@@ -162,21 +150,14 @@ def hue_shades(base_hex, n):
 
 H2D_COLORS = dict(zip(H2D_PARTS, hue_shades(H2D_BASE_HEX, len(H2D_PARTS))))
 
-# local_compute_reset/local_compute_compact/local_compute_expand are
-# local_compute's own three consecutive parts, not a separate categorical
-# identity -- shades of local_compute's own yellow (same hue-family
-# convention as H2D_COLORS above), light->dark in chronological order
-# (reset happens first, then the compact multiply, then the expansion).
-LOCAL_COMPUTE_SPLIT_PARTS = ["local_compute_reset", "local_compute_compact", "local_compute_expand"]
-
 # transpose_structure()'s one-time direction-optimizing-BFS cost (see the
 # plan): NOT a sub-part of local_compute (it runs in term_col_bcast_done(),
-# not compute()) -- rendered in the same grouped-bar panel per the user's
-# own request, but deliberately its own distinct hue, not a 4th yellow
-# shade, so it doesn't read as "part of local_compute's own breakdown".
-# transpose_*_cycles is zero in every round except whichever one the
-# top-down -> bottom-up switch actually fires in (see run_bfs.py), so this
-# bar is empty everywhere but that one round.
+# not compute()) -- stacked as its own segment on the round bars (see
+# plot_timing_row), deliberately its own distinct hue, not a local_compute
+# shade, so it doesn't read as "part of local_compute". transpose_*_cycles
+# is zero in every round except whichever one the top-down -> bottom-up
+# switch actually fires in (see run_bfs.py), so this segment is empty
+# everywhere but that one round.
 TRANSPOSE_COLOR = "#2a9d8f"  # teal -- distinct from every other hue family in use
 
 # Also stacked directly onto the round-bars panel's own switch-round bar
@@ -188,18 +169,6 @@ TRANSPOSE_COLOR = "#2a9d8f"  # teal -- distinct from every other hue family in u
 # has no way to attribute from the bars alone, title text notwithstanding.
 ROUND_SEGMENT_COLORS["transpose"] = TRANSPOSE_COLOR
 ROUND_SEGMENT_LABELS["transpose"] = "transpose_structure() (one-time, switch round only)"
-
-COMPUTE_SPLIT_PARTS = LOCAL_COMPUTE_SPLIT_PARTS + ["transpose"]
-COMPUTE_SPLIT_COLORS = dict(zip(
-    LOCAL_COMPUTE_SPLIT_PARTS,
-    hue_shades(ROUND_SEGMENT_COLORS["local_compute"], len(LOCAL_COMPUTE_SPLIT_PARTS))))
-COMPUTE_SPLIT_COLORS["transpose"] = TRANSPOSE_COLOR
-COMPUTE_SPLIT_LABELS = {
-    "local_compute_reset": "buffer reset (y_local_buf/y_buf, tracks blk)",
-    "local_compute_compact": "compact multiply (y_flags)",
-    "local_compute_expand": "dense expansion (y_local_buf)",
-    "transpose": "transpose_structure() (one-time, switch round only)",
-}
 
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_MUTED = "#898781"
@@ -278,21 +247,12 @@ def plot_timing_row(row, out_path):
   # ordered within the bar, see module docstring.
   communication = np.clip(round_duration - local_compute - local_term_cond, 0.0, None)
 
-  # local_compute's own two sub-phases (see TS_COMPUTE_EXPAND_ENTRY in
-  # bool_pe.csl) -- rendered as their own grouped-bar panel below, not part
-  # of the stacked round bars above (they're a breakdown of local_compute's
-  # own segment, not an additional cost).
-  compute_split_stats = {}
-  for part in COMPUTE_SPLIT_PARTS:
-    part_max = parse_cycle_list(row[f"{part}_max_cycles"]).astype(float)
-    assert len(part_max) == profiled_rounds, (
-        f"{part}_max_cycles has {len(part_max)} entries, expected "
-        f"profiled_rounds={profiled_rounds}")
-    compute_split_stats[part] = {
-        "max": part_max,
-        "min": parse_cycle_list(row[f"{part}_min_cycles"]).astype(float),
-        "avg": parse_cycle_list_float(row[f"{part}_avg_cycles"]),
-    }
+  # transpose_structure()'s one-time cost (zero on every round except the
+  # switch round, if any) -- stacked as its own segment on the round bars.
+  transpose_heights = parse_cycle_list(row["transpose_max_cycles"]).astype(float)
+  assert len(transpose_heights) == profiled_rounds, (
+      f"transpose_max_cycles has {len(transpose_heights)} entries, expected "
+      f"profiled_rounds={profiled_rounds}")
 
   h2d_min = {p: int(row[f"{p}_min_cycles"]) for p in H2D_PARTS}
   h2d_max = {p: int(row[f"{p}_max_cycles"]) for p in H2D_PARTS}
@@ -323,16 +283,13 @@ def plot_timing_row(row, out_path):
   # per-bar width as h2d's panel, plus a little breathing room.
   d2h_w_in = per_bar_w_in * 2 + 0.3
   round_w_in = max(0.95 * profiled_rounds, 3.0)
-  compute_split_w_in = max(1.4 * profiled_rounds, 3.6)
-  fig, (ax_h2d, ax_rounds, ax_d2h, ax_compute) = plt.subplots(
-      1, 4, figsize=(h2d_w_in + round_w_in + d2h_w_in + compute_split_w_in, 6.5),
-      gridspec_kw={"width_ratios": [h2d_w_in, round_w_in, d2h_w_in, compute_split_w_in],
+  fig, (ax_h2d, ax_rounds, ax_d2h) = plt.subplots(
+      1, 3, figsize=(h2d_w_in + round_w_in + d2h_w_in, 6.5),
+      gridspec_kw={"width_ratios": [h2d_w_in, round_w_in, d2h_w_in],
                    "wspace": 0.1})
 
   bar_width = 0.62
-  # (ax, text_obj, xpos, segment_bottom, segment_top, bar_w) -- fit-checked
-  # below; bar_w travels with each label since the compute-split panel uses
-  # its own, narrower bar width than the h2d/round/d2h panels.
+  # (ax, text_obj, xpos, segment_bottom, segment_top, bar_w) -- fit-checked below.
   candidate_labels = []
 
   def add_solo_bar(ax, xpos, height, tick_y, color, label):
@@ -369,7 +326,6 @@ def plot_timing_row(row, out_path):
   ax_d2h.set_xticklabels(["resolve", "d2h"])
 
   bottom = np.zeros(profiled_rounds)
-  transpose_heights = compute_split_stats["transpose"]["max"]
   segment_values = {
       "local_compute": local_compute,
       "local_term_cond": local_term_cond,
@@ -421,31 +377,6 @@ def plot_timing_row(row, out_path):
   ax_rounds.set_xticks(rounds)
   ax_rounds.set_xticklabels(round_labels)
 
-  # Fourth panel: local_compute's own reset/compact/expand split, grouped
-  # bars (not stacked -- these are independent measurements, not parts of
-  # one total) -- same max-height + min/avg-tick convention as the rest.
-  # Offsets are computed generically (N bars centered on the round's x
-  # position) rather than hardcoded for 2, since this split has grown once
-  # already (compact/expand -> reset/compact/expand) and may again.
-  n_split_parts = len(COMPUTE_SPLIT_PARTS)
-  compute_split_bar_width = 0.6 / n_split_parts
-  split_offsets = (np.arange(n_split_parts) - (n_split_parts - 1) / 2) * compute_split_bar_width
-  for i, part in enumerate(COMPUTE_SPLIT_PARTS):
-    xpos = rounds + split_offsets[i]
-    heights = compute_split_stats[part]["max"]
-    color = COMPUTE_SPLIT_COLORS[part]
-    ax_compute.bar(xpos, heights, width=compute_split_bar_width, color=color, edgecolor=SURFACE,
-                   linewidth=1, label=COMPUTE_SPLIT_LABELS[part], zorder=2)
-    for r in rounds:
-      add_stat_ticks(ax_compute, xpos[r], compute_split_stats[part]["min"][r],
-                      compute_split_stats[part]["avg"][r], compute_split_bar_width)
-      txt = ax_compute.text(xpos[r], heights[r] / 2, f"{int(heights[r])}", ha="center", va="center",
-                            fontsize=7, color="white", fontweight="bold", zorder=4)
-      candidate_labels.append((ax_compute, txt, xpos[r], 0.0, heights[r], compute_split_bar_width))
-
-  ax_compute.set_xticks(rounds)
-  ax_compute.set_xticklabels(round_labels)
-
   # measure-first pass: a label only survives if its rendered bounding box
   # actually fits inside its own segment's rectangle (with a little
   # padding) -- otherwise remove it and let the legend + color carry
@@ -463,7 +394,6 @@ def plot_timing_row(row, out_path):
       txt.remove()
 
   ax_h2d.set_ylabel("cycles", labelpad=8)
-  ax_compute.set_ylabel("cycles", labelpad=8)
   rounds_suffix = (f"{rounds_completed} rounds (only first {profiled_rounds} profiled -- "
                     f"bump max_rounds for full detail)" if profiled_rounds < rounds_completed
                     else f"{rounds_completed} rounds")
@@ -472,7 +402,7 @@ def plot_timing_row(row, out_path):
                f"n={row['n']}, nnz={row['nnz']}, {rounds_suffix} "
                "(bar height = round_duration_cycles, + transpose_structure() on the switch round)",
                fontsize=10)
-  for ax in (ax_h2d, ax_rounds, ax_d2h, ax_compute):
+  for ax in (ax_h2d, ax_rounds, ax_d2h):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["left"].set_color(BASELINE)
@@ -489,18 +419,12 @@ def plot_timing_row(row, out_path):
   fig.patch.set_facecolor(SURFACE)
 
   handles, labels = [], []
-  for ax in (ax_h2d, ax_rounds, ax_d2h, ax_compute):
+  for ax in (ax_h2d, ax_rounds, ax_d2h):
     h, l = ax.get_legend_handles_labels()
     handles += h
     labels += l
   handles += STAT_TICK_HANDLES
   labels += [h.get_label() for h in STAT_TICK_HANDLES]
-  # "transpose_structure()" is drawn on both ax_rounds (stacked segment)
-  # and ax_compute (grouped bar) with the same label -- de-dupe by label
-  # text (preserving first-seen order) so it isn't listed twice.
-  seen = set()
-  deduped = [(h, l) for h, l in zip(handles, labels) if not (l in seen or seen.add(l))]
-  handles, labels = [list(t) for t in zip(*deduped)]
   fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, fontsize=8,
              bbox_to_anchor=(0.5, -0.16), columnspacing=1.8, handletextpad=0.6, labelspacing=1.0)
   plt.tight_layout(rect=[0, 0.26, 1, 0.93])

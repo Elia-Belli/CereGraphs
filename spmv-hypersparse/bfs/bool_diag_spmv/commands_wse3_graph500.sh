@@ -12,7 +12,7 @@ cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
 # --num-searches single-source BFS searches from distinct random roots
 # (defaults to all 16 vertices here, since the fixture is tiny), timed
 # individually and combined via harmonic mean GTEPS. Small matrix/grid here
-# purely to keep this a fast sanity check -- see GRAPH500_BENCHMARK.md for
+# purely to keep this a fast sanity check -- see docs/GRAPH500_BENCHMARK.md for
 # a real-scale (64-search, larger matrix) run.
 cslc bfs/bool_diag_spmv/src/layout_bool.csl --arch wse3 --fabric-dims=11,6 --fabric-offsets=4,1 \
 --params=pcols:4,prows:4,blk:4 \

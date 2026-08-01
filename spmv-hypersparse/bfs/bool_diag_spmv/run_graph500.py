@@ -4,11 +4,11 @@
   f_spmv_iter kernel: one compile, one matrix upload, then --num-searches
   (default 64, per the spec) single-source BFS searches from distinct
   random roots, each timed individually as its own Kernel 2 search (see
-  GRAPH500_BENCHMARK.md section 1) -- and the harmonic mean GTEPS across
+  docs/GRAPH500_BENCHMARK.md section 1) -- and the harmonic mean GTEPS across
   all of them, the spec's own rule for combining per-search rates into one
   number.
 
-  Kernel 1 / Kernel 2 split (GRAPH500_BENCHMARK.md section 1-2):
+  Kernel 1 / Kernel 2 split (docs/GRAPH500_BENCHMARK.md section 1-2):
     - matrix structure (mat_rows_buf, mat_col_idx/loc/len_buf,
       local_nnz*) is uploaded to the device exactly ONCE,
       timed separately as "construction" -- never part of any search's own
@@ -55,8 +55,8 @@ from scipy.sparse.csgraph import breadth_first_order
 # bfs_tree_plot.py lives in plots/ now -- see that folder's own scripts for
 # the matching bootstrap back to this directory.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots"))
-from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, compute_m_and_gteps, decode_phase_row,
-                         read_tic_toc_delta)
+from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, check_round_vs_total_communication,
+                         compute_m_and_gteps, decode_phase_row, read_tic_toc_delta)
 from bfs_tree_plot import invalid_parents
 from device_io import (csl_compile_core, derive_visited_from_parent,
                         extract_parent_result, hwl_to_oned_colmajor, memcpy_h2d_chunked,
@@ -182,14 +182,14 @@ def main():
   print(f"Load matrix A, {nrows}-by-{ncols} with {nnz} nonzeros (structural, boolean)")
 
   # Graph500's own m formula (the undirected dedup rule, see
-  # GRAPH500_BENCHMARK.md section 4) only makes sense for a symmetrized
+  # docs/GRAPH500_BENCHMARK.md section 4) only makes sense for a symmetrized
   # graph -- true for gen_rmat.py's output but not guaranteed for an
   # arbitrary --infile_mtx.
   is_symmetric = (A_csr != A_csr.T).nnz == 0
   if not is_symmetric:
     print("[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula "
           "instead of Graph500's own undirected dedup rule for every search's m; not directly "
-          "comparable to a Graph500-spec TEPS number. See GRAPH500_BENCHMARK.md section 4. ]]")
+          "comparable to a Graph500-spec TEPS number. See docs/GRAPH500_BENCHMARK.md section 4. ]]")
 
   A_csc = A_csr.tocsc(copy=True)
   A_csc = A_csc.sorted_indices()
@@ -341,7 +341,7 @@ def main():
     runner.launch("f_spmv_iter", nonblock=False)
 
     # Graph500's own output is exactly the predecessor/parent array (see
-    # GRAPH500_BENCHMARK.md section 1 -- the reference implementation's
+    # docs/GRAPH500_BENCHMARK.md section 1 -- the reference implementation's
     # run_bfs(root, pred) signature) -- derive_visited_from_parent() below
     # recovers visited from parent_local_buf alone, so only that one
     # transfer needs to be timed as the search's "output written to memory"
@@ -397,11 +397,19 @@ def main():
         print(f"[[ search {i} (source={source}): CORRECTNESS FAILED -- "
               f"visited mismatches={n_mismatch}, invalid parents={len(bad_device)} ]]")
 
-    row_cols, device_time_cycles, profiled_rounds = decode_phase_row(
+    (row_cols, device_time_cycles, profiled_rounds, round_duration_cycles,
+     local_compute_max_cycles, local_term_cond_max_cycles) = decode_phase_row(
         ts_hwl_u32, height, width, max_rounds, rounds_completed, round_trip_cycles, verbose=False)
     search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles + int(d2h_cycles.max())
     m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(
         A_coo_static, device_visited, is_symmetric, search_time_cycles)
+
+    # Consistency check (see check_round_vs_total_communication's own
+    # docstring) -- transpose_max_cycles=0 since this script has no
+    # --directional support (the bottom-up switch never fires here).
+    check_round_vs_total_communication(
+        round_duration_cycles, local_compute_max_cycles, local_term_cond_max_cycles,
+        device_time_cycles, 0, verbose=False)
 
     row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -437,7 +445,7 @@ def main():
 
   runner.stop()
 
-  # --- Aggregate, per GRAPH500_BENCHMARK.md section 1: harmonic mean of the
+  # --- Aggregate, per docs/GRAPH500_BENCHMARK.md section 1: harmonic mean of the
   # per-search rates, plus min/max/median for context (the spec reports
   # quartiles/min/max alongside the harmonic mean too). ---
   gteps_values = [r["gteps"] for r in search_rows]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs each of the balanced SNAP graphs (see benchmarks/prep_snap.sh) through
+# Runs each of the balanced SNAP graphs (see datasets/prep_snap.sh) through
 # real-appliance BFS (run_bfs.appliance.py, no --simulator) on the same
 # 750x750 grid the RMAT growth sweep (grow_sweep.sh) used. Unlike
 # grow_sweep.sh this does NOT stop at the first failure -- these are five
@@ -34,7 +34,7 @@ export NO_PROXY="$no_proxy"
 
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
 
-# Optional name args (matches download_snap_graphs.sh/prep_snap_v3.sh's own
+# Optional name args (matches download_snap_graphs.sh/prep_snap.sh's own
 # convention) -- e.g. `run_snap_sweep.sh skitter patents` to run just the
 # new two without re-running the other five.
 NAMES=("$@")
