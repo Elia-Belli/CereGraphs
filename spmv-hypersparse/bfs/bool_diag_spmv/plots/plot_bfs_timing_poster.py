@@ -75,6 +75,10 @@ COMMUNICATION_COLOR = "#eb6834"  # orange
 # look identical) -- next unused step in this repo's validated categorical
 # order (palette.md slot 4) instead.
 D2H_COLOR = "#eda100"  # yellow
+# Magnitude-jump callout only (see plot_timing_row_poster's ax_spacer) --
+# not part of the bar palette above, deliberately a plain, attention-
+# grabbing red so the scale jump reads as a callout, not another data series.
+MAGNITUDE_CALLOUT_COLOR = "#c0392b"
 
 TITLE_FONTSIZE = 15
 PANEL_TITLE_FONTSIZE = 13
@@ -112,6 +116,23 @@ def mean_std_ms(rows, cycles_key, clock_freq_hz):
   values = cycles_to_ms(np.array([int(r[cycles_key]) for r in rows], dtype=np.float64),
                          clock_freq_hz)
   return float(values.mean()), (float(values.std(ddof=1)) if len(values) > 1 else 0.0)
+
+
+_SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def order_of_magnitude_label(ratio):
+  """'x10^N' (unicode superscript, e.g. '×10³'), N = floor(log10(ratio)) --
+  the nearest power of ten ratio rounds DOWN to, for the magnitude-jump
+  callout between the h2d_matrix panel and its neighbor. Order of
+  magnitude, not the precise ratio: the callout's job is "this is
+  thousands of times bigger", not a number a reader would try to verify
+  against the bars themselves (each panel's own bars/ticks already carry
+  the precise values)."""
+  if ratio <= 0:
+    return "×10⁰"
+  oom = int(np.floor(np.log10(ratio)))
+  return f"×10{str(oom).translate(_SUPERSCRIPT_DIGITS)}"
 
 
 def plot_timing_row_poster(rows, out_path):
@@ -158,21 +179,21 @@ def plot_timing_row_poster(rows, out_path):
   transfer_xs = np.arange(len(transfer_labels))
 
   # h2d_matrix (a one-time, whole-matrix upload) gets its OWN panel/scale,
-  # not a 4th bar in ax_transfer -- it's ~1000x bigger than h2d_seed/
-  # resolve/d2h (seconds vs. low-single-digit ms), which on a shared linear
-  # scale would crush those three to invisible slivers, the exact "two
-  # measures of different scale" anti-pattern this file's own docstring
-  # already avoids once (rounds vs. transfer panels). A narrow, axis-off
-  # spacer panel between it and ax_rounds carries a "xN" callout instead of
-  # a shared axis, so the magnitude jump is stated directly rather than
-  # implied by a squashed bar.
+  # rightmost, not a 4th bar in ax_transfer -- it's 3-4 orders of magnitude
+  # bigger than h2d_seed/resolve/d2h (seconds vs. low-single-digit ms),
+  # which on a shared linear scale would crush those three to invisible
+  # slivers, the exact "two measures of different scale" anti-pattern this
+  # file's own docstring already avoids once (rounds vs. transfer panels).
+  # A narrow, axis-off spacer panel between ax_transfer and ax_h2d_matrix
+  # carries an order-of-magnitude callout instead of a shared axis, so the
+  # jump is stated directly rather than implied by a squashed bar.
   round_w_in = max(0.9 * profiled_rounds, 2.6)
   transfer_w_in = 1.3 * len(transfer_labels)
   h2d_matrix_w_in = 1.3
   spacer_w_in = 1.3
-  fig, (ax_h2d_matrix, ax_spacer, ax_rounds, ax_transfer) = plt.subplots(
-      1, 4, figsize=(h2d_matrix_w_in + spacer_w_in + round_w_in + transfer_w_in + 1.5, 6.5),
-      gridspec_kw={"width_ratios": [h2d_matrix_w_in, spacer_w_in, round_w_in, transfer_w_in],
+  fig, (ax_rounds, ax_transfer, ax_spacer, ax_h2d_matrix) = plt.subplots(
+      1, 4, figsize=(round_w_in + transfer_w_in + spacer_w_in + h2d_matrix_w_in + 1.5, 6.5),
+      gridspec_kw={"width_ratios": [round_w_in, transfer_w_in, spacer_w_in, h2d_matrix_w_in],
                    "wspace": 0.25})
 
   bar_width = 0.62
@@ -217,15 +238,23 @@ def plot_timing_row_poster(rows, out_path):
   ax_rounds.set_ylim(0, round_max * 1.25)
   ax_transfer.set_ylim(0, transfer_max * 1.15)
   ax_h2d_matrix.set_ylim(0, h2d_matrix_max * 1.15)
+  # h2d_matrix is tens of thousands of ms -- compact 1-5-digit tick labels
+  # (e.g. "1", "2", "3") plus a single "1e4"-style offset text above the
+  # axis, instead of a full "20000"/"40000" on every tick.
+  ax_h2d_matrix.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
 
-  # magnitude-jump callout: how many times bigger h2d_matrix is than the
+  # magnitude-jump callout: order of magnitude h2d_matrix is bigger than the
   # largest bar on the "small" side (rounds or h2d_seed/resolve/d2h) --
   # states the scale difference directly instead of leaving a reader to
-  # infer it from two panels with different axes.
+  # infer it from two panels with different axes. Positioned high in the
+  # spacer (near where each panel's own y-axis starts reading large
+  # values) and hugging ax_h2d_matrix's left edge/y-axis on the spacer's
+  # right side, with the arrow pointing straight at it.
   small_side_max = max(round_max, transfer_max, 1e-9)
   magnitude_ratio = h2d_matrix_mean / small_side_max
-  ax_spacer.text(0.3, 0.5, f"×{magnitude_ratio:,.0f}\n→", ha="center", va="center",
-                 fontsize=10, color=TEXT_MUTED, transform=ax_spacer.transAxes)
+  ax_spacer.text(0.85, 0.85, f"{order_of_magnitude_label(magnitude_ratio)} →", ha="right",
+                 va="center", fontsize=11, color=MAGNITUDE_CALLOUT_COLOR, fontweight="bold",
+                 transform=ax_spacer.transAxes)
   ax_spacer.axis("off")
 
   # No direction (TD/BU) suffix -- these poster plots only ever show
@@ -257,14 +286,15 @@ def plot_timing_row_poster(rows, out_path):
     if not (fits_w and fits_h):
       txt.remove()
 
-  h2d_matrix_title = "h2d_matrix" if n_runs == 1 else f"h2d_matrix (mean ± std, n={n_runs})"
-  transfer_title = ("Host-Device + Parent Resolve" if n_runs == 1 else
-                     f"Host-Device + Parent Resolve (mean ± std, n={n_runs} runs)")
+  # Mean/std-across-runs methodology goes in the caption below (see
+  # fig.text near the legend), not the titles -- keeps the titles short and
+  # avoids repeating the same parenthetical on two adjacent panels.
   ax_h2d_matrix.set_ylabel("ms", labelpad=8)
-  ax_h2d_matrix.set_title(h2d_matrix_title, fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
+  ax_h2d_matrix.set_title("h2d_matrix", fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
   ax_rounds.set_ylabel("ms", labelpad=8)
   ax_rounds.set_title("Per-Round Device Time", fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
-  ax_transfer.set_title(transfer_title, fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
+  ax_transfer.set_title("Host-Device + Parent Resolve",
+                         fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
 
   fig.suptitle(f"Timing Split on {poster_title_input(matrix)} and {pe_grid} PE Grid",
                fontsize=TITLE_FONTSIZE)
@@ -285,9 +315,27 @@ def plot_timing_row_poster(rows, out_path):
     handles += h
     labels += l
   fig.legend(handles, labels, loc="lower center", ncol=len(handles), frameon=False,
-             fontsize=LEGEND_FONTSIZE, bbox_to_anchor=(0.5, 0.01), columnspacing=1.8,
+             fontsize=LEGEND_FONTSIZE, bbox_to_anchor=(0.5, 0.02), columnspacing=1.8,
              handletextpad=0.6, labelspacing=1.0)
-  plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+
+  # Mean/std-across-runs methodology lives here, not in the panel titles
+  # (see the title-setting block above) -- one caption line instead of
+  # repeating the same parenthetical on two panels. Above the legend (not
+  # below it) so reading order is explanation -> color key.
+  if n_runs > 1:
+    fig.text(0.5, 0.14,
+              f"h2d_matrix/h2d_seed/resolve/d2h bars: mean ± std across n={n_runs} repeated "
+              "real-hardware runs of the same input.",
+              ha="center", va="center", fontsize=9, color=TEXT_MUTED)
+
+  # NOT tight_layout(rect=...) -- the axis-off ax_spacer panel makes
+  # tight_layout ignore/misjudge the requested rect (it prints its own
+  # "Axes ... not compatible with tight_layout" warning), so the caption
+  # below ends up overlapping the round panel's x-tick labels regardless of
+  # the rect margin passed in. subplots_adjust sets the figure margins
+  # directly and isn't subject to that same auto-layout guesswork.
+  plt.tight_layout()
+  fig.subplots_adjust(bottom=0.24, top=0.88)
 
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=200, bbox_inches="tight")
