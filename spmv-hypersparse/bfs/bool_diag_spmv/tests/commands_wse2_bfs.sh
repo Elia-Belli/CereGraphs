@@ -9,12 +9,12 @@
 # instead of commands_wse2.sh's run_single_spmv.py (which never touches
 # parent_local_buf at all -- is_iterative is hardcoded false there).
 #
-# Usage: ./bfs/bool_diag_spmv/commands_wse2_bfs.sh [extra run_bfs.py args...]
-#   e.g. ./bfs/bool_diag_spmv/commands_wse2_bfs.sh --infile_mtx=data/collision4x4.mtx
+# Usage: ./bfs/bool_diag_spmv/tests/commands_wse2_bfs.sh [extra run_bfs.py args...]
+#   e.g. ./bfs/bool_diag_spmv/tests/commands_wse2_bfs.sh --infile_mtx=data/collision4x4.mtx
 
 set -e
 
-cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
+cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)"
 
 cslc bfs/bool_diag_spmv/src/layout_bool.csl --arch wse2 --fabric-dims=11,6 --fabric-offsets=4,1 \
 --params=pcols:4,prows:4,blk:4 \

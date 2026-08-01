@@ -99,6 +99,7 @@ layout {
 
     @export_name("tsc_start_buffer", [*]u16, true);
     @export_name("tsc_end_buffer", [*]u16, true);
+    @export_name("tsc_ref_buffer", [*]u16, true);
     @export_name("transpose_tic_buffer", [*]u16, true);
     @export_name("transpose_toc_buffer", [*]u16, true);
     @export_name("round_trip_start_buffer", [*]u16, true);
@@ -114,4 +115,5 @@ layout {
     @export_name("f_enable_tsc", fn()void);
     @export_name("f_tic", fn()void);
     @export_name("f_toc", fn()void);
+    @export_name("f_sync_hostdevice", fn()void);
 }

@@ -124,6 +124,11 @@ const visited_bcast_done_task_id: local_task_id = @get_local_task_id(20);
 // memcpy" comment for real, not just in theory). 24 confirmed free by the
 // same real compile-time check.
 const parent_resolve_done_task_id: local_task_id = @get_local_task_id(24);
+// callback for the one-time host-device timing reference-clock sync (see
+// f_sync_hostdevice()/sync_hostdevice_done() below) -- 25 chosen the same
+// empirical way 24 was (next slot after the last confirmed-free one,
+// before memcpy's own 27-30ish reserved range); verify at compile time.
+const sync_hostdevice_done_task_id: local_task_id = @get_local_task_id(25);
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 
@@ -136,6 +141,22 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const timestamp = @import_module("<time>");
 var tsc_start_buffer = @zeros([timestamp.tsc_size_words]u16);
 var tsc_end_buffer = @zeros([timestamp.tsc_size_words]u16);
+
+// Reference-clock sample for sync-corrected host-device (h2d/d2h) timing --
+// see f_sync_hostdevice()/read_sync_corrected_span in bfs_timing.py. Unlike
+// tsc_start_buffer/tsc_end_buffer above (deliberately left unsynchronized,
+// see that comment), this exists specifically to correct for cross-PE clock
+// skew in host-device transfer measurements: the Cerebras SDK's own
+// bandwidth-test example documents that different PEs can genuinely
+// start/finish a real transfer at different wall-clock moments (fabric
+// fan-out), which tsc_start/end_buffer's per-PE self-relative delta can't
+// see. Sampled once per f_sync_hostdevice() call (three times per run --
+// before h2d_matrix, before h2d_seed, before d2h -- see run_bfs.py),
+// overwritten each time; nothing else reads or writes it.
+var tsc_ref_buffer = @zeros([timestamp.tsc_size_words]u16);
+// Dummy 1-word broadcast payload for the sync signal -- its content is
+// never read, only the fact that the broadcast reached this PE matters.
+var sync_signal_buf = @zeros([1]u32);
 
 // Always-correct round-trip span markers, INDEPENDENT of max_rounds/ts_buf
 // truncation (see record_ts()'s own max_rounds gate a few lines below --
@@ -527,6 +548,7 @@ var ptr_is_bottom_up_dbg: [*]u16 = &is_bottom_up_dbg;
 
 var ptr_tsc_start_buffer: [*]u16 = &tsc_start_buffer;
 var ptr_tsc_end_buffer: [*]u16 = &tsc_end_buffer;
+var ptr_tsc_ref_buffer: [*]u16 = &tsc_ref_buffer;
 var ptr_transpose_tic_buffer: [*]u16 = &transpose_tic_buffer;
 var ptr_transpose_toc_buffer: [*]u16 = &transpose_toc_buffer;
 var ptr_round_trip_start_buffer: [*]u16 = &round_trip_start_buffer;
@@ -559,6 +581,39 @@ fn f_tic() void {
 
 fn f_toc() void {
     timestamp.get_timestamp(&tsc_end_buffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+// One-time reference-clock sync for host-device (h2d/d2h) timing, modeled
+// on the Cerebras SDK's own bandwidth-test example (examples/benchmarks/
+// bandwidth-test/src/sync/pe.csl) but reusing this kernel's OWN existing
+// mpi_x row-broadcast instead of porting that example's hand-rolled
+// 3-phase relay, whose hardcoded task IDs (15-18), colors (0-4), and
+// queues (2-4) all collide with mpi_x/mpi_y's own allocation here (see the
+// plan). mpi_x.broadcast(root, ...) compares root against pcol_id, a value
+// scoped entirely to the row-broadcast module instance (see
+// collectives_2d/pe.csl's own pe_id/init()) -- so a single call with a
+// FIXED root=MID reaches every PE in the grid in one phase: each row does
+// its own column-MID-rooted broadcast independently and simultaneously.
+// Propagation delay from that root is corrected host-side (see
+// bfs_timing.read_sync_corrected_span), proportional to |pcol_id - MID|.
+//
+// mpi_x.init()/mpi_y.init() are called here unconditionally, NOT gated by
+// start_spmv()'s own mpi_initialized flag, since this must also work
+// BEFORE the first f_spmv_iter call (the h2d_matrix/h2d_seed brackets
+// happen before any BFS round). init() is a cheap, side-effect-free
+// coordinate read (see its own definition), so calling it again from
+// start_spmv() later is harmless -- and this deliberately leaves
+// mpi_initialized untouched so start_spmv()'s own one-time popcnt_src_dsd
+// retarget still runs exactly once, unaffected by this function.
+fn f_sync_hostdevice() void {
+    mpi_x.init();
+    mpi_y.init();
+    mpi_x.broadcast(MID, &sync_signal_buf, 1, sync_hostdevice_done_task_id);
+}
+
+task sync_hostdevice_done() void {
+    timestamp.get_timestamp(&tsc_ref_buffer);
     sys_mod.unblock_cmd_stream();
 }
 
@@ -1054,6 +1109,7 @@ comptime {
     @bind_local_task(term_col_bcast_done, term_col_bcast_done_task_id);
     @bind_local_task(visited_bcast_done, visited_bcast_done_task_id);
     @bind_local_task(parent_resolve_done, parent_resolve_done_task_id);
+    @bind_local_task(sync_hostdevice_done, sync_hostdevice_done_task_id);
 
     @export_symbol(ptr_x_bitmap, "x_bitmap");
     @export_symbol(ptr_y_bitmap_reduced, "y_bitmap_reduced");
@@ -1078,6 +1134,7 @@ comptime {
     @export_symbol(ptr_is_bottom_up_dbg, "is_bottom_up_dbg");
     @export_symbol(ptr_tsc_start_buffer, "tsc_start_buffer");
     @export_symbol(ptr_tsc_end_buffer, "tsc_end_buffer");
+    @export_symbol(ptr_tsc_ref_buffer, "tsc_ref_buffer");
     @export_symbol(ptr_transpose_tic_buffer, "transpose_tic_buffer");
     @export_symbol(ptr_transpose_toc_buffer, "transpose_toc_buffer");
     @export_symbol(ptr_round_trip_start_buffer, "round_trip_start_buffer");
@@ -1093,4 +1150,5 @@ comptime {
     @export_symbol(f_enable_tsc);
     @export_symbol(f_tic);
     @export_symbol(f_toc);
+    @export_symbol(f_sync_hostdevice);
 }

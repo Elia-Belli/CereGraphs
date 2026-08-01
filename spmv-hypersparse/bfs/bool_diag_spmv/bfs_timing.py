@@ -83,33 +83,83 @@ def decode_round_timestamps(ts_hwl_u32, height, width, max_rounds):
   return w0 + (w1 << 16) + (w2 << 32)
 
 
-def read_tic_toc_delta(runner, sym_tsc_start, sym_tsc_end, height, width):
-  """Read back tsc_start_buffer/tsc_end_buffer (each PE's own f_tic()/
-  f_toc() capture -- see f_enable_tsc()/f_tic()/f_toc() in bool_pe.csl) and
-  return the per-PE elapsed-cycle deltas as a flat (height*width,) int64
-  array. Same-PE subtraction (this PE's own toc minus this PE's own tic),
-  so no cross-PE clock synchronization is needed -- see run_bfs.py's own
-  module docstring for why."""
+def _read_tsc_grid(runner, sym, height, width):
+  """Read one [timestamp.tsc_size_words]u16 buffer back from every PE and
+  return a flat (height*width,) int64 array of 48-bit absolute timestamps
+  (same packing as decode_round_timestamps: word0 | word1<<16 | word2<<32).
+  Shared by read_tic_toc_delta and read_sync_corrected_span below."""
   # local import: only needed here, avoids importing the whole SDK runtime
   # module for callers that only want the pure-python constants above.
   from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-in-module
       MemcpyDataType, MemcpyOrder,
   )
+  buf_1d = np.zeros(height * width * TSC_WORDS, np.uint32)
+  runner.memcpy_d2h(buf_1d, sym, 0, 0, width, height, TSC_WORDS,
+                     streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                     order=MemcpyOrder.COL_MAJOR, nonblock=False)
+  hwl = np.reshape(buf_1d, (height, width, TSC_WORDS), order="F")
+  w0 = hwl[..., 0].astype(np.int64)
+  w1 = hwl[..., 1].astype(np.int64)
+  w2 = hwl[..., 2].astype(np.int64)
+  return (w0 + (w1 << 16) + (w2 << 32)).reshape(-1)
 
-  def _read(sym):
-    buf_1d = np.zeros(height * width * TSC_WORDS, np.uint32)
-    runner.memcpy_d2h(buf_1d, sym, 0, 0, width, height, TSC_WORDS,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
-    hwl = np.reshape(buf_1d, (height, width, TSC_WORDS), order="F")
-    w0 = hwl[..., 0].astype(np.int64)
-    w1 = hwl[..., 1].astype(np.int64)
-    w2 = hwl[..., 2].astype(np.int64)
-    return (w0 + (w1 << 16) + (w2 << 32)).reshape(-1)
 
-  tic = _read(sym_tsc_start)
-  toc = _read(sym_tsc_end)
+def read_tic_toc_delta(runner, sym_tsc_start, sym_tsc_end, height, width):
+  """Read back tsc_start_buffer/tsc_end_buffer (each PE's own f_tic()/
+  f_toc() capture -- see f_enable_tsc()/f_tic()/f_toc() in bool_pe.csl) and
+  return the per-PE elapsed-cycle deltas as a flat (height*width,) int64
+  array. Same-PE subtraction (this PE's own toc minus this PE's own tic),
+  so no cross-PE clock synchronization is needed -- correct for on-device-
+  only quantities that never leave the fabric (transpose_cycles,
+  parent_resolve_cycles, round_trip_cycles). NOT used for h2d_matrix/
+  h2d_seed/d2h any more -- those are real host<->device transfers, where
+  this is a structural lower bound on the true cross-PE span (see
+  read_sync_corrected_span below, now the sole timing for those three)."""
+  tic = _read_tsc_grid(runner, sym_tsc_start, height, width)
+  toc = _read_tsc_grid(runner, sym_tsc_end, height, width)
   return toc - tic
+
+
+def read_sync_corrected_span(runner, sym_tsc_start, sym_tsc_end, sym_tsc_ref,
+                              height, width):
+  """Sync-corrected host-device (h2d/d2h) span: max(toc) - min(tic) across
+  ALL PEs, the true cross-PE transfer span the Cerebras SDK's own
+  bandwidth-test example computes (run.py's cycles_send). Unlike
+  read_tic_toc_delta's per-PE self-relative toc-tic (needs no cross-PE
+  clock sync, but is a structural LOWER BOUND on this span -- for any PE p,
+  toc[p]-tic[p] <= max(toc)-min(tic) always), this recovers the true span
+  by back-projecting every PE's raw tic/toc onto a shared time origin,
+  using that PE's own raw tsc_ref_buffer sample (captured by
+  f_sync_hostdevice()'s sync pulse, see bool_pe.csl) as its local zero
+  point.
+
+  f_sync_hostdevice() reaches every PE via a single mpi_x.broadcast(MID,
+  ...) -- each PE's copy of the pulse arrives with a propagation delay
+  proportional to hop_distance = |pcol_id - MID| (one cycle per hop,
+  mirroring the SDK example's own (px+py) correction convention for ITS
+  differently-shaped, corner-rooted relay -- see the plan). pcol_id is
+  just this PE's own column index in the (height, width) grid (mpi_x.pe_id
+  is the column position -- see collectives_2d/pe.csl), so no extra
+  per-PE metadata needs to be read back from device beyond plain grid
+  geometry. corrected_ref[pe] = raw_ref[pe] - hop_distance[pe] estimates
+  what the reference clock would have read AT the origin (column MID) had
+  propagation been instantaneous -- the common baseline every PE's tic/toc
+  gets shifted against, making them comparable across PEs.
+
+  Returns span_cycles: a single int (the whole-grid span, not a per-PE
+  array -- there is only one true "when did this transfer start/end")."""
+  tic = _read_tsc_grid(runner, sym_tsc_start, height, width)
+  toc = _read_tsc_grid(runner, sym_tsc_end, height, width)
+  ref = _read_tsc_grid(runner, sym_tsc_ref, height, width)
+
+  mid = width // 2
+  pcol_id = np.tile(np.arange(width, dtype=np.int64), height)
+  hop_distance = np.abs(pcol_id - mid)
+
+  corrected_ref = ref - hop_distance
+  corrected_tic = tic - corrected_ref
+  corrected_toc = toc - corrected_ref
+  return int(corrected_toc.max() - corrected_tic.min())
 
 
 def compute_round_summary(round_start, round_end):

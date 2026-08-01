@@ -961,3 +961,73 @@ this investigation is closed by construction -- both now derive
 poster's per-round bars aggregate to the same percentage the heatmap's
 cell shows for that `(scale, grid)`, not a coincidentally-close or
 wildly-different one.
+
+## 15. `h2d_matrix`/`h2d_seed`/`d2h` timing: fixing (then dropping) a real understatement bug
+
+Checking this project's own `h2d`/`d2h` timing against the Cerebras SDK's
+official bandwidth-test example
+(`examples/benchmarks/bandwidth-test/src/sync/pe.csl` in the SDK's own
+`csl-extras` bundle) surfaced a real bug, distinct from anything sections
+1-14 cover (which are all about *round/compute* accounting, not host<->device
+transfer timing): `read_tic_toc_delta` computes, per PE, `toc[pe] -
+tic[pe]`, then takes `.max()` across PEs. That is a structural **lower
+bound** on the true cross-PE transfer span -- for any PE p, `toc[p] -
+tic[p] <= max(toc) - min(tic)` always, with equality only when the single
+longest-*duration* PE also happens to be both the earliest-starting and
+latest-finishing one. The SDK's own example computes the right quantity
+(`cycles_send = max(time_end) - min(time_start)`), correcting for
+cross-PE clock skew via a one-time reference-clock sync first (PE tsc
+counters aren't synchronized at boot).
+
+**Fix, phase 1 (kept both, added the correct one alongside)**: a new
+`f_sync_hostdevice()` entrypoint in `bool_pe.csl` reuses the kernel's own
+existing `mpi_x`/`mpi_y` `<collectives_2d>` instances -- a single
+`mpi_x.broadcast(MID, ...)` reaches the whole grid in one phase, since
+`pe_id` in `collectives_2d` is scoped to one axis and every row broadcasts
+independently and simultaneously -- rather than porting the SDK's own
+hand-rolled sync module verbatim, whose hardcoded task IDs/colors/queues
+all collided with `mpi_x`/`mpi_y`'s existing allocation. Task ID 25
+(confirmed free by compiling, same empirical-trial convention as section
+14's own task IDs). A new `tsc_ref_buffer` captures each PE's reference
+timestamp; `bfs_timing.read_sync_corrected_span` reads it back alongside
+the raw `tsc_start_buffer`/`tsc_end_buffer` and applies a propagation-delay
+correction (`hop_distance = |pcol_id - MID)`, one cycle per hop, mirroring
+the SDK example's own `(px+py)` correction for its differently-shaped relay)
+before computing `max(corrected_toc) - min(corrected_tic)`. Called three
+separate times per run -- before `h2d_matrix`, before `h2d_seed`, before
+`d2h` -- rather than one shared upfront sync, since `h2d_seed`/`d2h` are
+separated by the entire BFS run.
+
+Validated on real hardware at scale (RMAT s17, `750x750`, WSE-3): the
+`span_cycles ≥ max_cycles` proof held in every case, and `d2h` at this
+scale showed a **51% understatement** (`max_cycles`=3,044,320 vs.
+`span_cycles`=4,613,653) -- `h2d_matrix`/`h2d_seed` showed almost no gap
+(~1,700 cycles), consistent with `d2h`'s narrow-column transfer pattern
+having more real cross-PE fan-out skew than the two wide, one-shot bulk
+uploads. A second back-to-back run of the identical compiled kernel showed
+`max_cycles` and `span_cycles` both swinging by the *same* absolute ~431K
+cycles between runs (real host<->device network jitter, confirmed stable
+and near-zero for the purely-on-device `parent_resolve` bracket run
+alongside it) -- i.e. the fix improves **accuracy** (removes a proven
+systematic bias), not **precision** (real infrastructure noise is a
+property of the transfer itself, not the measurement method).
+
+**Fix, phase 2 (dropped the old one)**: once the new span was validated as
+strictly more accurate and never worse, there was nothing left to keep the
+old per-PE-max approach alongside for, so it was dropped for `h2d_matrix`/
+`h2d_seed`/`d2h` specifically -- `{part}_min_cycles`/`_max_cycles`/
+`_avg_cycles` no longer exist for those three; `{part}_span_cycles` is now
+the only number recorded, and it feeds `search_time_cycles`/GTEPS directly
+(previously the span was logged alongside but not wired into that math).
+`read_tic_toc_delta` itself is unchanged and still correct for
+`transpose_cycles`/`parent_resolve_cycles`/`round_trip_cycles` -- all
+on-device-only quantities that never leave the fabric, where no cross-PE
+sync concept applies and the old self-relative-delta approach was never
+wrong. `plot_bfs_timing.py`'s h2d/d2h bars lost their per-PE min tick
+(nothing to show any more, a single span isn't a per-PE statistic);
+`plot_bfs_timing_poster.py` reads `_span_cycles` in place of `_max_cycles`.
+`plot_grid_scale_heatmap.py` needed no changes -- its GTEPS/`%
+communication` panels never touched `h2d`/`d2h` columns at all, confirmed
+by direct comparison against its own already-published `rmat_grid_scale`
+heatmap: the new run's GTEPS-excl-transfer and `%` communication for
+`s17`/`750x750` matched that heatmap's cell exactly (13 GTEPS, 89%).

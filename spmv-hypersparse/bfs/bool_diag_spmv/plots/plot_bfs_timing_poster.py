@@ -110,9 +110,13 @@ def plot_timing_row_poster(row, out_path):
   compute = local_compute + local_term_cond
   communication = np.clip(round_duration - local_compute - local_term_cond, 0.0, None)
 
-  h2d_seed_max = cycles_to_ms(int(row["h2d_seed_max_cycles"]), clock_freq_hz)
+  # sync-corrected cross-PE span (see bfs_timing.read_sync_corrected_span) --
+  # the only h2d_seed/d2h timing this project records now. parent_resolve
+  # is on-device only (no host transfer, no sync bracket), so it keeps its
+  # original per-PE max.
+  h2d_seed_max = cycles_to_ms(int(row["h2d_seed_span_cycles"]), clock_freq_hz)
   parent_resolve_max = cycles_to_ms(int(row["parent_resolve_max_cycles"]), clock_freq_hz)
-  d2h_max = cycles_to_ms(int(row["d2h_max_cycles"]), clock_freq_hz)
+  d2h_max = cycles_to_ms(int(row["d2h_span_cycles"]), clock_freq_hz)
 
   round_xs = np.arange(profiled_rounds)
   transfer_labels = ["h2d_seed", "resolve", "d2h"]

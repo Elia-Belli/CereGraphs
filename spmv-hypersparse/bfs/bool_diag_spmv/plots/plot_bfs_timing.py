@@ -254,9 +254,14 @@ def plot_timing_row(row, out_path):
       f"transpose_max_cycles has {len(transpose_heights)} entries, expected "
       f"profiled_rounds={profiled_rounds}")
 
-  h2d_min = {p: int(row[f"{p}_min_cycles"]) for p in H2D_PARTS}
-  h2d_max = {p: int(row[f"{p}_max_cycles"]) for p in H2D_PARTS}
-  d2h_min, d2h_max = int(row["d2h_min_cycles"]), int(row["d2h_max_cycles"])
+  # h2d_matrix/h2d_seed/d2h: sync-corrected cross-PE span only (see
+  # bfs_timing.read_sync_corrected_span) -- no per-PE min/avg to show
+  # anymore, since the per-PE-max-of-self-delta approach these replaced was
+  # a structural lower bound on this span, not an independent measurement.
+  h2d_span = {p: int(row[f"{p}_span_cycles"]) for p in H2D_PARTS}
+  d2h_span = int(row["d2h_span_cycles"])
+  # parent_resolve is on-device only (no host transfer, no sync bracket), so
+  # it keeps the original per-PE min/max/avg approach.
   parent_resolve_min = int(row["parent_resolve_min_cycles"])
   parent_resolve_max = int(row["parent_resolve_max_cycles"])
 
@@ -295,14 +300,15 @@ def plot_timing_row(row, out_path):
   def add_solo_bar(ax, xpos, height, tick_y, color, label):
     ax.bar([xpos], [height], width=bar_width, color=color, edgecolor=SURFACE,
            linewidth=2, label=label, zorder=2)
-    ax.plot([xpos - bar_width / 2 * 0.7, xpos + bar_width / 2 * 0.7], [tick_y, tick_y],
-            color=TEXT_PRIMARY, linewidth=1.4, solid_capstyle="butt", zorder=3)
+    if tick_y is not None:
+      ax.plot([xpos - bar_width / 2 * 0.7, xpos + bar_width / 2 * 0.7], [tick_y, tick_y],
+              color=TEXT_PRIMARY, linewidth=1.4, solid_capstyle="butt", zorder=3)
     txt = ax.text(xpos, height / 2, f"{int(height)}", ha="center", va="center",
                   fontsize=7, color="white", fontweight="bold", zorder=4)
     candidate_labels.append((ax, txt, xpos, 0.0, height, bar_width))
 
   for i, part in enumerate(H2D_PARTS):
-    add_solo_bar(ax_h2d, i, h2d_max[part], h2d_min[part], H2D_COLORS[part], part)
+    add_solo_bar(ax_h2d, i, h2d_span[part], None, H2D_COLORS[part], part)
   # parent_resolve drawn first (xpos=0), d2h second (xpos=1) -- matches
   # their actual chronological order (the on-device reduce finishes before
   # the host's own d2h read begins, see run_bfs.py's parent_resolve_cycles
@@ -310,8 +316,8 @@ def plot_timing_row(row, out_path):
   # h2d panel's matrix->seed ordering already uses.
   add_solo_bar(ax_d2h, 0, parent_resolve_max, parent_resolve_min, PARENT_RESOLVE_COLOR,
                "parent_resolve")
-  add_solo_bar(ax_d2h, 1, d2h_max, d2h_min, D2H_COLOR, "d2h")
-  transfer_ylim = 1.15 * max(*h2d_max.values(), d2h_max, parent_resolve_max)
+  add_solo_bar(ax_d2h, 1, d2h_span, None, D2H_COLOR, "d2h")
+  transfer_ylim = 1.15 * max(*h2d_span.values(), d2h_span, parent_resolve_max)
   ax_h2d.set_ylim(0, transfer_ylim)
   ax_d2h.set_ylim(0, transfer_ylim)
   ax_h2d.set_xlim(-0.8, len(H2D_PARTS) - 0.2)

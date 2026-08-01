@@ -56,7 +56,8 @@ from scipy.sparse.csgraph import breadth_first_order
 # the matching bootstrap back to this directory.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots"))
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, check_round_vs_total_communication,
-                         compute_m_and_gteps, decode_phase_row, read_tic_toc_delta)
+                         compute_m_and_gteps, decode_phase_row, read_sync_corrected_span,
+                         read_tic_toc_delta)
 from bfs_tree_plot import invalid_parents
 from device_io import (csl_compile_core, derive_visited_from_parent,
                         extract_parent_result, hwl_to_oned_colmajor, memcpy_h2d_chunked,
@@ -100,11 +101,11 @@ def parse_args():
                             "exactly the kind of first full pass where a real bug should still "
                             "be caught, not just assumed correct because run_bfs.py passed once")
   parser.add_argument("--csv", default=None,
-                       help="per-search CSV path (default: results/graph500_searches.csv next "
-                            "to this script)")
+                       help="per-search CSV path (default: results/sim/graph500_searches.csv "
+                            "next to this script)")
   parser.add_argument("--summary-csv", default=None,
                        help="one-row-per-benchmark-run summary CSV (default: "
-                            "results/graph500_summary.csv next to this script)")
+                            "results/sim/graph500_summary.csv next to this script)")
   return parser.parse_args()
 
 
@@ -267,6 +268,7 @@ def main():
   sym_ts_buf = runner.get_id("ts_buf")
   sym_tsc_start_buffer = runner.get_id("tsc_start_buffer")
   sym_tsc_end_buffer = runner.get_id("tsc_end_buffer")
+  sym_tsc_ref_buffer = runner.get_id("tsc_ref_buffer")
   sym_round_trip_start_buffer = runner.get_id("round_trip_start_buffer")
   sym_round_trip_done_buffer = runner.get_id("round_trip_done_buffer")
 
@@ -278,6 +280,7 @@ def main():
 
   # --- Kernel 1 (construction): matrix structure upload, ONCE ---
   print("timing h2d: matrix structure upload (Kernel 1, construction -- done once)...")
+  runner.launch("f_sync_hostdevice", nonblock=False)
   runner.launch("f_tic", nonblock=True)
 
   memcpy_h2d_chunked(runner, sym_mat_rows_buf, mat_rows_buf, height, width, max_local_nnz,
@@ -311,10 +314,10 @@ def main():
                      order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
   runner.launch("f_toc", nonblock=False)  # blocks -> every matrix-structure h2d above is done
-  h2d_matrix_cycles = read_tic_toc_delta(runner, sym_tsc_start_buffer, sym_tsc_end_buffer,
-                                          height, width)
-  construction_time_seconds = int(h2d_matrix_cycles.max()) / CLOCK_FREQ_HZ
-  print(f"construction (h2d_matrix): max={int(h2d_matrix_cycles.max())} cycles "
+  h2d_matrix_span_cycles = read_sync_corrected_span(
+      runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
+  construction_time_seconds = h2d_matrix_span_cycles / CLOCK_FREQ_HZ
+  print(f"construction (h2d_matrix): sync-corrected span={h2d_matrix_span_cycles} cycles "
         f"({construction_time_seconds * 1e6:.2f} us) -- NOT part of any search's own time")
 
   # --- Kernel 2: one BFS search per root, each timed individually ---
@@ -327,13 +330,14 @@ def main():
     # docstring for why every other PE's x_bitmap is already provably zero.
     px, py, local_x = single_source_seed_pe(source, blk, P)
 
+    runner.launch("f_sync_hostdevice", nonblock=False)
     runner.launch("f_tic", nonblock=True)
     runner.memcpy_h2d(sym_x_bitmap, local_x, px, py, 1, 1, bitmap_words,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     runner.launch("f_toc", nonblock=False)  # blocks -> seed x h2d above is done
-    h2d_seed_cycles = read_tic_toc_delta(runner, sym_tsc_start_buffer, sym_tsc_end_buffer,
-                                          height, width)
+    h2d_seed_span_cycles = read_sync_corrected_span(
+        runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
 
     # the only per-search "reset": bool_pe.csl's start_spmv() reinitializes
     # visited_bitmap/rounds_completed/parent_local_buf/ts_round itself on every
@@ -346,6 +350,7 @@ def main():
     # recovers visited from parent_local_buf alone, so only that one
     # transfer needs to be timed as the search's "output written to memory"
     # cost, and it's folded into search_time_cycles below.
+    runner.launch("f_sync_hostdevice", nonblock=False)
     runner.launch("f_tic", nonblock=True)
     # Phase B of the on-device parent resolution plan: bool_pe.csl already
     # resolved each row's P per-PE candidates down to a single winner at
@@ -356,8 +361,8 @@ def main():
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     runner.launch("f_toc", nonblock=False)  # blocks -> the d2h read above is done
-    d2h_cycles = read_tic_toc_delta(runner, sym_tsc_start_buffer, sym_tsc_end_buffer,
-                                     height, width)
+    d2h_span_cycles = read_sync_corrected_span(
+        runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
 
     rounds_buf = np.zeros(height * width, np.uint32)
     runner.memcpy_d2h(rounds_buf, sym_rounds_completed, 0, 0, width, height, 1,
@@ -400,7 +405,7 @@ def main():
     (row_cols, device_time_cycles, profiled_rounds, round_duration_cycles,
      local_compute_max_cycles, local_term_cond_max_cycles) = decode_phase_row(
         ts_hwl_u32, height, width, max_rounds, rounds_completed, round_trip_cycles, verbose=False)
-    search_time_cycles = int(h2d_seed_cycles.max()) + device_time_cycles + int(d2h_cycles.max())
+    search_time_cycles = h2d_seed_span_cycles + device_time_cycles + d2h_span_cycles
     m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(
         A_coo_static, device_visited, is_symmetric, search_time_cycles)
 
@@ -425,8 +430,8 @@ def main():
         "profiled_rounds": profiled_rounds,
         "max_rounds": max_rounds,
         "correctness_ok": scipy_ok,
-        "h2d_seed_max_cycles": int(h2d_seed_cycles.max()),
-        "d2h_max_cycles": int(d2h_cycles.max()),
+        "h2d_seed_span_cycles": h2d_seed_span_cycles,
+        "d2h_span_cycles": d2h_span_cycles,
         "search_time_cycles": search_time_cycles,
         "visited_count": int(np.sum(device_visited)),
         "m_edges_traversed": m,
@@ -462,6 +467,7 @@ def main():
       "num_searches": len(search_rows),
       "num_correctness_fail": n_correctness_fail,
       "construction_time_seconds": construction_time_seconds,
+      "h2d_matrix_span_cycles": h2d_matrix_span_cycles,
       "harmonic_mean_gteps": hmean_gteps,
       "min_gteps": min(finite_gteps) if finite_gteps else float("nan"),
       "median_gteps": float(np.median(finite_gteps)) if finite_gteps else float("nan"),
@@ -478,7 +484,7 @@ def main():
                                     "see m_convention"))
 
   csv_path = args.csv or os.path.join(os.path.dirname(os.path.abspath(__file__)), "results",
-                                       "graph500_searches.csv")
+                                       "sim", "graph500_searches.csv")
   os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
   write_header = not os.path.exists(csv_path)
   if not write_header:
@@ -496,7 +502,7 @@ def main():
   print(f"appended {len(search_rows)} per-search rows to {csv_path}")
 
   summary_csv_path = args.summary_csv or os.path.join(
-      os.path.dirname(os.path.abspath(__file__)), "results", "graph500_summary.csv")
+      os.path.dirname(os.path.abspath(__file__)), "results", "sim", "graph500_summary.csv")
   os.makedirs(os.path.dirname(os.path.abspath(summary_csv_path)), exist_ok=True)
   write_header = not os.path.exists(summary_csv_path)
   if not write_header:

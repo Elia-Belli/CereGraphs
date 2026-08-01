@@ -211,7 +211,7 @@ def main():
   root = args.root
 
   code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "src", "layout_reduce_select_test.csl")
+                           "..", "src", "layout_reduce_select_test.csl")
 
   send_hwl, real_sets = make_test_data(P, count, seed=0)
 

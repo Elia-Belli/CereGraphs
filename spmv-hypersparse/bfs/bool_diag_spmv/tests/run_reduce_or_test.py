@@ -169,7 +169,7 @@ def main():
   root = args.root
 
   code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "src", "layout_reduce_or_test.csl")
+                           "..", "src", "layout_reduce_or_test.csl")
 
   # random per-PE test data, one word per count -- exercises every bit
   # position across whatever [count]u32 words the OR-reduce combines, not

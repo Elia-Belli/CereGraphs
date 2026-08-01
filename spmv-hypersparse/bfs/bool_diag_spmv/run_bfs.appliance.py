@@ -135,6 +135,38 @@ def read_tic_toc_delta_appliance(runner, sym_tsc_start, sym_tsc_end, height, wid
   return toc - tic
 
 
+def read_sync_corrected_span_appliance(runner, sym_tsc_start, sym_tsc_end, sym_tsc_ref,
+                                        height, width):
+  """Same as bfs_timing.read_sync_corrected_span, but against the appliance
+  MemcpyDataType/MemcpyOrder enums -- see read_tic_toc_delta_appliance's own
+  comment for why this can't just reuse the simulator-pybind-backed version."""
+  from bfs_timing import TSC_WORDS  # local: avoid importing the simulator pybind module at file scope
+
+  def _read(sym):
+    buf_1d = np.zeros(height * width * TSC_WORDS, np.uint32)
+    runner.memcpy_d2h(buf_1d, sym, 0, 0, width, height, TSC_WORDS, streaming=False,
+                       data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.COL_MAJOR,
+                       nonblock=False)
+    hwl = np.reshape(buf_1d, (height, width, TSC_WORDS), order="F")
+    w0 = hwl[..., 0].astype(np.int64)
+    w1 = hwl[..., 1].astype(np.int64)
+    w2 = hwl[..., 2].astype(np.int64)
+    return (w0 + (w1 << 16) + (w2 << 32)).reshape(-1)
+
+  tic = _read(sym_tsc_start)
+  toc = _read(sym_tsc_end)
+  ref = _read(sym_tsc_ref)
+
+  mid = width // 2
+  pcol_id = np.tile(np.arange(width, dtype=np.int64), height)
+  hop_distance = np.abs(pcol_id - mid)
+
+  corrected_ref = ref - hop_distance
+  corrected_tic = tic - corrected_ref
+  corrected_toc = toc - corrected_ref
+  return int(corrected_toc.max() - corrected_tic.min())
+
+
 def parse_args():
   parser = argparse.ArgumentParser()
   parser.add_argument("--infile_mtx", required=True, help="the sparse matrix in MTX format")
@@ -168,7 +200,8 @@ def parse_args():
                             "flag for the full explanation")
   parser.add_argument("--csv", default=None,
                        help="CSV file to append this run's timing row to "
-                            "(default: results/bfs_timing.csv next to this script)")
+                            "(default: results/sim/bfs_timing.csv or results/hw/bfs_timing.csv "
+                            "next to this script, depending on --simulator)")
   parser.add_argument("--out-tree", default=None, help="tree plot output path")
   parser.add_argument("--out-timing", default=None, help="timing plot output path")
   parser.add_argument("--no-show-parent-mismatch", dest="show_parent_mismatch",
@@ -350,6 +383,7 @@ def main():
       sym_ts_buf = runner.get_id("ts_buf")
       sym_tsc_start_buffer = runner.get_id("tsc_start_buffer")
       sym_tsc_end_buffer = runner.get_id("tsc_end_buffer")
+      sym_tsc_ref_buffer = runner.get_id("tsc_ref_buffer")
       sym_nf_history = runner.get_id("nf_history")
       sym_direction_history = runner.get_id("direction_history")
       sym_transpose_tic_buffer = runner.get_id("transpose_tic_buffer")
@@ -365,6 +399,7 @@ def main():
       print("enabling tsc...")
       runner.launch("f_enable_tsc", nonblock=False)
       print("timing h2d: matrix structure upload (Graph500-style 'construction')...")
+      runner.launch("f_sync_hostdevice", nonblock=False)
       runner.launch("f_tic", nonblock=True)
 
     memcpy_h2d_chunked(runner, sym_mat_rows_buf, mat_rows_buf, height, width, max_local_nnz,
@@ -397,29 +432,31 @@ def main():
                        streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=not need_timing)
 
-    h2d_matrix_cycles = None
+    h2d_matrix_span_cycles = None
     if need_timing:
       runner.launch("f_toc", nonblock=False)
-      h2d_matrix_cycles = read_tic_toc_delta_appliance(
-          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, height, width)
+      h2d_matrix_span_cycles = read_sync_corrected_span_appliance(
+          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
       print("timing h2d: seed x upload (Graph500-style per-search cost)...")
+      runner.launch("f_sync_hostdevice", nonblock=False)
       runner.launch("f_tic", nonblock=True)
 
     runner.memcpy_h2d(sym_x_bitmap, seed_local_x, seed_px, seed_py, 1, 1, bitmap_words,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
-    h2d_seed_cycles = None
+    h2d_seed_span_cycles = None
     if need_timing:
       runner.launch("f_toc", nonblock=False)
-      h2d_seed_cycles = read_tic_toc_delta_appliance(
-          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, height, width)
+      h2d_seed_span_cycles = read_sync_corrected_span_appliance(
+          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
 
     print("running f_spmv_iter...")
     runner.launch("f_spmv_iter", nonblock=False)
 
     if need_timing:
       print("timing d2h readback (parent_local_buf -- the real BFS output)...")
+      runner.launch("f_sync_hostdevice", nonblock=False)
       runner.launch("f_tic", nonblock=True)
 
     # Phase B of the on-device parent resolution plan: bool_pe.csl already
@@ -433,11 +470,11 @@ def main():
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
-    d2h_cycles = None
+    d2h_span_cycles = None
     if need_timing:
       runner.launch("f_toc", nonblock=False)
-      d2h_cycles = read_tic_toc_delta_appliance(
-          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, height, width)
+      d2h_span_cycles = read_sync_corrected_span_appliance(
+          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
 
     rounds_buf = np.zeros(height * width, np.uint32)
     runner.memcpy_d2h(rounds_buf, sym_rounds_completed, 0, 0, width, height, 1,
@@ -549,7 +586,8 @@ def main():
   if not args.notree:
     matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
     out_tree = args.out_tree or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "plots", "tree",
+        os.path.dirname(os.path.abspath(__file__)), "plots",
+        "sim" if args.simulator else "hw", "tree",
         f"{matrix_stem}_{np_cols}x{np_rows}_src{source}.png")
     render_tree_comparison(
         A_csr, source, scipy_parent, scipy_visited, scipy_levels,
@@ -571,13 +609,28 @@ def main():
         "matrix_symmetric": is_symmetric,
     }
 
-    for name, cycles in (("h2d_matrix", h2d_matrix_cycles), ("h2d_seed", h2d_seed_cycles),
-                         ("d2h", d2h_cycles), ("parent_resolve", parent_resolve_cycles)):
+    # parent_resolve has no sync bracket (it's an on-device-only reduce, not
+    # a host-device transfer) -- still the per-PE-max-of-self-delta approach,
+    # which is exactly right there (no cross-PE clock sync needed for a
+    # quantity that never leaves the fabric).
+    for name, cycles in (("parent_resolve", parent_resolve_cycles),):
       row[f"{name}_min_cycles"] = int(cycles.min())
       row[f"{name}_max_cycles"] = int(cycles.max())
       row[f"{name}_avg_cycles"] = f"{cycles.mean():.1f}"
       print(f"  {name:>18s}: min={int(cycles.min())} max={int(cycles.max())} "
             f"avg={cycles.mean():.1f}")
+
+    # Sync-corrected cross-PE span (see
+    # read_sync_corrected_span_appliance/bfs_timing.read_sync_corrected_span) --
+    # the true max(toc)-min(tic) across all PEs. This is now the ONLY h2d/d2h
+    # timing this project records: the per-PE-max-of-self-delta approach it
+    # replaced was a structural lower bound on this span (proved and measured
+    # -- understated d2h by ~51% at a 750x750 grid), never more accurate, so
+    # there was nothing worth keeping it alongside for.
+    for name, span in (("h2d_matrix", h2d_matrix_span_cycles),
+                        ("h2d_seed", h2d_seed_span_cycles), ("d2h", d2h_span_cycles)):
+      row[f"{name}_span_cycles"] = span
+      print(f"  {name:>18s}: sync-corrected span={span}")
 
     (row_cols, device_time_cycles, profiled_rounds, round_duration_cycles,
      local_compute_max_cycles, local_term_cond_max_cycles) = decode_phase_row(
@@ -647,8 +700,8 @@ def main():
     # back in; the full search_time_cycles then adds the host transfer
     # brackets on top.
     search_time_cycles_no_transfer = device_time_cycles + int(parent_resolve_cycles.max())
-    search_time_cycles = (int(h2d_seed_cycles.max()) + search_time_cycles_no_transfer
-                           + int(d2h_cycles.max()))
+    search_time_cycles = (h2d_seed_span_cycles + search_time_cycles_no_transfer
+                           + d2h_span_cycles)
     row["search_time_cycles"] = search_time_cycles
     print(f"[[ search_time_cycles (h2d_seed + device rounds [incl. transpose, parent_resolve] "
           f"+ d2h parent readback, docs/GRAPH500_BENCHMARK.md section 3): {search_time_cycles} ]]")
@@ -705,7 +758,7 @@ def main():
     csv_path = args.csv
     if csv_path is None:
       csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results",
-                               "bfs_timing.csv")
+                               "sim" if args.simulator else "hw", "bfs_timing.csv")
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
     write_header = not os.path.exists(csv_path)
     if not write_header:
@@ -722,7 +775,8 @@ def main():
       writer.writerow(row)
     print(f"appended timing row to {csv_path}")
 
-    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
+    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots",
+                              "sim" if args.simulator else "hw")
     out_timing = args.out_timing or plot_bfs_timing.default_out_path(
         plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
     plot_bfs_timing.plot_timing_row(row, out_timing)

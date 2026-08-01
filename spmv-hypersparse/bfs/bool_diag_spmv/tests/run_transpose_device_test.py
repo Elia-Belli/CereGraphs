@@ -99,7 +99,7 @@ def main():
   if fabric_width == 0 or fabric_height == 0:
     fabric_width, fabric_height = min_fabric_width, min_fabric_height
 
-  code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "layout_bool.csl")
+  code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "layout_bool.csl")
   csl_compile_core(
       args.driver, code_csl, args.latestlink, fabric_width, fabric_height,
       core_fabric_offset_x, core_fabric_offset_y, False, args.arch,

@@ -13,11 +13,30 @@ is append-only; a matrix file can be rebalanced and rerun under the same
 (infile_mtx, pe_grid) key).
 
 Usage: cs_python plots/plot_grid_scale_heatmap.py
-         [--csv=results/hw/bfs_timing.csv] [--out=plots/heatmap/rmat_grid_scale.png]
+         [--csv=results/hw/timings_heatmap.csv] [--out=plots/heatmap/rmat_grid_scale.png]
 
 A missing (scale, grid) cell -- not yet run, or run and never landed a CSV
 row (compile/link failure) -- is drawn hatched, not colored zero; GTEPS=0
 and "never run" are different facts and must not look the same.
+
+results/hw/timings_heatmap.csv is a separate file from results/hw/
+bfs_timing.csv (the ongoing, per-run log run_bfs.appliance.py appends to)
+-- restored from the real-hardware sweep at commit 2880cd0 (the last one
+before the skew-adjustment-removal refactor deleted it), then stripped down
+to exactly the columns this script reads: local_compute*/local_term_cond*/
+parent_resolve*/transpose*/search_time_cycles_no_transfer/gteps_no_transfer
+never depended on the skew-adjustment machinery that refactor removed (only
+the individual communication-phase columns did, e.g. visited_bcast_*/
+relay_*), so these numbers are still correct under the current methodology
+-- confirmed by an independent real-hardware re-run of one cell
+(rmat_s17_e16.balanced750x750, 750x750) landing on the exact same GTEPS/%
+communication this sweep's own already-published heatmap shows (13, 89%).
+Host-transfer columns (h2d_matrix/h2d_seed/d2h, and the full
+search_time_cycles/gteps/search_time_seconds built from them) are dropped
+entirely, not carried forward under some "_legacy" name -- they used the
+per-PE-max method later found to understate the true cross-PE span (see
+docs/GRAPH500_BENCHMARK.md section 15), and the raw per-PE data needed to
+retroactively recompute the sync-corrected span no longer exists.
 """
 
 import argparse
@@ -182,9 +201,9 @@ def load_rows(csv_path):
 def main():
   p = argparse.ArgumentParser()
   p.add_argument("--csv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
-                                                "results", "hw", "bfs_timing.csv"))
+                                                "results", "hw", "timings_heatmap.csv"))
   p.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                "heatmap", "rmat_grid_scale.png"))
+                                                "hw", "heatmap", "rmat_grid_scale.png"))
   args = p.parse_args()
 
   by_key = load_rows(args.csv)
