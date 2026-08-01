@@ -33,13 +33,15 @@
   colors so this stays behaviorally consistent with the original -- only
   the layout and fused/recolored round segments are new.
 
-  The host-device/parent_resolve panel (right) shows mean +/- std across
-  every matching row instead of a single sample -- real hardware showed
-  genuine run-to-run jitter in the host-transfer brackets (h2d_matrix/
-  h2d_seed/d2h; see docs/GRAPH500_BENCHMARK.md section 15), so a single run
-  isn't representative on its own. The per-round device-time panel (left)
-  is drawn from a single representative run (the most recent match) --
-  on-device work showed no comparable variance, confirmed on real hardware.
+  The host-device/parent_resolve and h2d_matrix panels show mean +/- std
+  across every matching row instead of a single sample -- real hardware
+  showed genuine run-to-run jitter in the host-transfer brackets
+  (h2d_matrix/h2d_seed/d2h; see docs/GRAPH500_BENCHMARK.md section 15), so
+  a single run isn't representative on its own. The per-round device-time
+  panel is drawn from a single representative run (the most recent match)
+  -- on-device work showed no comparable variance, confirmed on real
+  hardware. The mean +/- std methodology itself isn't captioned on the
+  figure -- it's explained externally, wherever this poster gets used.
 
   How to run (from bool_diag_spmv/), aggregating every run of one config:
      python3 plots/plot_bfs_timing_poster.py --csv results/hw/bfs_timing.csv \\
@@ -75,10 +77,6 @@ COMMUNICATION_COLOR = "#eb6834"  # orange
 # look identical) -- next unused step in this repo's validated categorical
 # order (palette.md slot 4) instead.
 D2H_COLOR = "#eda100"  # yellow
-# Magnitude-jump callout only (see plot_timing_row_poster's ax_spacer) --
-# not part of the bar palette above, deliberately a plain, attention-
-# grabbing red so the scale jump reads as a callout, not another data series.
-MAGNITUDE_CALLOUT_COLOR = "#c0392b"
 
 TITLE_FONTSIZE = 15
 PANEL_TITLE_FONTSIZE = 13
@@ -118,23 +116,6 @@ def mean_std_ms(rows, cycles_key, clock_freq_hz):
   return float(values.mean()), (float(values.std(ddof=1)) if len(values) > 1 else 0.0)
 
 
-_SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-
-
-def order_of_magnitude_label(ratio):
-  """'x10^N' (unicode superscript, e.g. '×10³'), N = floor(log10(ratio)) --
-  the nearest power of ten ratio rounds DOWN to, for the magnitude-jump
-  callout between the h2d_matrix panel and its neighbor. Order of
-  magnitude, not the precise ratio: the callout's job is "this is
-  thousands of times bigger", not a number a reader would try to verify
-  against the bars themselves (each panel's own bars/ticks already carry
-  the precise values)."""
-  if ratio <= 0:
-    return "×10⁰"
-  oom = int(np.floor(np.log10(ratio)))
-  return f"×10{str(oom).translate(_SUPERSCRIPT_DIGITS)}"
-
-
 def plot_timing_row_poster(rows, out_path):
   """rows: every CSV row for the SAME (infile_mtx, pe_grid) config (one run
   each) -- see select_rows. The per-round device-time panel (left) is
@@ -147,7 +128,6 @@ def plot_timing_row_poster(rows, out_path):
   matrix = row["infile_mtx"]
   pe_grid = row["pe_grid"]
   clock_freq_hz = float(row.get("clock_freq_hz") or CLOCK_FREQ_HZ)
-  n_runs = len(rows)
 
   round_duration = cycles_to_ms(parse_cycle_list(row["round_duration_cycles"]).astype(float),
                                  clock_freq_hz)
@@ -167,7 +147,7 @@ def plot_timing_row_poster(rows, out_path):
   # sync-corrected cross-PE span (see bfs_timing.read_sync_corrected_span) --
   # the only h2d_matrix/h2d_seed/d2h timing this project records now.
   # parent_resolve is on-device only (no host transfer, no sync bracket),
-  # so it keeps its original per-PE max. Mean +/- std across all n_runs.
+  # so it keeps its original per-PE max. Mean +/- std across all of `rows`.
   h2d_matrix_mean, h2d_matrix_std = mean_std_ms(rows, "h2d_matrix_span_cycles", clock_freq_hz)
   h2d_seed_mean, h2d_seed_std = mean_std_ms(rows, "h2d_seed_span_cycles", clock_freq_hz)
   parent_resolve_mean, parent_resolve_std = mean_std_ms(
@@ -184,16 +164,12 @@ def plot_timing_row_poster(rows, out_path):
   # which on a shared linear scale would crush those three to invisible
   # slivers, the exact "two measures of different scale" anti-pattern this
   # file's own docstring already avoids once (rounds vs. transfer panels).
-  # A narrow, axis-off spacer panel between ax_transfer and ax_h2d_matrix
-  # carries an order-of-magnitude callout instead of a shared axis, so the
-  # jump is stated directly rather than implied by a squashed bar.
   round_w_in = max(0.9 * profiled_rounds, 2.6)
   transfer_w_in = 1.3 * len(transfer_labels)
   h2d_matrix_w_in = 1.3
-  spacer_w_in = 1.3
-  fig, (ax_rounds, ax_transfer, ax_spacer, ax_h2d_matrix) = plt.subplots(
-      1, 4, figsize=(round_w_in + transfer_w_in + spacer_w_in + h2d_matrix_w_in + 1.5, 6.5),
-      gridspec_kw={"width_ratios": [round_w_in, transfer_w_in, spacer_w_in, h2d_matrix_w_in],
+  fig, (ax_rounds, ax_transfer, ax_h2d_matrix) = plt.subplots(
+      1, 3, figsize=(round_w_in + transfer_w_in + h2d_matrix_w_in + 1.5, 6.5),
+      gridspec_kw={"width_ratios": [round_w_in, transfer_w_in, h2d_matrix_w_in],
                    "wspace": 0.25})
 
   bar_width = 0.62
@@ -243,20 +219,6 @@ def plot_timing_row_poster(rows, out_path):
   # axis, instead of a full "20000"/"40000" on every tick.
   ax_h2d_matrix.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
 
-  # magnitude-jump callout: order of magnitude h2d_matrix is bigger than the
-  # largest bar on the "small" side (rounds or h2d_seed/resolve/d2h) --
-  # states the scale difference directly instead of leaving a reader to
-  # infer it from two panels with different axes. Positioned high in the
-  # spacer (near where each panel's own y-axis starts reading large
-  # values) and hugging ax_h2d_matrix's left edge/y-axis on the spacer's
-  # right side, with the arrow pointing straight at it.
-  small_side_max = max(round_max, transfer_max, 1e-9)
-  magnitude_ratio = h2d_matrix_mean / small_side_max
-  ax_spacer.text(0.85, 0.85, f"{order_of_magnitude_label(magnitude_ratio)} →", ha="right",
-                 va="center", fontsize=11, color=MAGNITUDE_CALLOUT_COLOR, fontweight="bold",
-                 transform=ax_spacer.transAxes)
-  ax_spacer.axis("off")
-
   # No direction (TD/BU) suffix -- these poster plots only ever show
   # top-down rounds, so the label would be redundant on every round.
   round_labels = [f"round {r}" for r in range(profiled_rounds)]
@@ -286,15 +248,10 @@ def plot_timing_row_poster(rows, out_path):
     if not (fits_w and fits_h):
       txt.remove()
 
-  # Mean/std-across-runs methodology goes in the caption below (see
-  # fig.text near the legend), not the titles -- keeps the titles short and
-  # avoids repeating the same parenthetical on two adjacent panels.
-  ax_h2d_matrix.set_ylabel("ms", labelpad=8)
-  ax_h2d_matrix.set_title("h2d_matrix", fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
+  # No "ms" ylabel on ax_h2d_matrix -- ax_rounds (leftmost) already
+  # establishes the unit for the whole figure; repeating it on the
+  # rightmost panel is redundant.
   ax_rounds.set_ylabel("ms", labelpad=8)
-  ax_rounds.set_title("Per-Round Device Time", fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
-  ax_transfer.set_title("Host-Device + Parent Resolve",
-                         fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
 
   fig.suptitle(f"Timing Split on {poster_title_input(matrix)} and {pe_grid} PE Grid",
                fontsize=TITLE_FONTSIZE)
@@ -315,27 +272,26 @@ def plot_timing_row_poster(rows, out_path):
     handles += h
     labels += l
   fig.legend(handles, labels, loc="lower center", ncol=len(handles), frameon=False,
-             fontsize=LEGEND_FONTSIZE, bbox_to_anchor=(0.5, 0.02), columnspacing=1.8,
+             fontsize=LEGEND_FONTSIZE, bbox_to_anchor=(0.5, 0.01), columnspacing=1.8,
              handletextpad=0.6, labelspacing=1.0)
+  # No mean/std-methodology caption on the figure itself -- explained
+  # externally, wherever this poster gets used (see module docstring).
+  plt.tight_layout(rect=[0, 0.08, 1, 0.93])
 
-  # Mean/std-across-runs methodology lives here, not in the panel titles
-  # (see the title-setting block above) -- one caption line instead of
-  # repeating the same parenthetical on two panels. Above the legend (not
-  # below it) so reading order is explanation -> color key.
-  if n_runs > 1:
-    fig.text(0.5, 0.14,
-              f"h2d_matrix/h2d_seed/resolve/d2h bars: mean ± std across n={n_runs} repeated "
-              "real-hardware runs of the same input.",
-              ha="center", va="center", fontsize=9, color=TEXT_MUTED)
-
-  # NOT tight_layout(rect=...) -- the axis-off ax_spacer panel makes
-  # tight_layout ignore/misjudge the requested rect (it prints its own
-  # "Axes ... not compatible with tight_layout" warning), so the caption
-  # below ends up overlapping the round panel's x-tick labels regardless of
-  # the rect margin passed in. subplots_adjust sets the figure margins
-  # directly and isn't subject to that same auto-layout guesswork.
-  plt.tight_layout()
-  fig.subplots_adjust(bottom=0.24, top=0.88)
+  # Panel titles as fig.text at one shared, absolute figure-fraction y,
+  # positioned AFTER tight_layout (using each axes' own now-final
+  # get_position()) instead of ax.set_title(): matplotlib's per-axes title
+  # placement auto-adjusts to clear each axes' own decorations (h2d_matrix's
+  # scientific-notation offset text needs more clearance than the other two
+  # panels have), so ax.set_title() alone renders the three titles at
+  # different heights. One shared figure-space y sidesteps that entirely.
+  title_y = 0.91
+  for ax, text in ((ax_rounds, "Per-Round Device Time"),
+                   (ax_transfer, "Host-Device + Parent Resolve"),
+                   (ax_h2d_matrix, "h2d_matrix")):
+    pos = ax.get_position()
+    fig.text((pos.x0 + pos.x1) / 2, title_y, text, ha="center", va="bottom",
+              fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
 
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=200, bbox_inches="tight")
