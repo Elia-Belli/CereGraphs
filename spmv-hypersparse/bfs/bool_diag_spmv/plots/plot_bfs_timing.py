@@ -478,6 +478,27 @@ def select_row(rows, args):
   return rows[args.row]
 
 
+def select_rows(rows, args):
+  """Like select_row, but returns EVERY matching row (not just the most
+  recent) -- for callers that want to aggregate repeated runs of the same
+  (infile_mtx, pe_grid[, channels]) config (e.g. plot_bfs_timing_poster.py's
+  mean/std-across-runs mode), not just plot one. Falls back to a single
+  row (rows[args.row], wrapped in a list) when no filters are given, same
+  as select_row, so existing --row-only invocations still work unchanged."""
+  filtered = rows
+  if args.infile_mtx is not None:
+    filtered = [r for r in filtered if r["infile_mtx"] == args.infile_mtx]
+  if args.pe_grid is not None:
+    filtered = [r for r in filtered if r["pe_grid"] == args.pe_grid]
+  if args.channels is not None:
+    filtered = [r for r in filtered if int(r["channels"]) == args.channels]
+  if args.infile_mtx is not None or args.pe_grid is not None or args.channels is not None:
+    assert filtered, "no CSV rows match the given --infile_mtx/--pe_grid/--channels filters"
+    return filtered
+  assert rows, "CSV has no rows to plot"
+  return [rows[args.row]]
+
+
 def main():
   args = parse_args()
 
