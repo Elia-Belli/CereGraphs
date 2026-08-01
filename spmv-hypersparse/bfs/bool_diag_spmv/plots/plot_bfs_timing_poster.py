@@ -289,7 +289,7 @@ def _plot_timing_row_poster_linear(rows, out_path):
   ax_rounds.set_ylabel("ms", labelpad=8)
 
   fig.suptitle(f"Timing Split on {poster_title_input(matrix)} and {pe_grid} PE Grid",
-               fontsize=TITLE_FONTSIZE)
+               fontsize=TITLE_FONTSIZE, y=0.98)
   for ax in (ax_h2d_matrix, ax_rounds, ax_transfer):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -311,7 +311,11 @@ def _plot_timing_row_poster_linear(rows, out_path):
              handletextpad=0.6, labelspacing=1.0)
   # No mean/std-methodology caption on the figure itself -- explained
   # externally, wherever this poster gets used (see module docstring).
-  plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+  # rect's right=0.97 (not 1.0) leaves a sliver of padding so ax_h2d_matrix's
+  # bar/ticks don't butt right up against the figure's own right edge;
+  # top=0.88 (not 0.93) leaves clear air between the panel titles below and
+  # the suptitle above (see title_y), instead of the two crowding together.
+  plt.tight_layout(rect=[0, 0.08, 0.97, 0.88])
 
   # Panel titles as fig.text at one shared, absolute figure-fraction y,
   # positioned AFTER tight_layout (using each axes' own now-final
@@ -320,7 +324,7 @@ def _plot_timing_row_poster_linear(rows, out_path):
   # scientific-notation offset text needs more clearance than the other two
   # panels have), so ax.set_title() alone renders the three titles at
   # different heights. One shared figure-space y sidesteps that entirely.
-  title_y = 0.91
+  title_y = 0.90
   for ax, text in ((ax_rounds, "Per-Round Device Time"),
                    (ax_transfer, "Host-Device + Parent Resolve"),
                    (ax_h2d_matrix, "h2d_matrix")):
@@ -337,14 +341,17 @@ def _plot_timing_row_poster_linear(rows, out_path):
 
 
 def _plot_timing_row_poster_log(rows, out_path):
-  """One panel, one log-scale y-axis, 6 solo bars: compute/communication
-  (collapsed across every round into one total each -- no per-round
-  breakdown here) plus h2d_matrix/h2d_seed/resolve/d2h. The alternative to
-  _plot_timing_row_poster_linear's small-multiples split: a single shared
-  scale reads naturally to an audience used to log-scale benchmark charts,
-  at the cost of bar *length* no longer encoding magnitude the intuitive
-  (linear) way -- equal-looking gaps between bars are multiplicative, not
-  additive. See the module docstring for the fuller tradeoff discussion.
+  """One panel, one log-scale y-axis, 6 solo bars in chronological, grouped
+  order (not alphabetical): h2d_matrix/h2d_seed ("Host to Device"),
+  compute/communication ("Kernel" -- collapsed across every round into one
+  total each, no per-round breakdown here), resolve/d2h ("Device to Host").
+  Vertical separator lines + group labels above each pair make the 3
+  phases explicit. The alternative to _plot_timing_row_poster_linear's
+  small-multiples split: a single shared scale reads naturally to an
+  audience used to log-scale benchmark charts, at the cost of bar *length*
+  no longer encoding magnitude the intuitive (linear) way -- equal-looking
+  gaps between bars are multiplicative, not additive. See the module
+  docstring for the fuller tradeoff discussion.
 
   compute/communication have no error bars (single representative run,
   same as the linear mode's round panel -- on-device work showed no
@@ -377,16 +384,24 @@ def _plot_timing_row_poster_log(rows, out_path):
       rows, "parent_resolve_max_cycles", clock_freq_hz)
   d2h_mean, d2h_std = mean_std_ms(rows, "d2h_span_cycles", clock_freq_hz)
 
+  # Chronological, grouped order (not alphabetical/panel-inherited): the
+  # 3 phases a search actually goes through -- Host to Device (h2d_matrix,
+  # h2d_seed), Kernel (compute, communication), Device to Host (resolve,
+  # d2h -- resolve is on-device only, but it's the on-device step that
+  # produces exactly what d2h then reads off, so it belongs with d2h's
+  # phase, not the Kernel's). See group_spans below for the separators/
+  # labels that make these 3 groups visually explicit.
   bars = [
-      ("compute", compute_total, COMPUTE_COLOR, 0.0),
-      ("communication", communication_total, COMMUNICATION_COLOR, 0.0),
       ("h2d_matrix", h2d_matrix_mean, H2D_COLORS["h2d_matrix"], h2d_matrix_std),
       ("h2d_seed", h2d_seed_mean, H2D_COLORS["h2d_seed"], h2d_seed_std),
+      ("compute", compute_total, COMPUTE_COLOR, 0.0),
+      ("communication", communication_total, COMMUNICATION_COLOR, 0.0),
       ("resolve", parent_resolve_mean, PARENT_RESOLVE_COLOR, parent_resolve_std),
       ("d2h", d2h_mean, D2H_COLOR, d2h_std),
   ]
+  group_spans = [("Host to Device", 0, 1), ("Kernel", 2, 3), ("Device to Host", 4, 5)]
 
-  fig, ax = plt.subplots(figsize=(1.5 * len(bars) + 1.5, 6.5))
+  fig, ax = plt.subplots(figsize=(1.5 * len(bars) + 1.5, 5.5))
   bar_width = 0.62
   xs = np.arange(len(bars))
   for x, (name, height, color, yerr) in zip(xs, bars):
@@ -402,7 +417,21 @@ def _plot_timing_row_poster_log(rows, out_path):
     ax.text(x, height * 1.2, f"{height:.3f}", ha="center", va="bottom", fontsize=8,
             color=TEXT_PRIMARY, fontweight="bold", zorder=4)
 
+  # Vertical separators between the 3 phase groups (after h2d_seed, after
+  # communication) -- full-height regardless of the log-scale ylim, since
+  # axvline's y range is axes-fraction (0-1) by default, not data space.
+  for sep_x in (1.5, 3.5):
+    ax.axvline(sep_x, color=BASELINE, linewidth=1, zorder=1)
+
   ax.set_yscale("log")
+  # Explicit ylim, not matplotlib's own log-scale auto-margin (which pads
+  # generously in log space -- across the ~6 decades this chart spans,
+  # that default margin leaves a lot of dead space above the tallest bar's
+  # label). A tight, data-driven range instead: just below the smallest
+  # bar, just above the tallest label.
+  min_height = min(height for _, height, _, _ in bars)
+  max_label_top = max(height * 1.2 for _, height, _, _ in bars)
+  ax.set_ylim(min_height * 0.5, max_label_top * 1.3)
   ax.set_xticks(xs)
   ax.set_xticklabels([name for name, _, _, _ in bars])
   ax.set_xlim(-0.8, len(bars) - 0.2)
@@ -417,9 +446,17 @@ def _plot_timing_row_poster_log(rows, out_path):
   ax.set_facecolor(SURFACE)
   fig.patch.set_facecolor(SURFACE)
 
+  # Group labels above their own span -- x in data coords, y in axes
+  # fraction (get_xaxis_transform), so they stay put above the bars
+  # regardless of the log-scale y-range.
+  group_transform = ax.get_xaxis_transform()
+  for label, i0, i1 in group_spans:
+    ax.text((i0 + i1) / 2, 1.06, label, ha="center", va="bottom",
+             fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY, transform=group_transform)
+
   fig.suptitle(f"Timing Split on {poster_title_input(matrix)} and {pe_grid} PE Grid "
-               "(log scale)", fontsize=TITLE_FONTSIZE)
-  plt.tight_layout(rect=[0, 0.02, 1, 0.93])
+               "(log scale)", fontsize=TITLE_FONTSIZE, y=0.98)
+  plt.tight_layout(rect=[0, 0.02, 1, 0.92])
 
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=200, bbox_inches="tight")
