@@ -167,3 +167,824 @@ Event 2026-07-28 11:06:10 +0000 UTC reason=InconsistentVersion wsjob=wsjob-g6mzm
 Empty ingress service url. Falling back to default server: 10.125.8.2:443
 2026-07-28 11:13:01,176 INFO     CSL compiler output:
 	CSL compiler produced no messages. Compilation successful.
+infile_mtx = data/snap_orkut.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 3072750-by-3072750 with 117185083 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+WARNING: compile only -- the appliance's compile server is torn down once this returns, so SdkRuntime can't be used in this same invocation
+compile artifact_path: /home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/src/cs_7eff23dfaa077a8ae99d67ab5a1eb546f4829efd72e9ffa32279d3568e0fab07.tar.gz
+Compilation done in 450.1152038574219s
+dumped artifact_path to artifact_path.json
+COMPILE ONLY: EXIT
+[2026-07-28T11:13:40Z] running orkut (reads artifact_path.json)
+Event 2026-07-28 11:52:01 +0000 UTC reason=InconsistentVersion wsjob=wsjob-3tts3tbaw3tbe5kn5cvmbk message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Could not find coordinator IP:port in cluster details
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+infile_mtx = data/snap_orkut.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 3072750-by-3072750 with 117185083 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+load artifact_path from artifact_path.json
+enabling tsc...
+timing h2d: matrix structure upload (Graph500-style 'construction')...
+Traceback (most recent call last):
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 675, in <module>
+    main()
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 365, in main
+    runner.memcpy_h2d(sym_mat_rows_buf, mat_rows_buf_1d, 0, 0, width, height, max_local_nnz,
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 1017, in memcpy_h2d
+    response = self.stub().sdk_runtime_memcpy_h2d(generate_h2d_requests())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/grpc/_channel.py", line 1131, in __call__
+    return _end_unary_response_blocking(state, call, False, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/grpc/_channel.py", line 849, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.RESOURCE_EXHAUSTED
+	details = "Sent message larger than max (2147482669 vs. 2147482624)"
+	debug_error_string = "UNKNOWN:Sent message larger than max (2147482669 vs. 2147482624) {created_time:"2026-07-28T11:59:32.969681284+00:00", grpc_status:8}"
+>
+[2026-07-28T11:59:34Z] FAILED: orkut run step failed -- see traceback above.
+[2026-07-28T11:59:34Z] --- livejournal (data/snap_livejournal.balanced750x750.mtx) @ 750x750 (channels=16) ---
+[2026-07-28T11:59:34Z] compiling livejournal (writes artifact_path.json)
+Event 2026-07-28 12:22:37 +0000 UTC reason=InconsistentVersion wsjob=wsjob-cvnzuzuhusa3aqvy5yugvk message='Warning: client semantic version 1.14.0 is inconsistent with cluster server semantic version 1.20.2, there's a risk job could fail due to inconsistent setup.'
+Empty ingress service url. Falling back to default server: 10.125.8.2:443
+2026-07-28 12:28:32,057 INFO     CSL compiler output:
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	Failed to terminate linker worker processes
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-2767fc0bdb4c.ld: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-16c9f1ea92a7.ld: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-577fff7d1531.ld: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: ran out of PE memory for data (section .bss) 
+	ld.lld: error: ran out of PE memory for task table
+	ld.lld: error: ran out of PE memory for data (section .data.hi) 
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: section .bss virtual address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+
+	ld.lld: error: section .bss load address range overlaps with .filters
+	>>> .bss range is [0x46D8, 0x1CD51]
+	>>> .filters range is [0xF680, 0xF6DF]
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+	ld.lld: error: cannot open /tmp/cslc-30a3fe/cslc-79bda91191c9.o: No such file or directory
+	Failed to link: /tmp/cslc-30a3fe/cslc-79bda91191c9.o
+
+infile_mtx = data/snap_livejournal.balanced750x750.mtx, source = 0, max_rounds = 10
+Load matrix A, 4848000-by-4848000 with 68993773 nonzeros (structural, boolean)
+[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula instead of Graph500's own undirected dedup rule. See GRAPH500_BENCHMARK.md section 4. ]]
+WARNING: compile only -- the appliance's compile server is torn down once this returns, so SdkRuntime can't be used in this same invocation
+Traceback (most recent call last):
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 675, in <module>
+    out_timing = args.out_timing or plot_bfs_timing.default_out_path(
+  ^^^^^^
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/run_bfs.appliance.py", line 309, in main
+    artifact_path = csl_compile_core_appliance(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/device_io.py", line 336, in csl_compile_core_appliance
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 1541, in compile
+    self._check_sdk_response(response, "SdkCompiler.compile() failed.")
+  File "/home/elia/cs_appliance_sdk/lib64/python3.11/site-packages/cerebras/sdk/client/sdk_appliance_client.py", line 598, in _check_sdk_response
+    raise ApplianceUnknownError(f"{preamble}")
+cerebras.appliance.errors.ApplianceUnknownError: SdkCompiler.compile() failed.
+[2026-07-28T12:28:36Z] FAILED: livejournal compile step failed -- skipping to next graph.
+[2026-07-28T12:28:36Z] === run_snap_sweep done ===

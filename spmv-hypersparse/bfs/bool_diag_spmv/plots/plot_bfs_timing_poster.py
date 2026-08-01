@@ -77,11 +77,11 @@ RMAT_SCALE_RE = re.compile(r"^rmat_s(\d+)_e\d+(?:\.balanced\d+x\d+)?\.mtx$")
 
 
 def poster_title_input(matrix):
-  """'RMAT Scale <scale>' for an RMAT input (the poster's own input family);
-  falls back to the bare matrix stem for anything else (e.g. a SNAP graph)
-  so this script doesn't break on non-RMAT rows."""
+  """'Scale <scale>' for an RMAT input (the poster's own input family); falls
+  back to the bare matrix stem for anything else (e.g. a SNAP graph) so this
+  script doesn't break on non-RMAT rows."""
   m = RMAT_SCALE_RE.match(matrix)
-  return f"RMAT Scale {m.group(1)}" if m else os.path.splitext(matrix)[0]
+  return f"Scale {m.group(1)}" if m else os.path.splitext(matrix)[0]
 
 
 def default_out_path(plots_dir, matrix, pe_grid, source, channels):
@@ -93,7 +93,6 @@ def default_out_path(plots_dir, matrix, pe_grid, source, channels):
 def plot_timing_row_poster(row, out_path):
   matrix = row["infile_mtx"]
   pe_grid = row["pe_grid"]
-  source = row["source"]
   clock_freq_hz = float(row.get("clock_freq_hz") or CLOCK_FREQ_HZ)
 
   round_duration = cycles_to_ms(parse_cycle_list(row["round_duration_cycles"]).astype(float),
@@ -189,7 +188,7 @@ def plot_timing_row_poster(row, out_path):
   ax_transfer.set_title("Host-Device + Parent Resolve",
                          fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
 
-  fig.suptitle(f"BFS on {poster_title_input(matrix)} on {pe_grid} PE grid from Source {source}",
+  fig.suptitle(f"Timing Split on {poster_title_input(matrix)} and {pe_grid} PE Grid",
                fontsize=TITLE_FONTSIZE)
   for ax in (ax_rounds, ax_transfer):
     ax.spines["top"].set_visible(False)
@@ -214,8 +213,11 @@ def plot_timing_row_poster(row, out_path):
 
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=200, bbox_inches="tight")
-  plt.close(fig)
   print(f"saved poster timing plot to {out_path}")
+  svg_path = os.path.splitext(out_path)[0] + ".svg"
+  plt.savefig(svg_path, dpi=200, bbox_inches="tight")
+  print(f"saved poster timing plot to {svg_path}")
+  plt.close(fig)
 
 
 def main():

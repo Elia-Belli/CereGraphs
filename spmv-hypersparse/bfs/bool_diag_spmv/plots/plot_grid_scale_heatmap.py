@@ -258,11 +258,22 @@ def main():
       norm = None
       contrast_fn = lambda v: v / panel_vmax  # noqa: E731
 
+    # pcolormesh instead of imshow, rasterized=False -- imshow always embeds
+    # a bitmap in SVG output with no vector option; pcolormesh draws each
+    # cell as a real vector quad. Edges offset by -0.5 so cell (i, j)'s
+    # center lands on integer (j, i), matching imshow's own pixel-center
+    # convention (and this function's existing tick/text placement at
+    # integer coordinates).
     masked = np.ma.masked_invalid(grid_mat)
+    x_edges = np.arange(len(grids) + 1) - 0.5
+    y_edges = np.arange(len(scales) + 1) - 0.5
     if norm is not None:
-      im = ax.imshow(masked, cmap=cmap, norm=norm, aspect="auto", origin="lower")
+      im = ax.pcolormesh(x_edges, y_edges, masked, cmap=cmap, norm=norm, rasterized=False)
     else:
-      im = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=panel_vmax, aspect="auto", origin="lower")
+      im = ax.pcolormesh(x_edges, y_edges, masked, cmap=cmap, vmin=vmin, vmax=panel_vmax,
+                          rasterized=False)
+    ax.set_xlim(x_edges[0], x_edges[-1])
+    ax.set_ylim(y_edges[0], y_edges[-1])
 
     # Hatch every missing cell so "not run / failed" is never confused with
     # a real, low value. The best-GTEPS PE grid for each RMAT scale (picked
@@ -336,6 +347,10 @@ def main():
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label(cbar_label, color=TEXT_PRIMARY)
     cbar.ax.tick_params(colors=TEXT_MUTED)
+    # Colorbar.solids defaults to rasterized=True regardless of the
+    # mappable's own type -- force it vector too, so the SVG has no
+    # embedded bitmaps left.
+    cbar.solids.set_rasterized(False)
 
   axes[0].set_ylabel("RMAT scale", color=TEXT_PRIMARY)
 
@@ -346,6 +361,9 @@ def main():
   os.makedirs(os.path.dirname(args.out), exist_ok=True)
   fig.savefig(args.out, dpi=200, bbox_inches="tight")
   print(f"wrote {args.out}")
+  svg_path = os.path.splitext(args.out)[0] + ".svg"
+  fig.savefig(svg_path, dpi=200, bbox_inches="tight")
+  print(f"wrote {svg_path}")
 
 
 if __name__ == "__main__":
