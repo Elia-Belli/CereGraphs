@@ -43,13 +43,30 @@
   hardware. The mean +/- std methodology itself isn't captioned on the
   figure -- it's explained externally, wherever this poster gets used.
 
+  --log-scale: an alternative to the whole small-multiples approach above
+  -- ONE panel, ONE log-scale y-axis, 6 solo bars (compute + communication,
+  each collapsed across every round into one total -- no per-round
+  breakdown in this mode -- plus h2d_matrix/h2d_seed/resolve/d2h). Log
+  scale is the more common convention for "one metric spans many orders of
+  magnitude" in HPC/profiling papers specifically, at the known cost that
+  bar *length* stops encoding magnitude the intuitive (linear) way once
+  the axis is log-scaled. Both modes are kept side by side (not one
+  replacing the other) so they're easy to compare directly -- see
+  _plot_timing_row_poster_linear/_log's own docstrings.
+
+  SVG only, no PNG -- this is vector output meant to be embedded/rescaled
+  into a poster, not viewed as a standalone raster image.
+
   How to run (from bool_diag_spmv/), aggregating every run of one config:
      python3 plots/plot_bfs_timing_poster.py --csv results/hw/bfs_timing.csv \\
          --infile_mtx rmat_s17_e16.balanced750x750.mtx --pe_grid 750x750
+     python3 plots/plot_bfs_timing_poster.py --csv results/hw/bfs_timing.csv \\
+         --infile_mtx rmat_s17_e16.balanced750x750.mtx --pe_grid 750x750 --log-scale
   Or a single specific row, same as before (no --infile_mtx/--pe_grid):
      python3 plots/plot_bfs_timing_poster.py --csv results/hw/bfs_timing.csv --row -1
 """
 
+import argparse
 import csv
 import os
 import re
@@ -98,10 +115,16 @@ def poster_title_input(matrix):
   return f"Scale {m.group(1)}" if m else os.path.splitext(matrix)[0]
 
 
-def default_out_path(plots_dir, matrix, pe_grid, source, channels):
+def default_out_path(plots_dir, matrix, pe_grid, source, channels, log_scale=False):
   matrix_stem = os.path.splitext(matrix)[0]
-  timing_dir = os.path.join(plots_dir, "hw", "timings")
-  return os.path.join(timing_dir, f"timing_poster_{matrix_stem}_{pe_grid}_src{source}_ch{channels}.png")
+  # NOT "timings" -- every poster actually gets saved under plots/hw/
+  # timing-poster/ (see the tracked files themselves); this default just
+  # never matched that until now, so every real invocation so far has
+  # passed --out explicitly instead of relying on it.
+  timing_dir = os.path.join(plots_dir, "hw", "timing-poster")
+  suffix = "_logscale" if log_scale else ""
+  return os.path.join(
+      timing_dir, f"timing_poster_{matrix_stem}_{pe_grid}_src{source}_ch{channels}{suffix}.svg")
 
 
 def mean_std_ms(rows, cycles_key, clock_freq_hz):
@@ -116,14 +139,26 @@ def mean_std_ms(rows, cycles_key, clock_freq_hz):
   return float(values.mean()), (float(values.std(ddof=1)) if len(values) > 1 else 0.0)
 
 
-def plot_timing_row_poster(rows, out_path):
-  """rows: every CSV row for the SAME (infile_mtx, pe_grid) config (one run
-  each) -- see select_rows. The per-round device-time panel (left) is
-  purely on-device work with no real run-to-run variance (confirmed on
-  real hardware, section 15), so it's drawn from a single representative
-  run (the most recent). The host-device/parent_resolve panel (right) is
-  where real hardware jitter actually shows up, so it's drawn as mean +/-
-  std across ALL of `rows` instead."""
+def plot_timing_row_poster(rows, out_path, log_scale=False):
+  """Dispatches to one of two entirely different renderings of the same
+  underlying data -- see _plot_timing_row_poster_linear/_log's own
+  docstrings for what each one shows and why. `rows`: every CSV row for
+  the SAME (infile_mtx, pe_grid) config (one run each) -- see
+  select_rows."""
+  if log_scale:
+    _plot_timing_row_poster_log(rows, out_path)
+  else:
+    _plot_timing_row_poster_linear(rows, out_path)
+
+
+def _plot_timing_row_poster_linear(rows, out_path):
+  """Small multiples: 3 separate linear-scale panels (rounds, h2d_seed/
+  resolve/d2h, h2d_matrix), one per order of magnitude -- see the module
+  docstring for why. The per-round device-time panel (left) is purely
+  on-device work with no real run-to-run variance (confirmed on real
+  hardware, section 15), so it's drawn from a single representative run
+  (the most recent). The other two panels show mean +/- std across ALL of
+  `rows` instead -- real hardware jitter actually shows up there."""
   row = rows[-1]
   matrix = row["infile_mtx"]
   pe_grid = row["pe_grid"]
@@ -293,17 +328,118 @@ def plot_timing_row_poster(rows, out_path):
     fig.text((pos.x0 + pos.x1) / 2, title_y, text, ha="center", va="bottom",
               fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
 
+  # SVG only -- no PNG. Vector output for a poster figure that gets
+  # embedded/rescaled, not viewed as a standalone raster image.
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
   plt.savefig(out_path, dpi=200, bbox_inches="tight")
   print(f"saved poster timing plot to {out_path}")
-  svg_path = os.path.splitext(out_path)[0] + ".svg"
-  plt.savefig(svg_path, dpi=200, bbox_inches="tight")
-  print(f"saved poster timing plot to {svg_path}")
   plt.close(fig)
 
 
+def _plot_timing_row_poster_log(rows, out_path):
+  """One panel, one log-scale y-axis, 6 solo bars: compute/communication
+  (collapsed across every round into one total each -- no per-round
+  breakdown here) plus h2d_matrix/h2d_seed/resolve/d2h. The alternative to
+  _plot_timing_row_poster_linear's small-multiples split: a single shared
+  scale reads naturally to an audience used to log-scale benchmark charts,
+  at the cost of bar *length* no longer encoding magnitude the intuitive
+  (linear) way -- equal-looking gaps between bars are multiplicative, not
+  additive. See the module docstring for the fuller tradeoff discussion.
+
+  compute/communication have no error bars (single representative run,
+  same as the linear mode's round panel -- on-device work showed no
+  real run-to-run variance). h2d_matrix/h2d_seed/resolve/d2h show mean +/-
+  std across ALL of `rows`, same as the linear mode's other two panels."""
+  row = rows[-1]
+  matrix = row["infile_mtx"]
+  pe_grid = row["pe_grid"]
+  clock_freq_hz = float(row.get("clock_freq_hz") or CLOCK_FREQ_HZ)
+
+  round_duration = cycles_to_ms(parse_cycle_list(row["round_duration_cycles"]).astype(float),
+                                 clock_freq_hz)
+  local_compute = cycles_to_ms(parse_cycle_list(row["local_compute_max_cycles"]).astype(float),
+                                clock_freq_hz)
+  local_term_cond = cycles_to_ms(parse_cycle_list(row["local_term_cond_max_cycles"]).astype(float),
+                                  clock_freq_hz)
+  compute = local_compute + local_term_cond
+  communication = np.clip(round_duration - local_compute - local_term_cond, 0.0, None)
+  # Summed (not averaged) across rounds -- these totals stand in for the
+  # same whole-search "on-device time" the linear mode's round panel shows
+  # as a stack, just collapsed to 2 numbers. A tiny positive floor, not 0:
+  # log(0) is undefined, and communication_total (or compute_total, for a
+  # single-round search) can be genuinely ~0.
+  compute_total = max(float(compute.sum()), 1e-6)
+  communication_total = max(float(communication.sum()), 1e-6)
+
+  h2d_matrix_mean, h2d_matrix_std = mean_std_ms(rows, "h2d_matrix_span_cycles", clock_freq_hz)
+  h2d_seed_mean, h2d_seed_std = mean_std_ms(rows, "h2d_seed_span_cycles", clock_freq_hz)
+  parent_resolve_mean, parent_resolve_std = mean_std_ms(
+      rows, "parent_resolve_max_cycles", clock_freq_hz)
+  d2h_mean, d2h_std = mean_std_ms(rows, "d2h_span_cycles", clock_freq_hz)
+
+  bars = [
+      ("compute", compute_total, COMPUTE_COLOR, 0.0),
+      ("communication", communication_total, COMMUNICATION_COLOR, 0.0),
+      ("h2d_matrix", h2d_matrix_mean, H2D_COLORS["h2d_matrix"], h2d_matrix_std),
+      ("h2d_seed", h2d_seed_mean, H2D_COLORS["h2d_seed"], h2d_seed_std),
+      ("resolve", parent_resolve_mean, PARENT_RESOLVE_COLOR, parent_resolve_std),
+      ("d2h", d2h_mean, D2H_COLOR, d2h_std),
+  ]
+
+  fig, ax = plt.subplots(figsize=(1.5 * len(bars) + 1.5, 6.5))
+  bar_width = 0.62
+  xs = np.arange(len(bars))
+  for x, (name, height, color, yerr) in zip(xs, bars):
+    ax.bar([x], [height], width=bar_width, color=color, edgecolor=SURFACE, linewidth=2,
+           label=name, zorder=2)
+    if yerr:
+      ax.errorbar([x], [height], yerr=yerr, fmt="none", ecolor=TEXT_PRIMARY,
+                  elinewidth=1.4, capsize=4, capthick=1.4, zorder=5)
+    # Label ABOVE the bar (a multiplicative offset, not additive -- matches
+    # log-scale semantics), not centered inside: bar heights span several
+    # decades here, so a short bar (e.g. compute) has no room for inside
+    # text the way a linear-scale bar does.
+    ax.text(x, height * 1.2, f"{height:.3f}", ha="center", va="bottom", fontsize=8,
+            color=TEXT_PRIMARY, fontweight="bold", zorder=4)
+
+  ax.set_yscale("log")
+  ax.set_xticks(xs)
+  ax.set_xticklabels([name for name, _, _, _ in bars])
+  ax.set_xlim(-0.8, len(bars) - 0.2)
+  ax.set_ylabel("ms (log scale)", labelpad=8)
+  ax.spines["top"].set_visible(False)
+  ax.spines["right"].set_visible(False)
+  ax.spines["left"].set_color(BASELINE)
+  ax.spines["bottom"].set_color(BASELINE)
+  ax.tick_params(colors=TEXT_MUTED)
+  ax.yaxis.grid(True, which="major", color=GRIDLINE, linewidth=1, zorder=0)
+  ax.set_axisbelow(True)
+  ax.set_facecolor(SURFACE)
+  fig.patch.set_facecolor(SURFACE)
+
+  fig.suptitle(f"Timing Split on {poster_title_input(matrix)} and {pe_grid} PE Grid "
+               "(log scale)", fontsize=TITLE_FONTSIZE)
+  plt.tight_layout(rect=[0, 0.02, 1, 0.93])
+
+  os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+  plt.savefig(out_path, dpi=200, bbox_inches="tight")
+  print(f"saved poster timing plot to {out_path}")
+  plt.close(fig)
+
+
+def parse_poster_args():
+  """This file's own --log-scale flag, plus every shared flag plot_bfs_timing.py's
+  parse_args() already defines (--csv/--row/--infile_mtx/--pe_grid/--channels/--out)."""
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--log-scale", action="store_true",
+                       help="single log-scale panel (compute/communication collapsed to one "
+                            "total each, plus h2d_matrix/h2d_seed/resolve/d2h -- 6 solo bars "
+                            "total) instead of the default 3-panel linear small-multiples layout")
+  return parse_args(parser)
+
+
 def main():
-  args = parse_args()
+  args = parse_poster_args()
 
   csv_path = args.csv
   if csv_path is None:
@@ -316,8 +452,9 @@ def main():
   last = matched[-1]
   plots_dir = os.path.dirname(os.path.abspath(__file__))
   out_path = args.out or default_out_path(
-      plots_dir, last["infile_mtx"], last["pe_grid"], last["source"], last["channels"])
-  plot_timing_row_poster(matched, out_path)
+      plots_dir, last["infile_mtx"], last["pe_grid"], last["source"], last["channels"],
+      log_scale=args.log_scale)
+  plot_timing_row_poster(matched, out_path, log_scale=args.log_scale)
 
 
 if __name__ == "__main__":

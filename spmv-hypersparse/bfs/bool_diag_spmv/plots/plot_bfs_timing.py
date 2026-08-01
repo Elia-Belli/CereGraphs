@@ -441,8 +441,13 @@ def plot_timing_row(row, out_path):
   print(f"saved timing plot to {out_path}")
 
 
-def parse_args():
-  parser = argparse.ArgumentParser()
+def parse_args(parser=None):
+  """parser: an existing ArgumentParser to add these shared flags to (lets a
+  caller like plot_bfs_timing_poster.py add its own flags first, e.g.
+  --log-scale) -- creates its own if not given, so this stays a drop-in
+  no-arg call for this file's own main()."""
+  if parser is None:
+    parser = argparse.ArgumentParser()
   parser.add_argument("--csv", default=None, help="bfs_timing.csv path (default: "
                                                     "../results/bfs_timing.csv, a sibling of "
                                                     "this script's own plots/ directory)")
