@@ -33,6 +33,11 @@ param max_rounds: u16 = 10;
 // override it with a real fraction of n. u32 (not f32) since cslc's
 // --params CLI flag only accepts unsigned integers.
 param tau_switch_count: u32 = 4294967295;
+// A/B/C switch for the two sparse reduce_select_any counterparts -- see
+// bool_pe.csl's own param comment. Defaulted to 0 (dense, the production
+// path) so existing callers that don't pass it keep today's behavior
+// unchanged.
+param parent_resolve_variant: u16 = 0;
 
 comptime {
     // the diagonal-target design requires a square grid: every row/column
@@ -73,6 +78,7 @@ layout {
                 .max_local_nnz_rows = max_local_nnz_rows,
                 .max_rounds = max_rounds,
                 .tau_switch_count = tau_switch_count,
+                .parent_resolve_variant = parent_resolve_variant,
             });
         } // while py
     } // while px
@@ -82,6 +88,7 @@ layout {
     @export_name("visited_bitmap", [*]u32, true);
     @export_name("rounds_completed", [*]u16, true);
     @export_name("parent_local_buf", [*]u32, true);
+    @export_name("parent_occupancy", [*]u32, true);
 
     @export_name("mat_rows_buf", [*]u16, true);
     @export_name("mat_col_idx_buf", [*]u16, true);

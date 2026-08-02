@@ -260,6 +260,7 @@ def csl_compile_core(
     width_east_buf: int,
     max_rounds: Optional[int] = None,
     tau_switch_count: Optional[int] = None,
+    parent_resolve_variant: Optional[int] = None,
 ):
   comp_dir = elf_dir
 
@@ -284,6 +285,10 @@ def csl_compile_core(
     # direction-optimizing switch with a real fraction of n.
     if tau_switch_count is not None:
       args.append(f"--params=tau_switch_count:{int(tau_switch_count)}")
+    # left at layout_bool.csl's own default (0, dense reduce_select_any)
+    # unless a caller opts into validating one of the sparse collectives.
+    if parent_resolve_variant is not None:
+      args.append(f"--params=parent_resolve_variant:{int(parent_resolve_variant)}")
 
     args.append(f"-o={comp_dir}")
     if arch is not None:
@@ -319,6 +324,7 @@ def csl_compile_core_appliance(
     width_east_buf: int,
     max_rounds: Optional[int] = None,
     tau_switch_count: Optional[int] = None,
+    parent_resolve_variant: Optional[int] = None,
 ):
   """Appliance-mode counterpart to csl_compile_core: same --params, but
   compiled via cerebras.sdk.client.SdkCompiler instead of a direct `cslc`
@@ -354,6 +360,8 @@ def csl_compile_core_appliance(
     args.append(f"--params=max_rounds:{max_rounds}")
   if tau_switch_count is not None:
     args.append(f"--params=tau_switch_count:{int(tau_switch_count)}")
+  if parent_resolve_variant is not None:
+    args.append(f"--params=parent_resolve_variant:{int(parent_resolve_variant)}")
 
   args.append(f"-o={elf_dir}")
   if arch is not None:

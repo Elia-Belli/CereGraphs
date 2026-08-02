@@ -1,0 +1,71 @@
+// PE code for the standalone reduce_select_any_indexed() correctness test --
+// second sparse counterpart of pe_reduce_select_test.csl (see its own
+// comment for the overall shape; this file only differs in calling
+// mpi_x.reduce_select_any_indexed() instead of mpi_x.reduce_select_any(),
+// and in declaring the six extra scratch buffers that call requires --
+// see collectives_2d/pe.csl's own comment on reduce_select_any_indexed()
+// for the wire/workspace layout). send_buf/recv_buf keep the EXACT same
+// caller-visible dense [count]u32 contract as the dense test, so the same
+// host-side ground truth/checking logic in run_reduce_select_test.py
+// applies unchanged to all three variants.
+
+param memcpy_params;
+param c2d_params;
+param count: u16;
+param root: u16;
+param sentinel: u32;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// local repo copy -- see layout_reduce_select_indexed_test.csl's own import comment.
+const mpi_x = @import_module("./collectives_2d/pe.csl", .{
+    .dim_params = c2d_params.x,
+    .queues = [2]u16{2, 4},
+    .dest_dsr_ids = [1]u16{1},
+    .src0_dsr_ids = [1]u16{1},
+    .src1_dsr_ids = [1]u16{1},
+    });
+
+// bitmap_words = ceil(count/32) -- comptime here (unlike inside
+// collectives_2d/pe.csl itself, this test kernel's own `count` IS a
+// comptime param, so its scratch buffers can be sized directly).
+const bitmap_words: u16 = (count + 31) / 32;
+
+var send_buf = @zeros([count]u32);
+var recv_buf = @zeros([count]u32);
+var send_bitmap = @zeros([bitmap_words]u32);
+var recv_bitmap = @zeros([bitmap_words]u32);
+var send_indices = @zeros([count]u16);
+var recv_indices = @zeros([count]u16);
+var send_values = @zeros([count]u32);
+var recv_values = @zeros([count]u32);
+
+var ptr_send_buf: [*]u32 = &send_buf;
+var ptr_recv_buf: [*]u32 = &recv_buf;
+
+const reduce_done_task_id: local_task_id = @get_local_task_id(10);
+
+task reduce_done() void {
+    sys_mod.unblock_cmd_stream();
+}
+
+var mpi_initialized: bool = false;
+
+fn f_run() void {
+    if (!mpi_initialized) {
+        mpi_x.init();
+        mpi_initialized = true;
+    }
+    mpi_x.reduce_select_any_indexed(root, &send_buf, &recv_buf,
+                                     &send_bitmap, &recv_bitmap,
+                                     &send_indices, &recv_indices,
+                                     &send_values, &recv_values,
+                                     sentinel, count, reduce_done_task_id);
+}
+
+comptime {
+    @bind_local_task(reduce_done, reduce_done_task_id);
+    @export_symbol(ptr_send_buf, "send_buf");
+    @export_symbol(ptr_recv_buf, "recv_buf");
+    @export_symbol(f_run);
+}

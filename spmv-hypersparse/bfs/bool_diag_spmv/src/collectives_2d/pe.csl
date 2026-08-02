@@ -112,7 +112,17 @@ const reduce_fabouts = [2]fabout_dsd { data_0_fabout, data_1_fabout };
 // so its per-hop combine is ordinary branching CSL compute, not a single
 // fused async instruction. See reduce_select_any()/transfer_data_reduce_select_any()
 // below.
-const Ftype = enum(u16) { broadcast, scatter, gather, reduce_fadds, reduce_or, reduce_select_any };
+// A sparse bitmap+compact-values counterpart (reduce_select_any_sparse) was
+// built and measured on real hardware: ~7.6-8x SLOWER than reduce_select_any,
+// not faster (docs/ERRORS.md #16) -- its per-hop merge was a manual scalar
+// bit-scan, O(count) regardless of occupancy, costing ~10x more cycles per
+// word than the dense collective's single hardware-accelerated @mov32
+// transfer. Removed entirely (no regime where it won); reduce_select_any_
+// indexed (below) is what replaced it, storing explicit (row_index, value)
+// pairs instead of position-implicit compact values so its per-hop merge
+// cost is O(popcount) -- genuinely proportional to occupancy -- rather
+// than O(count). See its own comment for the full design and status.
+const Ftype = enum(u16) { broadcast, reduce_fadds, reduce_or, reduce_select_any, reduce_select_any_indexed };
 const Network_Config = struct {
   root: u16,
   count: u16,
@@ -154,6 +164,33 @@ var cur_network_cfg = Network_Config {
 };
 
 
+// Transient scratch for reduce_select_any_indexed() / transfer_data_reduce_
+// select_any_indexed() -- see their own comments. indexed_my_count: this
+// PE's own popcount, computed once at call time, reused whenever this PE
+// forwards or merges in its own data. indexed_incoming_count: the popcount
+// of whichever side's bitmap just landed. indexed_recv_count: the
+// accumulator's current count after its most recent merge. indexed_dense_
+// recv_buf: the caller's own dense recv_buf pointer, stashed across the
+// whole relay and used only once, at the root's final decompress step.
+// This variant has THREE caller-provided buffers per side (bitmap,
+// indices, values) -- fsm_state.send_buf/recv_buf hold the VALUES arrays
+// (already [*]u32, matching FSM_State's own field type); the bitmap/
+// indices pointers need their own slots since FSM_State has nowhere to
+// carry them.
+var indexed_my_count: u16 = 0;
+var indexed_incoming_count: u16 = 0;
+var indexed_recv_count: u16 = 0;
+var indexed_dense_recv_buf: [*]u32 = &invalid_u32;
+var indexed_send_bitmap: [*]u32 = &invalid_u32;
+var indexed_recv_bitmap: [*]u32 = &invalid_u32;
+var indexed_send_indices: [*]u16 = &invalid_u16;
+var indexed_recv_indices: [*]u16 = &invalid_u16;
+// Landing zone / staging buffer for the explicit 1-word length handshake
+// each hop's indices+values sub-transfer needs (see transfer_data_reduce_
+// select_any_indexed()'s own comment for why this collective uses an
+// explicit length word instead of deriving it via popcount).
+var indexed_len_scratch = @zeros([1]u16);
+
 // The FSM state is initially invalid
 var fsm_state = FSM_State {
   .send_buf = &invalid_u32,
@@ -161,7 +198,7 @@ var fsm_state = FSM_State {
   .state = StateEnum.Configure_network,
   // SDR requires the entrypoint starts from 8.
   // this initialization is don't care because it is overwritten by
-  // broadcast(), gather(), scatter() and reduce().
+  // broadcast() and reduce().
   .callback = @get_local_task_id(8),
   .counter = 0
 };
@@ -243,64 +280,6 @@ fn broadcast(root: u16, buf: [*]u32, count: u16, callback: local_task_id) void {
   start_data_transfer();
 }
 
-fn scatter(root: u16, send_buf: [*]u32, recv_buf: [*]u32, count: u16, callback: local_task_id) void {
-
-  // WARNING: block LOCK in the beginning and only
-  // unblock LOCK when the operation finishes
-  @block(C_LOCK);
-
-  @assert(lib_initialized);
-  // Request a scatter network rooted at `root`
-  cur_network_cfg = Network_Config {
-    .root = root,
-    .count = count,
-    .type = Ftype.scatter,
-    .sentinel = 0
-  };
-  // Initialize the FSM state to store `send_buf`, `recv_buf`, and `callback`
-  fsm_state = FSM_State {
-    .send_buf = send_buf,
-    .recv_buf = recv_buf,
-    .state = StateEnum.Configure_network,
-    .callback = callback,
-    .counter = 0
-  };
-  // all ops must clear filter and switch first
-  clear_filter_and_switch();
-  // reconfigure the routing and filter on C0 and start the FSM
-  configure_scatter_network();
-  start_data_transfer();
-}
-
-fn gather(root: u16, send_buf: [*]u32, recv_buf: [*]u32, count: u16, callback: local_task_id) void {
-
-  // WARNING: block LOCK in the beginning and only
-  // unblock LOCK when the operation finishes
-  @block(C_LOCK);
-
-  @assert(lib_initialized);
-  // Request a gather network rooted at `root`
-  cur_network_cfg = Network_Config {
-    .root = root,
-    .count = count,
-    .type = Ftype.gather,
-    .sentinel = 0
-  };
-  // Initialize the FSM state to store `send_buf`, `recv_buf`, and `callback`
-  fsm_state = FSM_State {
-    .send_buf = send_buf,
-    .recv_buf = recv_buf,
-    .state = StateEnum.Configure_network,
-    .callback = callback,
-    .counter = 0
-  };
-  // all ops must clear filter and switch first
-  clear_filter_and_switch();
-  // reconfigure the routing and switch on C0 and start the FSM
-  configure_gather_network();
-  start_data_transfer();
-}
-
 // `fadds` only works on f32 data
 fn reduce_fadds(root: u16, send_buf: [*]f32, recv_buf: [*]f32, count: u16, callback: local_task_id) void {
 
@@ -309,7 +288,7 @@ fn reduce_fadds(root: u16, send_buf: [*]f32, recv_buf: [*]f32, count: u16, callb
   @block(C_LOCK);
 
   @assert(lib_initialized);
-  // Request a gather network rooted at `root`
+  // Request a reduce network rooted at `root`
   cur_network_cfg = Network_Config {
     .root = root,
     .count = count,
@@ -433,8 +412,204 @@ fn reduce_select_any(root: u16, send_buf: [*]u32, recv_buf: [*]u32,
   start_data_transfer();
 }
 
+// --- reduce_select_any_indexed: a second sparse design -----------------------
+//
+// A first sparse counterpart (bitmap + position-implicit compact values,
+// since removed -- see docs/ERRORS.md #16) turned out ~7.6-8x SLOWER than
+// the dense collective on real hardware, root-caused to its per-hop merge
+// being a manual scalar bit-scan -- O(count) EVERY hop, regardless of
+// occupancy, since it has to walk every bit position to know which
+// compact-array slot maps to which row. This variant fixes that by storing
+// explicit (row_index, value) pairs instead of position-implicit ones:
+// knowing a value's row directly (rather than inferring it from a bit-scan
+// position) means merging only ever needs to walk the INCOMING side's
+// actual entries -- O(popcount(incoming)), genuinely proportional to
+// occupancy -- plus an O(bitmap_words) bitmap OR (word-granularity, not
+// bit-granularity). The bitmap is kept ONLY as an O(1) "is this row
+// already covered" membership test, never walked to reconstruct order, so
+// there is no need for the removed sparse design's own tricky
+// backward-merge safety argument -- a plain forward append is safe by
+// construction (see append_merge_indexed below), since indices are stored
+// explicitly rather than implied by write position.
+//
+// Wire format per hop, per side: (1) bitmap [bitmap_words, fixed, u32],
+// (2) length [1 word, u16 -- see below for why this is an explicit
+// handshake, unlike the removed sparse design's locally-popcounted
+// length], (3) indices [length, u16], (4) values [length, u32]. Real
+// hardware measurement (docs/ERRORS.md #16) found round-trip COUNT to be a
+// comparatively minor cost driver (~3.8x between dense's and the removed
+// sparse design's fixed per-hop overhead) next to the ~10x found in
+// per-word SCALAR COMPUTE cost, so trading more (cheap) round trips to
+// eliminate the O(count) scalar scan is the bet this design is making.
+//
+// Explicit length handshake, not popcount-derived: the removed sparse
+// design derived its length locally via a manual popcount specifically to
+// avoid an extra round trip. Doing the same here would need a
+// `@popcnt`-sized scratch buffer (this module has no comptime bound on
+// `count`/`bitmap_words` to size one against) -- rather than push yet more
+// caller-provided buffers onto this already wider API, this design sends
+// the length explicitly: the sender already knows its own count as a
+// running counter from its own merge/compress step, so writing it into a
+// 1-word buffer and sending it is essentially free, and the ONE extra
+// 1-word round trip per hop is cheap next to the scalar-scan cost being
+// eliminated.
+//
+// Caller-provided buffers, six total (three pairs): send/recv_bitmap
+// ([bitmap_words]u32 each), send/recv_indices ([count]u32 -- worst case
+// -- each, but element type u16), send/recv_values ([count]u32 each).
+// fsm_state.send_buf/recv_buf hold send_values/recv_values (already
+// [*]u32, matching FSM_State's own field type); the bitmap/indices
+// pointers are stashed in indexed_send_bitmap/indexed_recv_bitmap/
+// indexed_send_indices/indexed_recv_indices (see their own declaration
+// comment) since FSM_State has nowhere else to carry them. This raises
+// the worst-case (fully dense) per-side memory to bitmap_words*4 +
+// count*2 + count*4 = bitmap_words*4 + count*6 bytes -- a real,
+// quantifiable memory cost, though still small next to a full extra dense
+// buffer, and the entire point is worst-case occupancy is not the regime
+// this is for.
+//
+// STATUS: measured on real hardware, 4.5-8.9x FASTER than dense at grids
+// that compile (docs/ERRORS.md #17); blocked at very large `blk` by a real
+// PE static-memory ceiling (docs/ERRORS.md #8), traced to this collective's
+// own code size (its FSM below), not its caller-provided buffers.
 
-// initiate_teardowns() is called when the operation {broadcast, gather, scatter,
+// One-time (per collective call), per-PE compression of this PE's own
+// dense candidate array into explicit (bitmap, indices, values) form.
+// Returns the count of real values written. Still O(count) -- this is a
+// ONE-TIME cost (compressing this PE's own data, once per collective
+// call), not a per-hop cost -- the per-hop win is entirely in
+// append_merge_indexed below, not here.
+fn compress_dense_to_indexed(dense: [*]u32, sentinel: u32, count: u16,
+                             bitmap_words: u16, out_bitmap: [*]u32,
+                             out_indices: [*]u16, out_values: [*]u32) u16 {
+  var w: u16 = 0;
+  while (w < bitmap_words) : (w += 1) {
+    out_bitmap[w] = 0;
+  }
+  var out: u16 = 0;
+  var i: u16 = 0;
+  while (i < count) : (i += 1) {
+    if (dense[i] != sentinel) {
+      out_bitmap[i >> 5] |= (@as(u32, 1) << (i & 31));
+      out_indices[out] = i;
+      out_values[out] = dense[i];
+      out += 1;
+    }
+  }
+  return out;
+}
+
+// Merges `incoming` (a freshly-landed (bitmap, indices, values) triple,
+// `incoming_count` entries) INTO `acc` (the running accumulated triple,
+// `acc_count` entries so far) -- rows already covered by `acc` keep acc's
+// existing value (arbitrary tie-break, same convention select_merge_u32
+// already documents). Appends new entries starting at index `acc_count`,
+// so this is safe in place with NO special-case argument needed (unlike
+// the removed sparse design's own backward-scan proof): `incoming` is
+// always a wholly separate buffer (only ever read, never written here),
+// and `acc`'s own writes only ever land at indices >= its OWN current
+// count, so it can never clobber an entry not yet consumed from
+// `incoming` (a different buffer entirely) or overwrite one of its own
+// already-valid entries (indices < acc_count are never touched).
+//
+// Cost: O(incoming_count) for the values/indices merge (the actual
+// improvement over the removed sparse design's O(count)) + O(bitmap_words)
+// for the bitmap OR (word-granularity, not bit-granularity -- this loop
+// never inspects individual bits, only whole words).
+//
+// Returns acc's new count after the merge.
+fn append_merge_indexed(acc_bitmap: [*]u32, acc_indices: [*]u16, acc_values: [*]u32, acc_count: u16,
+                        incoming_bitmap: [*]u32, incoming_indices: [*]u16, incoming_values: [*]u32,
+                        incoming_count: u16, bitmap_words: u16) u16 {
+  var out: u16 = acc_count;
+  var i: u16 = 0;
+  while (i < incoming_count) : (i += 1) {
+    const row = incoming_indices[i];
+    const mask: u32 = @as(u32, 1) << (row & 31);
+    if ((acc_bitmap[row >> 5] & mask) == 0) {
+      acc_indices[out] = row;
+      acc_values[out] = incoming_values[i];
+      out += 1;
+    }
+  }
+  var w: u16 = 0;
+  while (w < bitmap_words) : (w += 1) {
+    acc_bitmap[w] |= incoming_bitmap[w];
+  }
+  return out;
+}
+
+// Final expansion (root only, once per collective call): converts the
+// accumulated (indices, values) result back into the caller's dense,
+// sentinel-filled recv_buf. O(count) to fill the sentinel background +
+// O(total_count) to place the real values -- both ONE-TIME costs (root's
+// final step), not per-hop.
+fn decompress_indexed_to_dense(indices: [*]u16, values: [*]u32, total_count: u16,
+                               sentinel: u32, count: u16, dense_out: [*]u32) void {
+  var i: u16 = 0;
+  while (i < count) : (i += 1) {
+    dense_out[i] = sentinel;
+  }
+  var k: u16 = 0;
+  while (k < total_count) : (k += 1) {
+    dense_out[indices[k]] = values[k];
+  }
+}
+
+// Sparse-by-explicit-index counterpart of reduce_select_any(): identical
+// caller-visible contract (dense [count]u32 send_buf/recv_buf, sentinel
+// marks "no candidate", recv_buf meaningful only at `root` once the
+// callback fires) -- see this whole section's own comment above for the
+// full design and status.
+fn reduce_select_any_indexed(root: u16, send_buf: [*]u32, recv_buf: [*]u32,
+                             send_bitmap: [*]u32, recv_bitmap: [*]u32,
+                             send_indices: [*]u16, recv_indices: [*]u16,
+                             send_values: [*]u32, recv_values: [*]u32,
+                             sentinel: u32, count: u16, callback: local_task_id) void {
+
+  // WARNING: block LOCK in the beginning and only
+  // unblock LOCK when the operation finishes
+  @block(C_LOCK);
+
+  @assert(lib_initialized);
+
+  const bitmap_words: u16 = (count + 31) / 32;
+
+  // One-time compression of MY OWN candidate data -- everything up to
+  // start_data_transfer() below is pure local compute, no async concerns.
+  indexed_my_count = compress_dense_to_indexed(send_buf, sentinel, count, bitmap_words,
+                                                send_bitmap, send_indices, send_values);
+  indexed_dense_recv_buf = recv_buf;
+  indexed_send_bitmap = send_bitmap;
+  indexed_recv_bitmap = recv_bitmap;
+  indexed_send_indices = send_indices;
+  indexed_recv_indices = recv_indices;
+
+  cur_network_cfg = Network_Config {
+    .root = root,
+    .count = count,
+    .type = Ftype.reduce_select_any_indexed,
+    .sentinel = sentinel
+  };
+  fsm_state = FSM_State {
+    .send_buf = send_values,
+    .recv_buf = recv_values,
+    .state = StateEnum.Configure_network,
+    .callback = callback,
+    .counter = 0
+  };
+  // all ops must clear filter and switch first
+  clear_filter_and_switch();
+  // reconfigure the routing and switch on C0 and C1, then start the FSM --
+  // configure_reduce_network() is pure routing/color config, no arithmetic
+  // dependence, reused unchanged from reduce_fadds/reduce_or/reduce_select_any.
+  configure_reduce_network(DATA_COLOR_0);
+  configure_reduce_network(DATA_COLOR_1);
+  start_data_transfer();
+}
+
+
+// initiate_teardowns() is called when the operation {broadcast,
 // reduce_adds} finishes the data transfer.
 // The root should send out teardown wavelets to all others PEs to turn C0 and C1
 // back to teardown mode.
@@ -442,12 +617,6 @@ fn initiate_teardowns() void {
   switch (cur_network_cfg.type) {
     Ftype.broadcast => {
       teardown_broadcast_network();
-    },
-    Ftype.scatter => {
-      teardown_scatter_network();
-    },
-    Ftype.gather => {
-      teardown_gather_network();
     },
     Ftype.reduce_fadds => {
       teardown_reduce_network();
@@ -460,6 +629,10 @@ fn initiate_teardowns() void {
     Ftype.reduce_select_any => {
       // same teardown as reduce_fadds/reduce_or -- pure control-wavelet/
       // color bookkeeping, no dependence on the per-hop combine mechanics.
+      teardown_reduce_network();
+    },
+    Ftype.reduce_select_any_indexed => {
+      // same teardown as every other reduce variant.
       teardown_reduce_network();
     }
   }
@@ -477,88 +650,6 @@ fn teardown_broadcast_network() void {
   }
   // Other PEs do not have to do anything! Just wait for the teardown wavelet
   // sent out by `cur_network_cfg.root`
-}
-
-// Scatter-network specific teardown initiation
-fn teardown_scatter_network() void {
-  // Only the `cur_network_cfg.root` PE needs to send out a teardown wavelet
-  // The same logic as `broadcast` applies here: `scatter` is another
-  // `root` -> all other PE operation
-  if (pe_id == cur_network_cfg.root) {
-    ctrl_buf[0] = comptime ctrl.wavelet(.{ .cmd0 = .{ .no_ce = true, .type = ctrl.Cmd.Teardown } });
-    mem_to_fabout_no_activate(ctrl_out, ctrl_mem);
-  }
-}
-
-// Gather-network specific teardown initiation
-// In gather-networks, the PEs on either end (pe_0, pe_max) are responsible
-// for sending teardown wavelets towards PEs in the middle.
-//
-// After transfer_data_gather(), the routing is
-//                root
-// -->  --> -->    <--   <-- <--     <--
-// ^               |                    ^
-// |               v                    |
-// pos0   pos1     pos1   pos1        pos0
-//
-// Both P0 and Pw-1 send TD.
-// The TD from Pw-1 resets the switch position of root because PE root+1
-// pops cmd0. The routing becomes
-//                root
-// -->  --> -->  -->     <-- <--     <--
-// ^               |                    ^
-// |               v                    |
-// pos0   pos1     pos0    teardown  teardown
-//
-// Then the TD from P0 can reach the root because the pos0 has rx = WEST.
-// The routing becomes
-//                      root
-// -->       --> -->   -->       <-- <--     <--
-// ^                     |                     ^
-// |                     v                     |
-// teardown  teardown  teardown  teardown   teardown
-//
-fn teardown_gather_network() void {
-
-  const cur_root = cur_network_cfg.root;
-
-  if (pe_id == 0) {
-
-    // If we're PE0 and we're the root, we must wait for teardowns from
-    // the other end of our row or columns. DATA_COLOR_0 has tx = RAMP in this
-    // case, and we cannot send out any teardowns
-    if (cur_root == 0) {
-      return;
-    }
-    // Otherwise, send a teardown wavelet to POS_DIR (EAST or SOUTH)
-    ctrl_buf[0] = comptime ctrl.wavelet(.{ .cmd0 = .{ .no_ce = true, .type = ctrl.Cmd.Teardown } });
-    mem_to_fabout_no_activate(ctrl_out, ctrl_mem);
-
-  } else if (pe_id == NUM_PES - 1) {
-
-    // Analogous logic to `(pe_id == 0) and (cur_root == 0)` above
-    if (cur_root == NUM_PES - 1) {
-      return;
-    }
-    if (cur_root != 0) {
-      // In cases where we are the last PE and the current root is somewhere
-      // in the middle of our row or column, we tear down every whose pe_id is
-      // greater than the root, then rely on the "guard PE" (root + 1) to
-      // pop `cmd0` and let `cmd1` flip the root PE's switch. This then allows
-      // the root PE to be torn down by the teardown wavelet from PE0.
-      ctrl_buf[0] = comptime ctrl.wavelet(.{ .cmd0 = .{ .no_ce = true, .type = ctrl.Cmd.Teardown },
-                                            .cmd1 = .{ .no_ce = true, .type = ctrl.Cmd.Reset }});
-    } else {
-      // On the other hand, if we are the last PE and the current root is PE0,
-      // PE0 does not have a switch. This is because there are no PEs with
-      // pe_id < 0, and therefore, no-one to send it wavelets from NEG_DIR.
-      // So, in this case, we (the last PE) are responsible for tearing down
-      // the root as well as all other PEs.
-      ctrl_buf[0] = comptime ctrl.wavelet(.{ .cmd0 = .{ .no_ce = true, .type = ctrl.Cmd.Teardown },
-                                             .cmd1 = .{ .no_ce = true, .type = ctrl.Cmd.Teardown }});
-    }
-    mem_to_fabout_no_activate(ctrl_out, ctrl_mem);
-  }
 }
 
 // The extreme PEs (pid=0 and pid=w-1) send out 2 TDs, one for C0 and the other for C1.
@@ -730,169 +821,11 @@ fn clear_filter_and_switch() void {
   switch_config.clear_current_position(DATA_COLOR_0);
   switch_config.set_invalid_for_all_switch_positions(DATA_COLOR_0);
 
-  // WARNING: gather() sets pop_mode = ALWAYS_POP. If we don't reset pop_mode
-  // for subsequent operation, it is going to pop the command from TD (teardown),
-  // then TD is no longer a TD.
+  // Defensive reset: an earlier `gather()` (since removed) used to set
+  // pop_mode = ALWAYS_POP. Without resetting it here, a subsequent operation
+  // would pop the command from TD (teardown), so TD is no longer a TD.
   switch_config.set_pop_mode(DATA_COLOR_0, tile_config.target.pop_mode.NO_POP);
 }
-
-// Set up a filter that scatters data among the NUM_PEs many PEs in chunks
-// of `cur_network_cfg.count`
-fn configure_scatter_filter() void {
-  const chunk_size = cur_network_cfg.count;
-  const send_size = NUM_PES * cur_network_cfg.count;
-
-  const init_counter = (send_size - pe_id * chunk_size) % send_size;
-
-  const filter_id = @get_filter_id(DATA_COLOR_0);
-  // SDR removes the "limits" on the counter filter, instead, we need to set
-  // the pass_cnt and drop_cnt. To be compatible with old API which still uses
-  // "limits", we need to set pass_cnt (in this case, max_counter) before
-  // calling set_max_counter(). Otherwise the drop_cnt may not be set correctly.
-  tile_config.filters.set_max_counter(filter_id, chunk_size - 1);
-  tile_config.filters.set_active_limit(filter_id, send_size - 1);
-  tile_config.filters.set_counter(filter_id, init_counter);
-}
-
-// A scatter network is a broadcast network + a non-trivial filter,
-// so we can reuse the code from `configure_broadcast_network`
-fn configure_scatter_network() void {
-  configure_scatter_filter();
-  configure_broadcast_network();
-}
-
-// A gather network features all PEs sending data towards the root PE
-// All PEs are equipped with switches that are used to sequence data being
-// sent towards the root PE.
-// If the root PE is not at either extreme of the row or column, it will
-// have a central switch, so it can first receive data from NEG_DIR then
-// receive data from POS_DIR
-//
-// root:
-//  1st PE     middle                  last PE
-//   <--       -->                       -->
-//   |           |                         |
-//   V           V                         V
-//  pos0        pos0                      pos0
-//         receive data from neg first
-//                <--
-//                |
-//                V
-//              pos1
-//
-// non-root:
-//   -->       -->           <--         <--
-//   ^         ^               ^           ^
-//   |         |      root     |           |
-//  pos0      pos0            pos0        pos0
-//
-//           -->-->          <--<--
-//            pos1            pos1
-//  After it sends out the last wavelet, pos0 --> pos1 because of
-//  .advance_switch = true
-//
-fn configure_gather_network() void {
-
-  // (1) configure the routing before the switch position.
-  const root = cur_network_cfg.root;
-
-  const addr = color_config.get_color_config_addr(DATA_COLOR_0);
-
-  if (pe_id == root) {
-
-    // We are the root. If we're at either end, the routing is simple:
-    // no switches needed.
-    if (pe_id == 0) {
-      color_config.reset_routes(addr, .{.tx = RAMP, .rx = POS_DIR});
-    } else if (pe_id == NUM_PES - 1) {
-      color_config.reset_routes(addr, .{.tx = RAMP, .rx = NEG_DIR});
-    } else {
-      // If we're in the middle, then we need a switch to receive first from
-      // NEG_DIR, then receive from the POS_DIR
-      color_config.reset_routes(addr, .{.tx = RAMP, .rx = NEG_DIR});
-    }
-
-  } else if (pe_id == 0) {
-    // If PE0 is not the root, then it must just transmit to POS_DIR
-    color_config.reset_routes(addr, .{.tx = POS_DIR, .rx = RAMP});
-
-  } else if (pe_id == NUM_PES - 1) {
-
-    // If the last PE is not the root, it must just transmit NEG_DIR
-    color_config.reset_routes(addr, .{.tx = NEG_DIR, .rx = RAMP});
-
-  } else if (pe_id < root) {
-
-    // If we are a PE with `pe_id < root`, we transmit to POS_DIR and have a
-    // switch that allows us to act as just a NEG_DIR -> POS_DIR conduit
-    color_config.reset_routes(addr, .{.tx = POS_DIR, .rx = RAMP});
-
-  } else {
-    // If we are a PE with `pe_id > root`, we transmit to NEG_DIR and have a
-    // switch that allows us to act as just a POS_DIR -> NEG_DIR conduit
-    color_config.reset_routes(addr, .{.tx = NEG_DIR, .rx = RAMP});
-  }
-
-  // (2) configure the switch position which needs to inherit configuration
-  // from pos0.
-  // disable the switch for all PEs
-  // the middle PE will reconfigure pos1 later
-  switch_config.clear_current_position(DATA_COLOR_0);
-  switch_config.set_invalid_for_all_switch_positions(DATA_COLOR_0);
-
-  if (pe_id == root) {
-
-    // We are the root. If we're at either end, the routing is simple:
-    // no switches needed, so we skip pid = 0 and pid=w-1.
-    if ((pe_id > 0) and (pe_id < NUM_PES - 1)){
-      // If we're in the middle, then we need a switch to receive first from
-      // NEG_DIR, then receive from the POS_DIR
-      switch_config.set_rx_switch_pos1(DATA_COLOR_0, POS_DIR);
-      switch_config.set_current_switch_position(DATA_COLOR_0, 0);
-    }
-
-  } else if (pe_id == 0) {
-    // If PE0 is not the root, then it must just transmit to POS_DIR
-
-  } else if (pe_id == NUM_PES - 1) {
-
-    // If the last PE is not the root, it must just transmit NEG_DIR
-
-  } else if (pe_id < root) {
-
-    // If we are a PE with `pe_id < root`, we transmit to POS_DIR and have a
-    // switch that allows us to act as just a NEG_DIR -> POS_DIR conduit
-    switch_config.set_rx_switch_pos1(DATA_COLOR_0, NEG_DIR);
-    switch_config.set_current_switch_position(DATA_COLOR_0, 0);
-
-  } else {
-    // If we are a PE with `pe_id > root`, we transmit to NEG_DIR and have a
-    // switch that allows us to act as just a POS_DIR -> NEG_DIR conduit
-    switch_config.set_rx_switch_pos1(DATA_COLOR_0, POS_DIR);
-    switch_config.set_current_switch_position(DATA_COLOR_0, 0);
-  }
-  // The PE at `root + 1` is the "guard PE" which pops a command.
-  // This is important so that the last PE (pe_id == NUM_PES - 1) can send a
-  // command wavelet which tears down all PEs with pe_id > root and then
-  // flips the root PE's switch.
-  // This, in turn, allows the teardown wavelet sent from NEG_DIR to tear down
-  // the root and also find a destination (at the root). Without this mechanism,
-  // the NEG_DIR teardown wavelet would remain in the network and block all
-  // subsequent operations.
-  if (pe_id == root + 1) {
-    switch_config.set_pop_mode(DATA_COLOR_0, tile_config.target.pop_mode.ALWAYS_POP);
-  }
-
-  // NOTE: we don't need to insert NOP here because switch_config and teardown.exit()
-  // work on different config reg, there is no race condition.
-
-  // clear teardown-in-progress bit
-  // WARNING: if we clear TIP bit before routing is reconfigured, it stalls broadcast
-  // on WSE3. However it seems working on gather.
-  // To make it consistent, we always clear TIP after routing/switch is reconfigured.
-  tile_config.teardown.exit(DATA_COLOR_0);
-}
-
 
 // Reduce is complicated: it works with 2 colors instead of 1 (alternating colors strategy)
 // so, it depends on the td_color as well as the root.
@@ -953,7 +886,7 @@ fn configure_reduce_network(td_color: color) void {
 
   // clear teardown-in-progress bit
   // WARNING: if we clear TIP bit before routing is reconfigured, it stalls broadcast
-  // on WSE3. However it seems working on gather and reduce.
+  // on WSE3. However it seems working on reduce.
   // To make it consistent, we always clear TIP after routing/switch is reconfigured.
   tile_config.teardown.exit(td_color);
 }
@@ -991,9 +924,6 @@ var fabout = @get_dsd(fabout_dsd,
                       if (@is_arch("wse3")) .{ .extent = 1, .output_queue = COLOR_0_OQ }
                       else .{ .extent = 1, .fabric_color = DATA_COLOR_0, .output_queue = COLOR_0_OQ });
 var fabin = @get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = COLOR_0_IQ });
-var fabout_adv = @get_dsd(fabout_dsd,
-                          if (@is_arch("wse3")) .{ .extent = 1, .output_queue = COLOR_0_OQ, .advance_switch = true }
-                          else .{ .extent = 1, .fabric_color = DATA_COLOR_0, .output_queue = COLOR_0_OQ, .advance_switch = true });
 
 // For `broadcast`, transfering data is straightforward: the root sends, the others
 // receive.
@@ -1017,129 +947,6 @@ fn transfer_data_broadcast() void {
   // when we next run through `fsm()`, we'll be in the `Callback` state ready
   // to do `@activate(fsm_state.callback)`
   fsm_state.state = StateEnum.Callback;
-}
-
-// For `scatter`, transfering data is almost the same as `broadcast`:
-// generally speaking, the installed-filter does most of the heavy lifting of
-// distributing wavelets between the many PEs.
-// However, because we cannot set up a RAMP -> RAMP route in addition to
-// RAMP -> EAST, WEST, the root PE must also copy over its own chunk of the
-// data to the `recv_buffer`
-fn transfer_data_scatter() void {
-  if (cur_network_cfg.root == pe_id) {
-    // scatter has the same routing as broadcast, it does not have R --> R,
-    // so the root does not send data to itself, we need another mov32 to
-    // copy data from `send_buf` to `recv_buf`
-    // WARNING: only single set of DSR is used, so we must perform non-async
-    // task first
-
-    // (1) copy data locally
-    var dst = @set_dsd_length(mem, cur_network_cfg.count);
-    dst = @set_dsd_base_addr(dst, fsm_state.recv_buf);
-
-    var src = @set_dsd_length(mem, cur_network_cfg.count);
-    src = @set_dsd_base_addr(src, fsm_state.send_buf);
-    src = @increment_dsd_offset(src, @as(i16, pe_id * cur_network_cfg.count), u32);
-
-    // Copy over the root's chunk of the data from `send_buf` to `recv_buf`
-    @load_to_dsr(dest_dsr, dst); // dest DSR points to `recv_buf`
-    @load_to_dsr(src1_dsr, src); // s1dsr points to `send_buf`
-    @mov32(dest_dsr, src1_dsr);
-    //@mov32(dst, src);
-
-    // (2) broadcast data to other PEs
-    fabout = @set_dsd_length(fabout, cur_network_cfg.count * NUM_PES);
-    mem = @set_dsd_length(mem, cur_network_cfg.count * NUM_PES);
-    mem = @set_dsd_base_addr(mem, fsm_state.send_buf);
-
-    // NOTE: at the end of this data transfer, we activate ACTIVATE_FSM_TASK_ID
-    mem_to_fabout(fabout, mem);
-
-  } else {
-    fabin = @set_dsd_length(fabin, cur_network_cfg.count);
-    mem = @set_dsd_length(mem, cur_network_cfg.count);
-    mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
-
-    // NOTE: at the end of this data transfer, we activate ACTIVATE_FSM_TASK_ID
-    fabin_to_mem(mem, fabin);
-  }
-
-  // when we next run through `fsm()`, we'll be in the `Callback` state ready
-  // to do `@activate(fsm_state.callback)`
-  fsm_state.state = StateEnum.Callback;
-}
-
-// Transfer data in gather if we are the `root` PE
-fn transfer_data_gather_root(root: u16, count: u16) void {
-  // In `gather`, if we are the root, we must receive first from
-  // NEG_DIR, then copy our own data over, then receive from POS_DIR
-  if (fsm_state.counter == root) {
-
-    // If our counter is at the `root`, this means that we should copy data
-    // over from `send_buf` to `recv_buf` locally
-    mem = @set_dsd_length(mem, count);
-    const src = @set_dsd_base_addr(mem, fsm_state.send_buf);
-    mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
-    mem = @increment_dsd_offset(mem, @as(i16, root * count), u32);
-
-    @load_to_dsr(dest_dsr, mem);
-    @load_to_dsr(src1_dsr, src);
-    @mov32(dest_dsr, src1_dsr);
-    //@mov32(mem, src);
-    fsm_state.counter += 1;
-
-    // If we are the last PE in the row or column, then there is no step
-    // after this! No data to receive from POS_DIR, so, we move to the
-    // `StateEnum.Callback` state.
-    if (root == NUM_PES - 1) {
-      fsm_state.state = StateEnum.Callback;
-    }
-    @activate(ACTIVATE_FSM_TASK_ID);
-
-  } else if (fsm_state.counter == 0) {
-
-    // If our `fsm_state.counter` is 0 and we are in this case
-    // (instead of the `fsm_state.counter == root` case above), we know that
-    // `root != 0`. We are now receiving data from NEG_DIR, but that data
-    // is arriving in reverse order because this allows us to ingest all
-    // data in a single mem1d_dsd operation.
-
-    const neg_dir_size = count * root;
-
-    fabin = @set_dsd_length(fabin, neg_dir_size);
-
-    mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
-    mem = @set_dsd_length(mem, neg_dir_size);
-    mem = @increment_dsd_offset(mem, @as(i16, neg_dir_size) - 1, u32);
-
-    // Because we are receiving data in reverse order, we create a fresh
-    // dsd with stride negative 1.
-    const rev = @set_dsd_stride(mem, -1);
-
-    fabin_to_mem(rev, fabin);
-
-    // Once we are done ingesting data from NEG_DIR, we move onto the `root`
-    // state
-    fsm_state.counter = root;
-
-  } else {
-
-    // Finally, we are ingesting data from POS_DIR, and we receive this data
-    // in the correct order. This is a simple receive operation.
-    @assert(fsm_state.counter == root + 1);
-
-    const offset = (root + 1) * count;
-    const pos_dir_size = (NUM_PES - root - 1) * count;
-
-    fabin = @set_dsd_length(fabin, pos_dir_size);
-
-    mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
-    mem = @set_dsd_length(mem, pos_dir_size);
-    mem = @increment_dsd_offset(mem, @as(i16, offset), u32);
-
-    fabin_to_mem(mem, fabin);
-    fsm_state.state = StateEnum.Callback;
-  }
 }
 
 // We need to use functions like these instead of putting DSD ops directly into
@@ -1236,58 +1043,6 @@ fn mem_to_fabout_no_activate(f: fabout_dsd, m: mem1d_dsd) void {
   @load_to_dsr(src1_dsr, m);
   @mov32(dest_dsr, src1_dsr, .{.async=true} );
   //@mov32(f, m, .{ .async = true });
-}
-
-// Gather is a multi-phase FSM
-fn transfer_data_gather() void {
-
-  const root = cur_network_cfg.root;
-  const count = cur_network_cfg.count;
-  if (root == pe_id) {
-
-    transfer_data_gather_root(root, count);
-
-  } else if (fsm_state.counter == 0) {
-    // We're a non-root node, responsible for sending our data towards the root
-    // in the first pass through the FSM
-
-    fabout_adv = @set_dsd_length(fabout_adv, count);
-    mem = @set_dsd_length(mem, count);
-    mem = @set_dsd_base_addr(mem, fsm_state.send_buf);
-
-    var tmp = mem;
-    // If our `pe_id` is less than `root`, then we must send data in reverse
-    // to allow the root PE to receive it in a single `mem1d_dsd` operation.
-    // To avoid breaking `mem` by setting a negative stride, we do these
-    // operations with a temporary DSD `tmp`.
-    if (pe_id < root) {
-      tmp = @increment_dsd_offset(tmp, @as(i16, count) - 1, u32);
-      tmp = @set_dsd_stride(tmp, - 1);
-    }
-
-    // If we are PE0 and the root is somewhere in the middle of our row or
-    // column, after we are done sending our data, we are responsible for
-    // sending the control wavelet that flips root's switch to allow it to
-    // start receiving from POS_DIR
-    const send_ctrl_wavelet = (pe_id == 0) and (root != NUM_PES - 1);
-    if (!send_ctrl_wavelet) {
-      // If we are not in that case, we are done and can move to the callback
-      // state
-      fsm_state.state = StateEnum.Callback;
-    }
-    mem_to_fabout(fabout_adv, tmp);
-
-    fsm_state.counter += 1;
-  } else {
-    // We send a single control wavelet to flip root's switch, allowing it to
-    // start receiving from POS_DIR
-    @assert(pe_id == 0);
-    @assert(root != NUM_PES - 1);
-
-    ctrl_buf[0] = comptime ctrl.wavelet(.{ .cmd0 = .{ .no_ce = true, .type = ctrl.Cmd.Advance } });
-    mem_to_fabout(ctrl_out, ctrl_mem);
-    fsm_state.state = StateEnum.Callback;
-  }
 }
 
 // Reduce is the only function in this library that involves both COLOR_0 and
@@ -1598,18 +1353,402 @@ fn transfer_data_reduce_select_any() void {
   }
 }
 
+// Explicit-index counterpart of transfer_data_reduce_select_any()
+// -- same root/non-root, extreme-PE/middle-PE branching every reduce
+// variant in this file shares, but each hop-side now has FOUR sub-transfers
+// instead of dense's one: (1) bitmap [fixed bitmap_words, u32, via `mem`],
+// (2) length [fixed 1 word, u16, via `mem16`, an explicit handshake -- see
+// reduce_select_any_indexed()'s own comment for why], (3) indices [length,
+// u16, via `mem16`], (4) values [length, u32, via `mem`]. `mem16` here
+// carries GENUINE u16 data (no @ptrcast reinterpretation needed, unlike
+// reduce_or's own mem16 usage, since indices really are u16-typed, not a
+// u16 view of u32 words).
+//
+// Two hard-won lessons from an earlier sparse design (since removed, see
+// docs/ERRORS.md #16) apply here, doubly so given there are twice as many
+// sub-transfers per hop: (1) reduce_pos_fabin/reduce_neg_fabin/
+// reduce_pos_fabout/reduce_neg_fabout must be re-length'd immediately
+// before EVERY single sub-transfer (bitmap and length sub-transfers
+// included, not just the variable-length ones) to match whichever of
+// `mem`/`mem16` is in use -- omitting this desyncs sender/receiver. (2)
+// every branch that transitions to StateEnum.Callback (or advances
+// fsm_state.counter) WITHOUT issuing a new fabin_to_mem/mem_to_fabout/
+// fabin_to_mem16/mem_to_fabout16 call must explicitly
+// @activate(ACTIVATE_FSM_TASK_ID) itself -- there is no async op left to
+// do it via its own .activate, and skipping this silently deadlocks the
+// whole collective (confirmed the hard way in the removed sparse design;
+// not re-confirmed by a live bug here, just applied preemptively).
+fn transfer_data_reduce_select_any_indexed() void {
+
+  const root = cur_network_cfg.root;
+  const count = cur_network_cfg.count;
+  const sentinel = cur_network_cfg.sentinel;
+  const bitmap_words: u16 = (count + 31) / 32;
+
+  if (pe_id == root and fsm_state.counter == 0) {
+    // Root, pass 1: ingest side A's bitmap raw into recv_bitmap.
+    reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, bitmap_words);
+    reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, bitmap_words);
+    mem = @set_dsd_length(mem, bitmap_words);
+    mem = @set_dsd_base_addr(mem, indexed_recv_bitmap);
+    switch (pe_id) {
+      0 => { fabin_to_mem(mem, reduce_pos_fabin); },
+      (NUM_PES - 1) => { fabin_to_mem(mem, reduce_neg_fabin); },
+      else => { fabin_to_mem(mem, reduce_pos_fabin); }
+    }
+    fsm_state.counter += 1;
+
+  } else if (pe_id == root and fsm_state.counter == 1) {
+    // Root, pass 2: side A's length handshake.
+    reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, 1);
+    reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, 1);
+    mem16 = @set_dsd_length(mem16, 1);
+    mem16 = @set_dsd_base_addr(mem16, &indexed_len_scratch);
+    switch (pe_id) {
+      0 => { fabin_to_mem16(mem16, reduce_pos_fabin); },
+      (NUM_PES - 1) => { fabin_to_mem16(mem16, reduce_neg_fabin); },
+      else => { fabin_to_mem16(mem16, reduce_pos_fabin); }
+    }
+    fsm_state.counter += 1;
+
+  } else if (pe_id == root and fsm_state.counter == 2) {
+    // Root, pass 3: side A's length landed -- receive its indices (0-guarded).
+    indexed_incoming_count = indexed_len_scratch[0];
+    if (indexed_incoming_count == 0) {
+      fsm_state.counter += 1;
+      @activate(ACTIVATE_FSM_TASK_ID);
+    } else {
+      reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, indexed_incoming_count);
+      reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, indexed_incoming_count);
+      mem16 = @set_dsd_length(mem16, indexed_incoming_count);
+      mem16 = @set_dsd_base_addr(mem16, indexed_recv_indices);
+      switch (pe_id) {
+        0 => { fabin_to_mem16(mem16, reduce_pos_fabin); },
+        (NUM_PES - 1) => { fabin_to_mem16(mem16, reduce_neg_fabin); },
+        else => { fabin_to_mem16(mem16, reduce_pos_fabin); }
+      }
+      fsm_state.counter += 1;
+    }
+
+  } else if (pe_id == root and fsm_state.counter == 3) {
+    // Root, pass 4: side A's indices landed (or were skipped) -- receive
+    // its values (same 0-guard state as indices, since they share a count).
+    if (indexed_incoming_count == 0) {
+      fsm_state.counter += 1;
+      @activate(ACTIVATE_FSM_TASK_ID);
+    } else {
+      reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, indexed_incoming_count);
+      reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, indexed_incoming_count);
+      mem = @set_dsd_length(mem, indexed_incoming_count);
+      mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
+      switch (pe_id) {
+        0 => { fabin_to_mem(mem, reduce_pos_fabin); },
+        (NUM_PES - 1) => { fabin_to_mem(mem, reduce_neg_fabin); },
+        else => { fabin_to_mem(mem, reduce_pos_fabin); }
+      }
+      fsm_state.counter += 1;
+    }
+
+  } else if (pe_id == root and fsm_state.counter == 4) {
+    // Root, pass 5: side A fully landed -- merge MY OWN data (send_*,
+    // untouched so far) into it now, freeing send_bitmap/send_indices/
+    // send_values' memory to reuse as a middle root's landing zone for
+    // side B -- the same in-place trick reduce_select_any() itself uses
+    // (see its own comment), extended to three buffer pairs instead of one.
+    indexed_recv_count = append_merge_indexed(indexed_recv_bitmap, indexed_recv_indices, fsm_state.recv_buf, indexed_incoming_count,
+                                               indexed_send_bitmap, indexed_send_indices, fsm_state.send_buf, indexed_my_count,
+                                               bitmap_words);
+    switch (pe_id) {
+      0 => {
+        // Extreme root: no second side exists -- done.
+        decompress_indexed_to_dense(indexed_recv_indices, fsm_state.recv_buf, indexed_recv_count, sentinel, count, indexed_dense_recv_buf);
+        fsm_state.state = StateEnum.Callback;
+        @activate(ACTIVATE_FSM_TASK_ID);
+      },
+      (NUM_PES - 1) => {
+        decompress_indexed_to_dense(indexed_recv_indices, fsm_state.recv_buf, indexed_recv_count, sentinel, count, indexed_dense_recv_buf);
+        fsm_state.state = StateEnum.Callback;
+        @activate(ACTIVATE_FSM_TASK_ID);
+      },
+      else => {
+        // Middle root: ingest side B's bitmap directly into send_bitmap's
+        // now-free memory (in place -- no dedicated scratch buffer).
+        reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, bitmap_words);
+        mem = @set_dsd_length(mem, bitmap_words);
+        mem = @set_dsd_base_addr(mem, indexed_send_bitmap);
+        fabin_to_mem(mem, reduce_neg_fabin);
+        fsm_state.counter += 1;
+      }
+    }
+
+  } else if (pe_id == root and fsm_state.counter == 5) {
+    // Root, pass 6 (middle root only): side B's bitmap landed -- length handshake.
+    reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, 1);
+    mem16 = @set_dsd_length(mem16, 1);
+    mem16 = @set_dsd_base_addr(mem16, &indexed_len_scratch);
+    fabin_to_mem16(mem16, reduce_neg_fabin);
+    fsm_state.counter += 1;
+
+  } else if (pe_id == root and fsm_state.counter == 6) {
+    // Root, pass 7 (middle root only): side B's length landed -- indices (0-guarded).
+    indexed_incoming_count = indexed_len_scratch[0];
+    if (indexed_incoming_count == 0) {
+      fsm_state.counter += 1;
+      @activate(ACTIVATE_FSM_TASK_ID);
+    } else {
+      reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, indexed_incoming_count);
+      mem16 = @set_dsd_length(mem16, indexed_incoming_count);
+      mem16 = @set_dsd_base_addr(mem16, indexed_send_indices);
+      fabin_to_mem16(mem16, reduce_neg_fabin);
+      fsm_state.counter += 1;
+    }
+
+  } else if (pe_id == root and fsm_state.counter == 7) {
+    // Root, pass 8 (middle root only): side B's indices landed (or were
+    // skipped) -- values (same 0-guard state).
+    if (indexed_incoming_count == 0) {
+      fsm_state.counter += 1;
+      @activate(ACTIVATE_FSM_TASK_ID);
+    } else {
+      reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, indexed_incoming_count);
+      mem = @set_dsd_length(mem, indexed_incoming_count);
+      mem = @set_dsd_base_addr(mem, fsm_state.send_buf);
+      fabin_to_mem(mem, reduce_neg_fabin);
+      fsm_state.counter += 1;
+    }
+
+  } else if (pe_id == root and fsm_state.counter == 8) {
+    // Root, pass 9 (middle root only): side B fully landed -- merge it in
+    // and finish, decompressing the final union into the caller's dense
+    // recv_buf.
+    indexed_recv_count = append_merge_indexed(indexed_recv_bitmap, indexed_recv_indices, fsm_state.recv_buf, indexed_recv_count,
+                                               indexed_send_bitmap, indexed_send_indices, fsm_state.send_buf, indexed_incoming_count,
+                                               bitmap_words);
+    decompress_indexed_to_dense(indexed_recv_indices, fsm_state.recv_buf, indexed_recv_count, sentinel, count, indexed_dense_recv_buf);
+    fsm_state.state = StateEnum.Callback;
+    @activate(ACTIVATE_FSM_TASK_ID);
+
+  } else if (pe_id == 0) {
+    // Extreme non-root: nothing arrives from "before" us -- just forward
+    // our own copy toward root, no merge needed. Every sender (root or
+    // not, extreme or not) always emits all four sub-parts, even a
+    // length of 0, so a receiver on the other end never has to guess
+    // whether a part was skipped.
+    if (fsm_state.counter == 0) {
+      reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, bitmap_words);
+      mem = @set_dsd_length(mem, bitmap_words);
+      mem = @set_dsd_base_addr(mem, indexed_send_bitmap);
+      mem_to_fabout(reduce_pos_fabout, mem);
+      fsm_state.counter += 1;
+    } else if (fsm_state.counter == 1) {
+      indexed_len_scratch[0] = indexed_my_count;
+      reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, 1);
+      mem16 = @set_dsd_length(mem16, 1);
+      mem16 = @set_dsd_base_addr(mem16, &indexed_len_scratch);
+      mem_to_fabout16(reduce_pos_fabout, mem16);
+      fsm_state.counter += 1;
+    } else if (fsm_state.counter == 2) {
+      if (indexed_my_count == 0) {
+        fsm_state.counter += 1;
+        @activate(ACTIVATE_FSM_TASK_ID);
+      } else {
+        reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, indexed_my_count);
+        mem16 = @set_dsd_length(mem16, indexed_my_count);
+        mem16 = @set_dsd_base_addr(mem16, indexed_send_indices);
+        mem_to_fabout16(reduce_pos_fabout, mem16);
+        fsm_state.counter += 1;
+      }
+    } else {
+      if (indexed_my_count == 0) {
+        fsm_state.state = StateEnum.Callback;
+        @activate(ACTIVATE_FSM_TASK_ID);
+      } else {
+        reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, indexed_my_count);
+        mem = @set_dsd_length(mem, indexed_my_count);
+        mem = @set_dsd_base_addr(mem, fsm_state.send_buf);
+        mem_to_fabout(reduce_pos_fabout, mem);
+        fsm_state.state = StateEnum.Callback;
+      }
+    }
+
+  } else if (pe_id == NUM_PES - 1) {
+    if (fsm_state.counter == 0) {
+      reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, bitmap_words);
+      mem = @set_dsd_length(mem, bitmap_words);
+      mem = @set_dsd_base_addr(mem, indexed_send_bitmap);
+      mem_to_fabout(reduce_neg_fabout, mem);
+      fsm_state.counter += 1;
+    } else if (fsm_state.counter == 1) {
+      indexed_len_scratch[0] = indexed_my_count;
+      reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, 1);
+      mem16 = @set_dsd_length(mem16, 1);
+      mem16 = @set_dsd_base_addr(mem16, &indexed_len_scratch);
+      mem_to_fabout16(reduce_neg_fabout, mem16);
+      fsm_state.counter += 1;
+    } else if (fsm_state.counter == 2) {
+      if (indexed_my_count == 0) {
+        fsm_state.counter += 1;
+        @activate(ACTIVATE_FSM_TASK_ID);
+      } else {
+        reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, indexed_my_count);
+        mem16 = @set_dsd_length(mem16, indexed_my_count);
+        mem16 = @set_dsd_base_addr(mem16, indexed_send_indices);
+        mem_to_fabout16(reduce_neg_fabout, mem16);
+        fsm_state.counter += 1;
+      }
+    } else {
+      if (indexed_my_count == 0) {
+        fsm_state.state = StateEnum.Callback;
+        @activate(ACTIVATE_FSM_TASK_ID);
+      } else {
+        reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, indexed_my_count);
+        mem = @set_dsd_length(mem, indexed_my_count);
+        mem = @set_dsd_base_addr(mem, fsm_state.send_buf);
+        mem_to_fabout(reduce_neg_fabout, mem);
+        fsm_state.state = StateEnum.Callback;
+      }
+    }
+
+  } else if (fsm_state.counter == 0) {
+    // Middle, non-root, pass 1: ingest whatever's accumulated so far's bitmap.
+    reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, bitmap_words);
+    reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, bitmap_words);
+    mem = @set_dsd_length(mem, bitmap_words);
+    mem = @set_dsd_base_addr(mem, indexed_recv_bitmap);
+    if (pe_id < root) {
+      fabin_to_mem(mem, reduce_neg_fabin);
+    } else {
+      fabin_to_mem(mem, reduce_pos_fabin);
+    }
+    fsm_state.counter += 1;
+
+  } else if (fsm_state.counter == 1) {
+    // Middle, non-root, pass 2: bitmap landed -- length handshake.
+    reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, 1);
+    reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, 1);
+    mem16 = @set_dsd_length(mem16, 1);
+    mem16 = @set_dsd_base_addr(mem16, &indexed_len_scratch);
+    if (pe_id < root) {
+      fabin_to_mem16(mem16, reduce_neg_fabin);
+    } else {
+      fabin_to_mem16(mem16, reduce_pos_fabin);
+    }
+    fsm_state.counter += 1;
+
+  } else if (fsm_state.counter == 2) {
+    // Middle, non-root, pass 3: length landed -- indices (0-guarded).
+    indexed_incoming_count = indexed_len_scratch[0];
+    if (indexed_incoming_count == 0) {
+      fsm_state.counter += 1;
+      @activate(ACTIVATE_FSM_TASK_ID);
+    } else {
+      reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, indexed_incoming_count);
+      reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, indexed_incoming_count);
+      mem16 = @set_dsd_length(mem16, indexed_incoming_count);
+      mem16 = @set_dsd_base_addr(mem16, indexed_recv_indices);
+      if (pe_id < root) {
+        fabin_to_mem16(mem16, reduce_neg_fabin);
+      } else {
+        fabin_to_mem16(mem16, reduce_pos_fabin);
+      }
+      fsm_state.counter += 1;
+    }
+
+  } else if (fsm_state.counter == 3) {
+    // Middle, non-root, pass 4: indices landed (or were skipped) -- values
+    // (same 0-guard state).
+    if (indexed_incoming_count == 0) {
+      fsm_state.counter += 1;
+      @activate(ACTIVATE_FSM_TASK_ID);
+    } else {
+      reduce_neg_fabin = @set_dsd_length(reduce_neg_fabin, indexed_incoming_count);
+      reduce_pos_fabin = @set_dsd_length(reduce_pos_fabin, indexed_incoming_count);
+      mem = @set_dsd_length(mem, indexed_incoming_count);
+      mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
+      if (pe_id < root) {
+        fabin_to_mem(mem, reduce_neg_fabin);
+      } else {
+        fabin_to_mem(mem, reduce_pos_fabin);
+      }
+      fsm_state.counter += 1;
+    }
+
+  } else if (fsm_state.counter == 4) {
+    // Middle, non-root, pass 5: fully landed -- merge with our own copy IN
+    // PLACE, forward the updated union's bitmap toward root.
+    indexed_recv_count = append_merge_indexed(indexed_recv_bitmap, indexed_recv_indices, fsm_state.recv_buf, indexed_incoming_count,
+                                               indexed_send_bitmap, indexed_send_indices, fsm_state.send_buf, indexed_my_count,
+                                               bitmap_words);
+    reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, bitmap_words);
+    reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, bitmap_words);
+    mem = @set_dsd_length(mem, bitmap_words);
+    mem = @set_dsd_base_addr(mem, indexed_recv_bitmap);
+    if (pe_id < root) {
+      mem_to_fabout(reduce_pos_fabout, mem);
+    } else {
+      mem_to_fabout(reduce_neg_fabout, mem);
+    }
+    fsm_state.counter += 1;
+
+  } else if (fsm_state.counter == 5) {
+    // Middle, non-root, pass 6: forward the updated union's length.
+    indexed_len_scratch[0] = indexed_recv_count;
+    reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, 1);
+    reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, 1);
+    mem16 = @set_dsd_length(mem16, 1);
+    mem16 = @set_dsd_base_addr(mem16, &indexed_len_scratch);
+    if (pe_id < root) {
+      mem_to_fabout16(reduce_pos_fabout, mem16);
+    } else {
+      mem_to_fabout16(reduce_neg_fabout, mem16);
+    }
+    fsm_state.counter += 1;
+
+  } else if (fsm_state.counter == 6) {
+    // Middle, non-root, pass 7: forward the updated union's indices (0-guarded).
+    if (indexed_recv_count == 0) {
+      fsm_state.counter += 1;
+      @activate(ACTIVATE_FSM_TASK_ID);
+    } else {
+      reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, indexed_recv_count);
+      reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, indexed_recv_count);
+      mem16 = @set_dsd_length(mem16, indexed_recv_count);
+      mem16 = @set_dsd_base_addr(mem16, indexed_recv_indices);
+      if (pe_id < root) {
+        mem_to_fabout16(reduce_pos_fabout, mem16);
+      } else {
+        mem_to_fabout16(reduce_neg_fabout, mem16);
+      }
+      fsm_state.counter += 1;
+    }
+
+  } else {
+    // Middle, non-root, pass 8: forward the updated union's values (same
+    // 0-guard state), done.
+    if (indexed_recv_count == 0) {
+      fsm_state.state = StateEnum.Callback;
+      @activate(ACTIVATE_FSM_TASK_ID);
+    } else {
+      reduce_pos_fabout = @set_dsd_length(reduce_pos_fabout, indexed_recv_count);
+      reduce_neg_fabout = @set_dsd_length(reduce_neg_fabout, indexed_recv_count);
+      mem = @set_dsd_length(mem, indexed_recv_count);
+      mem = @set_dsd_base_addr(mem, fsm_state.recv_buf);
+      if (pe_id < root) {
+        mem_to_fabout(reduce_pos_fabout, mem);
+      } else {
+        mem_to_fabout(reduce_neg_fabout, mem);
+      }
+      fsm_state.state = StateEnum.Callback;
+    }
+  }
+}
+
 // Function that dispatches appropriate type of data-transfer function depending
 // on the type of collective communication primitive being used
 fn transfer_data() void {
   switch (cur_network_cfg.type) {
     Ftype.broadcast => {
       transfer_data_broadcast();
-    },
-    Ftype.scatter => {
-      transfer_data_scatter();
-    },
-    Ftype.gather => {
-      transfer_data_gather();
     },
     Ftype.reduce_or => {
       // named explicitly rather than folded into the else below --
@@ -1621,6 +1760,11 @@ fn transfer_data() void {
       // variants silently sharing one else branch would be an even bigger
       // footgun.
       transfer_data_reduce_select_any();
+    },
+    Ftype.reduce_select_any_indexed => {
+      // named explicitly for the same reason -- a fourth reduce variant
+      // silently sharing the else branch would be the same footgun again.
+      transfer_data_reduce_select_any_indexed();
     },
     else => {
       transfer_data_reduce();
@@ -1639,8 +1783,9 @@ comptime {
   // Bind our relevant tasks
   @bind_local_task(fsm, ACTIVATE_FSM_TASK_ID);
 
-  // We need to install a placeholder filter just to allow for filter reconfiguration
-  // in `scatter`
+  // We need to install a placeholder filter just to allow for filter
+  // reconfiguration (originally for `scatter`, since removed -- kept as a
+  // harmless static no-op default for DATA_COLOR_0's initial config).
   // This current filter is a no-op
   const filter = .{
     .count_data = true,
@@ -1681,8 +1826,9 @@ var num_tds: u16 = 0;
 
 fn teardown_handler_0() void {
   if (cur_network_cfg.type == Ftype.reduce_fadds or cur_network_cfg.type == Ftype.reduce_or
-      or cur_network_cfg.type == Ftype.reduce_select_any) {
-    // all three reduce ops use C0 and C1 -- NOT exhaustiveness-checked
+      or cur_network_cfg.type == Ftype.reduce_select_any
+      or cur_network_cfg.type == Ftype.reduce_select_any_indexed) {
+    // all four reduce ops use C0 and C1 -- NOT exhaustiveness-checked
     // (plain booleans, unlike initiate_teardowns()'s switch), so a missed
     // case here is a SILENT C_LOCK-never-unblocks hang, not a compile
     // error. Must stay in sync with every Ftype.reduce_* addition by hand.
@@ -1693,7 +1839,7 @@ fn teardown_handler_0() void {
        @activate(C_LOCK);
     }
   }else{
-    // others {bcast, gather, scatter} only use C0
+    // others {bcast} only use C0
     // LOCK can be picked only when the operation finishes
     @activate(C_LOCK);
   }
@@ -1703,7 +1849,8 @@ fn teardown_handler_1() void {
   // only reduce ops use C0 and C1 -- see teardown_handler_0's comment on
   // why this must be kept in sync by hand with every Ftype.reduce_* addition.
   @assert(cur_network_cfg.type == Ftype.reduce_fadds or cur_network_cfg.type == Ftype.reduce_or
-          or cur_network_cfg.type == Ftype.reduce_select_any);
+          or cur_network_cfg.type == Ftype.reduce_select_any
+          or cur_network_cfg.type == Ftype.reduce_select_any_indexed);
   num_tds += 1;
   if (num_tds == 2){ // receive TD from C0 and C1
     num_tds = 0; // reset num_tds
@@ -1727,7 +1874,7 @@ comptime{
 // - the operation unblocks LOCK when it finishes
 // - LOCK is picked by the HW scheduler to perform the state transition
 //
-// (*) operation is {broadcast, scatter, gather, reduce_add}
+// (*) operation is {broadcast, reduce_add}
 //
 task f_lock() void {
   @activate(fsm_state.callback);

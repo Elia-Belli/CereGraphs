@@ -105,26 +105,50 @@ still correct with the chunked transfer. (Visited count is small, 18/685500
 — expected, not a bug: berkstan is directed, and this particular vertex has
 a small out-component from that direction.)
 
-### 4b. `h2d_matrix` cycle-count stat is garbage — separate, pre-existing bug (open)
-While cross-checking timing after the #4 fix (real appliance runs of
-berkstan, s18, s20 @ 750x750, host-side `time` vs. the script's own printed
-stats), the `h2d_matrix: min=/max=/avg=` line printed a nonsense cycle count
-in *all three* runs (29.5B, 72.2B, and 595B cycles respectively — none
-plausible at 875MHz). Critically, **s18 and s20 never touch the new
-chunking path at all** (single-call, `max_local_nnz` far below the
-threshold) and still show garbage — proving this is a pre-existing bug in
-the `h2d_matrix` timing readout itself (most likely a 32-bit on-device
-cycle-counter wraparound not handled by the delta computation), unrelated
-to chunking, just never noticed before because every prior large-graph run
-either failed outright (this same #4 ceiling) or was small enough to finish
-before anyone looked closely at this one diagnostic line. **Does not affect
-correctness**: `search_time_cycles`/GTEPS use a different, confirmed-correct
-mechanism (`round_trip_start_buffer`/`round_trip_done_buffer`), and the
-script's own `WARNING` already notes `total_runtime_cycles`/`GTEPS` "remain
-CORRECT regardless." Old CSV rows/plots for berkstan/s18/s20 @ 750x750 that
-carried this garbage value were replaced with fresh reruns (cleanup, not a
-fix). **Status**: open, cosmetic/diagnostic-only, not chased further this
-session.
+### 4b. ~~`h2d_matrix` cycle-count stat is garbage~~ — CORRECTED: not a bug, a genuinely huge real cost (2026-08-02)
+This entry originally claimed the `h2d_matrix: min=/max=/avg=` line printed
+implausible cycle counts (29.5B, 72.2B, 595B cycles across berkstan/s18/s20
+@ 750x750) due to "likely a 32-bit on-device cycle-counter wraparound," and
+marked the issue open/cosmetic. **That diagnosis was wrong.** Investigated
+directly (2026-08-02, real ALCF hardware):
+
+1. **No wraparound exists at any bracket duration.** A sleep-sweep
+   experiment (`f_sync_hostdevice` → `f_tic` → host `time.sleep(span)` →
+   `f_toc`, no real transfer, `span` from 0.05s to 30s against a tiny 4x4
+   artifact) showed a flat, proportional `measured_cycles`/`expected_cycles`
+   ratio (~0.857, stable) across the *entire* range — no corruption, no
+   jump, no sign of a wrap anywhere up to 30 real seconds.
+2. **The billions-of-cycles number IS real elapsed time.** Cross-checked
+   directly against real RMAT s17 @ 750x750: host-side wall-clock timestamps
+   on every printed line showed a **23.77 real-second** gap between the
+   "timing h2d: matrix structure upload" print and the next print, while the
+   device reported `h2d_matrix` span = 17,700,123,401 cycles — 20.2s at the
+   assumed `CLOCK_FREQ_HZ=875MHz`, or 23.6s if the real effective clock is
+   closer to 750MHz (matching the ~0.857 ratio from the sleep-sweep almost
+   exactly). Either way, the reported cycle count corresponds to genuine
+   real time, not garbage.
+
+**Actual finding**: `h2d_matrix` (the matrix-structure upload, 7 separate
+appliance-mode `memcpy_h2d` calls per run) genuinely takes on the order of
+tens of real seconds for a modest ~3.7M-nonzero matrix — dwarfing every
+other cost in the pipeline (`parent_resolve` ~1.8ms, on-device compute
+~0.15ms). This is a real, very large performance cost that was previously
+mischaracterized as a measurement bug and therefore never investigated as
+one. **Does not affect correctness**: `search_time_cycles`/GTEPS still use
+the separate, confirmed-correct `round_trip_start_buffer`/
+`round_trip_done_buffer` mechanism, unaffected either way.
+
+**Secondary, smaller, less-confirmed finding**: the ~0.857 ratio from the
+sleep-sweep hints `CLOCK_FREQ_HZ = 875_000_000.0` (used throughout this
+codebase for every reported second/GTEPS figure) may not match the real
+device clock (~750MHz?) — plausible given 6/7 × 875MHz = 750MHz exactly, but
+not yet isolated from potential gRPC dispatch-latency confounds in the
+sleep-sweep methodology. Flagged for a dedicated follow-up, not yet acted on.
+
+**Status**: root cause corrected; the *real* h2d_matrix cost (why 7 appliance
+gRPC calls take tens of seconds — per-call dispatch overhead vs. real
+bandwidth limits vs. something else) is a genuine, separate optimization
+target, not chased further in this session pending user direction.
 
 ### 5. Blanket symmetrization of SNAP graphs fabricated edges
 **Where**: v2 of the SNAP pipeline (before this fix), all 5 graphs.
@@ -207,6 +231,57 @@ lines earlier in the same log — if they're present, it's #8, and retrying
 will not help (deterministic capacity, not a transient).
 **Status**: real, open, not attempted to fix this session (would require
 either more PEs or reducing static memory per PE, e.g. narrower bitmaps).
+
+**New occurrence (2026-08-02): `reduce_select_any_indexed` at RMAT s19,
+512x512 (`blk=1024`)**. Same `.bss`/task-table/`.data.hi` overflow
+signature, confirmed via the FULL (non-truncated) compile log — the
+subsequent "cannot open ... .o"/".ld" lines further down the same log are
+the same downstream-cleanup symptom already described above, not a fresh
+instance of #12; don't misdiagnose this pattern again. A dense control
+compile at the identical config succeeded cleanly in 190s, confirming this
+is specific to indexed, not a generic flake at this scale.
+
+Initial hypothesis was that indexed's 6 extra per-PE scratch buffers
+(send/recv × bitmap/indices/values, ~12.5KB/PE at `blk=1024`, vs sparse's
+~8.4KB 2-buffer workspace) were the cause. **Tested and refuted the same
+day**: made all variant-specific buffers' sizes comptime-conditional on
+`parent_resolve_variant` (a `const X = if (parent_resolve_variant == N)
+real_size else 0;` pattern, guaranteeing zero-size for every variant NOT
+selected at a given compile — see #17's own update) and additionally
+removed `reduce_select_any_sparse`'s workspace buffers from `bool_pe.csl`
+entirely (sparse had no regime where it won, see #16, so no reason to keep
+its ~8.4KB of dead-weight-when-unused scratch around at all). Retried the
+identical s19-512x512 indexed compile with both changes in place: **failed
+identically**, same `.bss`/task-table/`.data.hi` signature. Since this
+retest genuinely removed sparse's ~8.4KB from the indexed compile and
+nothing changed, the caller-side DATA buffers are not the (sole) driver of
+this ceiling — the remaining, more likely cause is CODE size: indexed's
+`transfer_data_reduce_select_any_indexed()` FSM has roughly 2x the
+sub-transfers/branch states of dense's much simpler transfer function
+(see #17), and that code is compiled into the binary unconditionally
+regardless of `parent_resolve_variant`'s value (confirmed no `comptime if`
+gates it in `collectives_2d/pe.csl`, and the buffer experiment's null
+result is itself evidence the compiler isn't eliminating the whole dead
+branch, code included, based on a runtime `if` over a `param`).
+
+**Further tested the same day**: also removed `reduce_select_any_sparse()`
+entirely from `collectives_2d/pe.csl` (not just its `bool_pe.csl` wiring --
+the function, helpers, `Ftype` entry, and FSM, see #16's updated status)
+and separately found and removed `scatter()`/`gather()` and their full
+supporting infrastructure (10 functions total, see new entry #18) after
+confirming they have zero call sites anywhere in this application. Retried
+the identical s19-512x512 indexed compile with ALL of today's cleanup in
+place (comptime-sized buffers + sparse fully removed + scatter/gather fully
+removed): **still failed, but the failure signature changed** —
+`.bss` no longer overflows; only `ld.lld: error: ran out of PE memory for
+task table` and `ld.lld: error: ran out of PE memory for data (section
+.data.hi)` remain. This is genuine partial progress (removing real dead
+code did measurably shrink the footprint), just not enough to clear the
+two remaining overflows. **Not retried further** — real, deterministic,
+and would need a genuine reduction in indexed's own per-hop protocol
+complexity (fewer sub-transfers or FSM states, which is what's now driving
+both the task-table and `.data.hi` overflow), not further dead-code
+removal, to lift.
 
 ### 9. `plot_bfs_timing.py` crash on `--max-rounds`-truncated runs
 ```
@@ -375,6 +450,206 @@ level; berkstan itself is back to **Open** (needs a bigger grid, joining
   pre-fix, and directed hyperlink/social graphs so far all show worse
   in-degree skew post-fix).
 
+### 16. Sparse `reduce_select_any_sparse` — correct, but a real ~7.6-8x performance REGRESSION, not a bug
+```
+parent_resolve avg cycles:  dense    sparse     ratio
+  P=8,   blk=128:            6,858.8    52,199.6   7.61x slower
+  P=750, blk=175 (real HW):  785,507.8  6,336,928.5  8.07x slower
+  P=512, blk=1024 (real HW): 3,045,422.2 23,057,499.9 7.57x slower
+```
+**Where**: `reduce_select_any` (see #1 above) resolves each row's BFS
+parent candidates in a serial ~P/2-hop relay chain toward the diagonal.
+Real-hardware instrumentation (a read-only `parent_occupancy` popcount
+added to `bool_pe.csl`, zero fabric cost) confirmed occupancy at the point
+this collective fires is genuinely low — under 1.2% mean at RMAT s17/s19
+scale — the classic setup for a "send fewer bytes" optimization.
+**What was built**: a sparse counterpart, `reduce_select_any_sparse()`
+(`src/collectives_2d/pe.csl`), with an identical caller-visible dense
+`[count]u32`/sentinel contract but an internal bitmap + compact-values wire
+format per hop (only real entries cross the fabric, plus a small fixed-size
+bitmap; no length word ever travels separately — both sides derive it by
+locally popcounting the just-landed bitmap). Two real bugs were found and
+fixed via the standalone test harness (`pe_reduce_select_sparse_test.csl`/
+`run_reduce_select_test.py --variant=sparse`, all on the free local
+simulator, no hardware spent): a fabric-side DSD length that was never
+re-set per sub-transfer (surfaced as a simulator "kernel stall" abort), and
+a compact-values merge that didn't preserve ascending-bit order (found via
+a targeted device-state dump). A third bug — three `Callback`-transition
+branches missing the `@activate(ACTIVATE_FSM_TASK_ID)` needed when no
+async op is left to trigger it — only surfaced under a very-low-occupancy
+P=8 stress test and would have been a near-certain production hang at the
+real occupancy this feature targets. All three fixed; final validation is
+0 mismatches across P=2..8, occupancy 0.005..0.95, multiple roots.
+**Then wired into the real BFS kernel** (a `sparse_parent_resolve` A/B
+switch in `bool_pe.csl`, off by default) and timed on real hardware at the
+same two configs above. Correctness held (0 mismatches both configs) —
+but `parent_resolve` was consistently **~7.6-8x slower**, not faster.
+**Root cause, quantified**: this is not fixed per-hop round-trip overhead
+dominating (the naive first hypothesis) — fitting `avg_cycles/hops` as a
+linear function of `blk` across these three very different scales shows
+the dense collective's per-hop cost is ~8.1 cycles/word of `blk` (a
+hardware-accelerated `@mov32` DMA-style transfer), while the sparse
+collective's per-hop cost is ~81.9 cycles/word of `blk` — about **10x
+more cycles per word**, while the FIXED (non-`blk`-scaling) per-hop
+overhead only differs by ~3.8x between the two. The dominant cost is
+`select_merge_sparse()`/`popcount_bitmap()`'s **manual scalar bit-scan**
+(`while (bit < 32)`, a branchy CSL loop touching every bit of every word,
+by design O(`blk`) *regardless of occupancy* — see those functions' own
+comments) running on **every single hop**, replacing what was one
+hardware-accelerated bulk transfer in the dense design. Low occupancy
+genuinely shrinks the *bytes moved*, but this design never made the
+*compute* scale down with occupancy — and that compute, done the scalar
+way, costs far more than the bytes it was trying to save.
+**Status**: `reduce_select_any_sparse()` and its standalone test harness
+have been **removed entirely** (2026-08-02, alongside #17's follow-up
+investigation) — not just unwired from `bool_pe.csl` as originally done,
+but fully deleted from `collectives_2d/pe.csl` itself (the function, its
+helper functions `compress_dense_to_sparse`/`append_merge_sparse`/
+`decompress_sparse_to_dense`/`popcount_word`/`popcount_bitmap`, its
+`Ftype` enum entry, its `transfer_data_reduce_select_any_sparse()` FSM,
+and every dispatch site referencing it) plus its standalone test kernel
+(`pe_reduce_select_sparse_test.csl`/`layout_reduce_select_sparse_test.csl`,
+deleted; `run_reduce_select_test.py --variant=sparse` removed from its
+CLI choices). There is no regime where the sparse variant was the better
+choice (#16), so — unlike indexed, which is a real trade-off kept as an
+opt-in — there was no reason to keep any of it around, in `bool_pe.csl`
+or in the shared collectives library. Regression-tested clean (0
+mismatches, dense + indexed, both the real BFS kernel and the standalone
+harness) after the removal. If a hardware-accelerated bit-count design is
+ever revisited, the concrete next step would be a `@popcnt`+u16-view idiom
+(as `bool_pe.csl`'s own `reduce_done()` already uses for `nz_local`) —
+blocked previously by `collectives_2d/pe.csl` having no comptime bound on
+`count` to size a `@popcnt` DSD scratch buffer against, since `count` is a
+runtime function argument there, not a `dim_params` field.
+
+### 17. `reduce_select_any_indexed` — real 4.5-8.9x SPEEDUP over dense, but hits #8's PE-memory ceiling at blk=1024
+```
+parent_resolve avg cycles:  dense       indexed     ratio
+  P=750, blk=175  (real HW, RMAT s17): 785,507.8    173,864.4   4.52x FASTER
+  P=750, blk=700  (real HW, RMAT s19): 3,060,275.1  342,748.4   8.93x FASTER
+  P=512, blk=1024 (real HW, RMAT s19): indexed cannot compile -- see #8
+```
+**Where**: same call site as #16 (`reduce_select_any`,
+`term_col_bcast_done()`). Following #16's root cause (sparse's regression is
+compute-bound — a manual scalar bit-scan costing ~10x more cycles/word than
+dense's hardware `@mov32` transfer, not a bandwidth problem), the natural
+question was whether avoiding that scan entirely — rather than trying to
+accelerate it with `@popcnt` (blocked, see #16's own "next step" note, by
+`collectives_2d/pe.csl` having no comptime bound on `count`) — would do
+better.
+**What was built**: `reduce_select_any_indexed()` (`src/collectives_2d/
+pe.csl`), a structurally different design from sparse: instead of a bitmap
++ position-implicit compact array (which still needs an O(`blk`) scan to
+merge, regardless of occupancy), each hop carries an explicit `(row_index,
+value)` pair list. `append_merge_indexed()` walks only `incoming_count`
+entries — genuinely O(popcount), not O(`blk`) — using the bitmap purely as
+an O(1) "have I already got this row" membership test, not as the thing
+being scanned. This also makes it safe-by-construction (a forward-only
+append, no backward-scan proof needed the way sparse's in-place merge
+required).
+**Correctness**: validated via the same standalone harness pattern as dense/
+sparse (`pe_reduce_select_indexed_test.csl`/`run_reduce_select_test.py
+--variant=indexed`) across P=2,3,4,8, occupancy 0.005-0.95, multiple roots —
+**0 mismatches on the first try, no bugs found** (unlike sparse's 3 real
+bugs during its own development), consistent with the append-only design
+being structurally simpler to get right. Then validated on `appliance-sim`
+(RMAT s10 8x8, free) before real hardware, per this repo's own convention.
+**Real hardware results**: wired via the `parent_resolve_variant` A/B
+switch (0=dense, 2=indexed) and measured at two configs — correctness held
+in both (0 mismatches, scipy cross-check OK): RMAT s17 750x750 (`blk=175`,
+**4.52x faster**) and RMAT s19 750x750 (`blk=700`, **8.93x faster** —
+dense 3,060,275.1 vs indexed 342,748.4 avg cycles). The margin *grows* with
+`blk`, not shrinks — a genuine, substantial, scale-holding win, not just
+"not as bad as sparse."
+**Could not measure the third config**: RMAT s19 512x512 (`blk=1024`) hits
+the real PE static-memory ceiling described in #8.
+**Follow-up investigation (2026-08-02, same day) into shrinking indexed's
+footprint to fit `blk=1024`**: audited `bool_pe.csl`/`collectives_2d/pe.csl`
+for buffers that are declared but dead/only-conditionally-used. Found and
+fixed two real things, neither of which lifted the ceiling:
+1. Made all three variants' scratch buffer sizes comptime-conditional on
+   `parent_resolve_variant` (`const LEN: u16 = if (parent_resolve_variant
+   == N) real_size else 0;` — the same "if-expression on a comptime value"
+   idiom `collectives_2d/pe.csl`'s own `task_id_COLOR_0/1` already use for
+   `@is_arch`), so a compile only pays for its own active variant's
+   scratch, not all three unconditionally. Regression-tested clean on the
+   free simulator across all variants.
+2. Removed `reduce_select_any_sparse`'s workspace buffers and its
+   `parent_resolve_variant == 1` branch from `bool_pe.csl` entirely (both
+   the CLI choice and the compile params mapping in `run_bfs.py`/
+   `run_bfs.appliance.py`) — sparse had no regime where it won (#16), so
+   there was no reason to keep its ~8.4KB of scratch wired in at all. The
+   collective itself and its standalone test harness remain untouched in
+   `collectives_2d/pe.csl`/`pe_reduce_select_sparse_test.csl` as reference.
+   Regression-tested clean (dense + indexed, free simulator).
+3. Retried the s19-512x512 indexed compile with both fixes in place:
+   **failed identically.** Since this genuinely removed sparse's ~8.4KB of
+   dead-when-indexed-is-active scratch and nothing changed, the DATA
+   buffers are not the (sole) driver of the ceiling. See #8's own updated
+   occurrence note: the more likely remaining cause is CODE size —
+   `transfer_data_reduce_select_any_indexed()`'s FSM body is roughly 2x the
+   sub-transfers/branch-states of dense's, and (confirmed via grep) none of
+   `collectives_2d/pe.csl`'s three collective-specific functions are gated
+   by `comptime if`, so all of their code compiles into the binary
+   regardless of which variant is actually selected at a given compile.
+   (Aside, prompted by "does collectives_2d load code for collectives we
+   never use": confirmed via `@bind_local_task` grep that hardware task
+   *count* is fixed at 2 per module instance — `fsm` + `f_lock`, doubled to
+   4 total since `bool_pe.csl` instantiates the module twice as `mpi_x`/
+   `mpi_y` — independent of how many `Ftype` variants exist. So the
+   "task table" ceiling isn't about task *count*; it's more likely
+   proportional to code/dispatch-site complexity inside the one shared
+   `fsm` task body, not chased down to an exact byte accounting.)
+**Status**: **kept wired into `bool_pe.csl`** as the `parent_resolve_variant
+=2` opt-in path (default remains 0/dense) rather than promoted to the new
+default — the s17/s19@750x750 wins are real and substantial, but the
+blk=1024 ceiling means indexed cannot currently be used unconditionally at
+every grid size this kernel targets. Choosing it is a real trade-off
+(faster `parent_resolve`, more code+data) to make deliberately per-config,
+not a strict improvement over dense the way this collective's own existence
+was over the pre-`reduce_select_any` d2h design (#1). If revisited:
+reducing indexed's own per-hop protocol complexity (fewer sub-transfers or
+FSM states, not a caller-side scratch trim) is the concrete next step to
+lift the blk=1024 ceiling.
+
+### 18. Dead `scatter`/`gather` collectives removed from `collectives_2d/pe.csl`
+
+User asked (2026-08-02, same investigation as #17) whether any code/data
+structures in the collectives module are dead or only optionally used,
+prompted by confirming that unused-variant CODE (not just data buffers)
+compiles into the binary regardless of which `parent_resolve_variant` is
+selected (see #17's follow-up). Audited every module-scope function and
+buffer in `bool_pe.csl`/`collectives_2d/pe.csl` against real call sites.
+
+Found `scatter()`/`gather()` — full, working implementations (`scatter`,
+`gather`, `teardown_scatter_network`, `teardown_gather_network`,
+`configure_scatter_filter`, `configure_scatter_network`,
+`configure_gather_network`, `transfer_data_scatter`,
+`transfer_data_gather_root`, `transfer_data_gather` — 10 functions, each
+mirroring `reduce_or`/`reduce_select_any`'s own structural complexity) with
+**zero call sites anywhere** in this application: `bool_pe.csl` never
+calls them, and grepping every standalone test harness (`pe_reduce_or_test
+.csl`, `pe_reduce_select_test.csl`, `pe_reduce_select_indexed_test.csl`)
+turned up nothing either. This `collectives_2d` copy is `bool_diag_spmv`'s
+own private fork (confirmed no other kernel in the repo imports it), so
+there was no hidden external caller. Removed entirely — all 10 functions,
+their `Ftype.scatter`/`Ftype.gather` enum entries, every dispatch site
+(`initiate_teardowns()`, `teardown_handler_0/1`, the main `transfer_data()`
+switch), and a now-dead `fabout_adv` DSD variable only `transfer_data_
+gather()` had used. A few stale/copy-paste comments referencing scatter or
+gather elsewhere in the file (e.g. a `reduce_fadds()` comment that
+mistakenly said "Request a gather network") were cleaned up along the way.
+
+Regression-tested clean (0 mismatches, dense + indexed, both the real BFS
+kernel via `run_bfs.py` and the standalone harness) after removal — this
+was pure dead-code elimination, no behavior anywhere depended on it.
+**Status**: removed. Combined with sparse's full removal (#16), this
+measurably shrank the s19-512x512 indexed compile's overflow from three
+sections (`.bss`/task-table/`.data.hi`) down to two (task-table/`.data.hi`
+only, see #8's updated occurrence note) — real progress, but not itself
+sufficient to lift the blk=1024 ceiling. A genuine, safe, permanent
+code-size reduction regardless.
+
 ## Summary table
 
 | # | Error | Where confirmed | Cause | Status |
@@ -383,11 +658,11 @@ level; berkstan itself is back to **Open** (needs a bigger grid, joining
 | 2 | PE mem overflow (new collective) | pokec/topcats | 3-buffer design | **Fixed** (2-buffer redesign) |
 | 3 | task id collision | compile-time | id 21 not actually free | **Fixed** (moved to 24) |
 | 4 | h2d gRPC 2GiB ceiling | berkstan (fix verified logically; blocked again by #15/#8), orkut | `max_local_nnz` skew + vendor SDK chunker envelope-overflow bug | **Fixed** (`memcpy_h2d_chunked`) |
-| 4b | `h2d_matrix` stat garbage | berkstan/s18/s20 @ 750x750 | likely 32-bit cycle-counter wraparound in that stat's readout | **Open** (cosmetic; GTEPS unaffected) |
+| 4b | ~~`h2d_matrix` stat garbage~~ → real ~24s cost, not a bug | s17 @ 750x750 (wall-clock cross-checked) | none — corrected misdiagnosis; genuine large real transfer time | **Not a bug** (real cost; optimization target, not chased further) |
 | 5 | fabricated symmetrization | v2 SNAP pipeline | wrong default (`A\|A^T` for directed graphs) | **Fixed** (opt-in `--symmetrize`) |
 | 6 | scrambled source vertex | any SNAP run | `--rand 0` doesn't disable base permutation | **Fixed** (`--operm`) |
 | 7 | raw/unbalanced SNAP fails | user experiment | real degree skew, no balancing | N/A (balancing required) |
-| 8 | PE static-mem ceiling | topcats, livejournal | `blk` too large for 750x750 grid | **Open** (needs bigger grid) |
+| 8 | PE static-mem ceiling | topcats, livejournal, as-Skitter, cit-Patents, `reduce_select_any_indexed` @ s19 512x512 (blk=1024) | `blk` too large / too much per-PE static state for the grid; for indexed, confirmed CODE-size-driven not data-buffer-driven -- removing dead scatter/gather+sparse code shrank the overflow from 3 sections to 2 (task-table/`.data.hi`) but didn't clear it | **Open** (needs bigger grid, less per-PE state, or a lower-complexity FSM) |
 | 9 | plot crash on truncation | any `--max-rounds` run | wrong length assumption | **Fixed** |
 | 10 | silently wrong GTEPS | any `--max-rounds` run | truncated `ts_buf` history | **Fixed** (round-trip markers) |
 | 11 | slow "compile" | large SNAP graphs | unvectorized Python preprocessing | **Fixed** (vectorized) |
@@ -395,3 +670,6 @@ level; berkstan itself is back to **Open** (needs a bigger grid, joining
 | 13 | transient 503 upload error | pokec (1st attempt) | connectivity flake (probable) | Resolved on retry |
 | 14 | "failed to terminate linker workers" | topcats | secondary message alongside #8 | Not independent |
 | 15 | directed BFS = ancestor not descendant reachability | berkstan (546279 test vs. reference table); pokec confirmed correct on real hardware (matches reference diameter/EE); topcats reconfirmed still fails (max_local_nnz 398→2179) | edge-list loader fed row=src into a kernel that natively computes ancestor-of-frontier | **Fixed** (code, `graph_loader.py`, verified on real hardware via pokec); berkstan/topcats blocked by #8; livejournal untested |
+| 16 | `reduce_select_any_sparse` ~7.6-8x slower, not a bug | RMAT s17 (750x750) + s19 (512x512), real hardware | manual O(`blk`) scalar bit-scan every hop, ~10x more cycles/word than dense's `@mov32` DMA transfer, dwarfing the bytes saved by low occupancy | **Not adopted, fully removed** (no regime where it won; deleted entirely from `collectives_2d/pe.csl` and `bool_pe.csl`, not just unwired) |
+| 17 | `reduce_select_any_indexed` 4.5-8.9x FASTER than dense, real win | RMAT s17 (750x750, blk=175) + s19 (750x750, blk=700), real hardware; s19 (512x512, blk=1024) blocked by #8 | explicit `(row_index,value)` pairs give O(popcount) merge vs sparse's O(`blk`) scan; ceiling at blk=1024 traced to indexed's own code size, not caller-side buffers (comptime-sizing + removing sparse AND scatter/gather narrowed but didn't clear it) | **Kept as opt-in** (`parent_resolve_variant=2`; default remains dense since the code/data cost blocks the largest-`blk` grids, see #8) |
+| 18 | Dead `scatter`/`gather` collectives, zero call sites | `collectives_2d/pe.csl` (bool_diag_spmv's private fork) | vestigial from the original library; 10 functions, never called by this kernel or any of its test harnesses | **Removed** (regression-tested clean; shrank but didn't clear #8's blk=1024 ceiling) |

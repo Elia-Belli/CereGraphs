@@ -103,6 +103,22 @@ param max_rounds: u16;          // upper bound on f_spmv_iter rounds profiled by
 param tau_switch_count: u32;    // switch top-down -> bottom-up once nz_total exceeds this (see term_col_bcast_done())
                                  // u32 (not f32): cslc's --params CLI flag only accepts unsigned
                                  // integers, and this is always a whole vertex count anyway
+// A/B switch for validating reduce_select_any_indexed against the dense
+// reduce_select_any it's meant to replace, on the real BFS kernel instead
+// of just the standalone test harness -- see term_col_bcast_done() below.
+// 0 = dense reduce_select_any (the default/production path), 2 =
+// reduce_select_any_indexed (measured ~4.5-8.9x FASTER on real hardware
+// at grids where it compiles, see docs/ERRORS.md #17; blocked at very
+// large blk by the PE static-memory ceiling, #8). Value 1 used to select
+// reduce_select_any_sparse (measured ~7.6-8x SLOWER, #16) -- removed
+// entirely, both this caller's wiring/workspace buffers AND the collective
+// itself (collectives_2d/pe.csl) plus its standalone test harness, since
+// there was no regime where it was the better choice.
+// Kept as 0/2 (not renumbered to 0/1) so existing --params=
+// parent_resolve_variant:2 invocations don't silently change meaning.
+// u16 (not an enum): cslc's --params CLI flag only accepts unsigned
+// integers, same reason tau_switch_count above is u32 not f32.
+param parent_resolve_variant: u16;
 
 const compute_task_id: local_task_id = @get_local_task_id(10);
 const reduce_done_task_id: local_task_id = @get_local_task_id(11);
@@ -520,11 +536,55 @@ var parent_local_buf = @zeros([blk]u32);
 // non-root PEs). Only 2 buffers total, matching reduce_or/reduce_fadds.
 var parent_relay_result = @zeros([blk]u32);
 
+// Extra scratch reduce_select_any_indexed() needs beyond
+// parent_local_buf/parent_relay_result (see its own comment in
+// collectives_2d/pe.csl for the wire/workspace layout) -- only used when
+// parent_resolve_variant == 2 below. Sized via a comptime-resolved `if`
+// on parent_resolve_variant (itself a `param`, hence comptime-known at
+// each individual compile -- same "if-expression on a comptime value"
+// idiom collectives_2d/pe.csl's own task_id_COLOR_0/1 already use for
+// @is_arch) so that a dense-only compile carries none of this scratch.
+// reduce_select_any_sparse()'s own workspace (parent_send_workspace/
+// parent_recv_workspace, variant == 1) has been removed entirely, along
+// with the collective itself and its standalone test harness -- sparse
+// measured ~7.6-8x SLOWER on real hardware (docs/ERRORS.md #16) with no
+// regime where it's the better choice, so unlike indexed there was no
+// reason to keep any of it around, caller-side or in collectives_2d/pe.csl.
+const INDEXED_BITMAP_LEN: u16 = if (parent_resolve_variant == 2) BITMAP_WORDS else 0;
+const INDEXED_ARRAY_LEN: u16 = if (parent_resolve_variant == 2) blk else 0;
+var parent_send_bitmap = @zeros([INDEXED_BITMAP_LEN]u32);
+var parent_recv_bitmap = @zeros([INDEXED_BITMAP_LEN]u32);
+var parent_send_indices = @zeros([INDEXED_ARRAY_LEN]u16);
+var parent_recv_indices = @zeros([INDEXED_ARRAY_LEN]u16);
+var parent_send_values = @zeros([INDEXED_ARRAY_LEN]u32);
+var parent_recv_values = @zeros([INDEXED_ARRAY_LEN]u32);
+
+// Read-only instrumentation for the sparse-reduce_select_any investigation
+// (Phase 1 of the plan): measures how many of this PE's blk local rows
+// already have a real (non-PARENT_NONE) parent candidate right before the
+// one-time end-of-run reduce_select_any call, to determine whether a sparse
+// (bitmap + compact-values) wire format would actually save fabric
+// bandwidth there, or whether occupancy is already too high by convergence
+// for it to matter. Purely additive: builds its own bitmap/popcount scratch
+// (occ_bitmap/occ_popcnt_scratch), never touches parent_local_buf itself or
+// the hot-path popcnt_scratch/popcnt_src_dsd/popcnt_dst_dsd reduce_done()
+// uses every round. occ_popcnt_src_dsd starts pointed at occ_popcnt_scratch
+// as a harmless placeholder and gets retargeted to occ_bitmap's u16 view in
+// start_spmv(), same reason and same trick as popcnt_src_dsd's own
+// declaration comment above (@ptrcast can't appear in a comptime DSD
+// struct literal).
+var occ_bitmap = @zeros([BITMAP_WORDS]u32);
+var parent_occupancy = @zeros([1]u32);
+var occ_popcnt_scratch = @zeros([2 * BITMAP_WORDS]u16);
+var occ_popcnt_src_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &occ_popcnt_scratch, .extent = 2 * BITMAP_WORDS });
+const occ_popcnt_dst_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &occ_popcnt_scratch, .extent = 2 * BITMAP_WORDS });
+
 var ptr_x_bitmap: [*]u32 = &x_bitmap;
 var ptr_y_bitmap_reduced: [*]u32 = &y_bitmap_reduced;
 var ptr_visited_bitmap: [*]u32 = &visited_bitmap;
 var ptr_rounds_completed: [*]u16 = &rounds_completed;
 var ptr_parent_relay_result: [*]u32 = &parent_relay_result;
+var ptr_parent_occupancy: [*]u32 = &parent_occupancy;
 var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
 var ptr_mat_col_idx_buf: [*]u16 = &mat_col_idx_buf;
 var ptr_mat_col_loc_buf: [*]u16 = &mat_col_loc_buf;
@@ -626,6 +686,9 @@ fn start_spmv() void {
         // its own declaration comment) -- x_bitmap's address never changes
         // for the life of this kernel, so this only needs to happen once.
         popcnt_src_dsd = @set_dsd_base_addr(popcnt_src_dsd, @ptrcast([*]u16, &x_bitmap));
+        // one-time retarget for the parent-occupancy instrumentation's own
+        // popcount pass (see occ_popcnt_src_dsd's own declaration comment).
+        occ_popcnt_src_dsd = @set_dsd_base_addr(occ_popcnt_src_dsd, @ptrcast([*]u16, &occ_bitmap));
     }
     pcol_id = mpi_x.pe_id;
     prow_id = mpi_y.pe_id;
@@ -1093,9 +1156,41 @@ task term_col_bcast_done() void {
         // for reduce_fadds/broadcast above (see the P/MID comment near their
         // declaration).
         if (is_iterative) {
+            // Phase 1 instrumentation (see occ_bitmap's own declaration
+            // comment): build "row k has a real parent candidate" as a
+            // bitmap (same bit-set idiom compute_topdown() uses), then
+            // popcount it via the existing 16-bit-granularity @popcnt +
+            // u16-view trick reduce_done() already uses for nz_local. Purely
+            // local compute, zero fabric traffic, runs once -- does not
+            // change reduce_select_any's own behavior below at all.
+            var occ_w: u16 = 0;
+            while (occ_w < BITMAP_WORDS) : (occ_w += 1) {
+                occ_bitmap[occ_w] = 0;
+            }
+            var occ_k: u16 = 0;
+            while (occ_k < blk) : (occ_k += 1) {
+                if (parent_local_buf[occ_k] != PARENT_NONE) {
+                    occ_bitmap[occ_k >> 5] |= (@as(u32, 1) << (occ_k & 31));
+                }
+            }
+            @popcnt(occ_popcnt_dst_dsd, occ_popcnt_src_dsd);
+            parent_occupancy[0] = 0;
+            var occ_pw: u16 = 0;
+            while (occ_pw < 2 * BITMAP_WORDS) : (occ_pw += 1) {
+                parent_occupancy[0] += @as(u32, occ_popcnt_scratch[occ_pw]);
+            }
+
             timestamp.get_timestamp(&parent_resolve_tic_buffer);
-            mpi_x.reduce_select_any(MID, &parent_local_buf, &parent_relay_result,
-                                     PARENT_NONE, blk, parent_resolve_done_task_id);
+            if (parent_resolve_variant == 2) {
+                mpi_x.reduce_select_any_indexed(MID, &parent_local_buf, &parent_relay_result,
+                                                 &parent_send_bitmap, &parent_recv_bitmap,
+                                                 &parent_send_indices, &parent_recv_indices,
+                                                 &parent_send_values, &parent_recv_values,
+                                                 PARENT_NONE, blk, parent_resolve_done_task_id);
+            } else {
+                mpi_x.reduce_select_any(MID, &parent_local_buf, &parent_relay_result,
+                                         PARENT_NONE, blk, parent_resolve_done_task_id);
+            }
         } else {
             sys_mod.unblock_cmd_stream();
         }
@@ -1127,6 +1222,7 @@ comptime {
     // POST-REDUCE buffer, meaningful only at PE-column MID -- instead of each
     // PE's own raw candidate. See parent_relay_result's own declaration comment.
     @export_symbol(ptr_parent_relay_result, "parent_local_buf");
+    @export_symbol(ptr_parent_occupancy, "parent_occupancy");
     @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
     @export_symbol(ptr_mat_col_idx_buf, "mat_col_idx_buf");
     @export_symbol(ptr_mat_col_loc_buf, "mat_col_loc_buf");

@@ -211,6 +211,16 @@ def parse_args():
   parser.add_argument("--dump-pe-timing", action="store_true",
                        help="save the full per-PE-per-round-per-phase cycle grid to a .npz file")
   parser.add_argument("--pe-timing-out", default=None, help="path for --dump-pe-timing's output")
+  parser.add_argument("--parent-resolve-variant", choices=["dense", "indexed"],
+                       default="dense",
+                       help="which reduce_select_any variant to use for the end-of-run "
+                            "parent-resolution collective -- dense is production; indexed is "
+                            "experimental, ~4.5-8.9x faster where it fits (see docs/ERRORS.md "
+                            "#17), blocked at very large blk by #8. (sparse, #16, was removed "
+                            "from this flag -- measured 7.6-8x slower, no regime where it wins; "
+                            "the collective itself remains in collectives_2d/pe.csl as "
+                            "reference.) Compares directly against the parent_resolve timing "
+                            "column this same script already reports.")
   return parser.parse_args()
 
 
@@ -347,6 +357,7 @@ def main():
         np_cols, np_rows, blk, max_local_nnz, max_local_nnz_cols, max_local_nnz_rows,
         channels, width_west_buf, width_east_buf, max_rounds=max_rounds,
         tau_switch_count=tau_switch_count,
+        parent_resolve_variant={"dense": 0, "indexed": 2}[args.parent_resolve_variant],
     )
     print(f"Compilation done in {time.time()-start}s", flush=True)
     # {"artifact_path": ...} dict, matching ALCF's own documented format
@@ -379,6 +390,7 @@ def main():
     sym_local_nnz_rows = runner.get_id("local_nnz_rows")
     sym_nz_total = runner.get_id("nz_total")
     sym_is_bottom_up_dbg = runner.get_id("is_bottom_up_dbg")
+    sym_parent_occupancy = runner.get_id("parent_occupancy")
     if need_timing:
       sym_ts_buf = runner.get_id("ts_buf")
       sym_tsc_start_buffer = runner.get_id("tsc_start_buffer")
@@ -498,6 +510,23 @@ def main():
     print(f"[[ direction-optimizing Phase A: final nz_total={final_nz_total}, "
           f"is_bottom_up={final_is_bottom_up}"
           + (f", tau_switch_count={tau_switch_count}" if tau_switch_count is not None else "") + " ]]")
+
+    # Phase 1 instrumentation for the sparse-reduce_select_any investigation
+    # (see the plan): how many of each PE's blk local rows already have a
+    # real parent candidate right before the one-time end-of-run
+    # reduce_select_any call. Read back grid-wide (not just PE(0,0)) since
+    # occupancy is genuinely per-PE, unlike nz_total/direction_history/
+    # nf_history which are identical everywhere by construction.
+    parent_occupancy_buf = np.zeros(height * width, np.uint32)
+    runner.memcpy_d2h(parent_occupancy_buf, sym_parent_occupancy, 0, 0, width, height, 1,
+                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
+    parent_occupancy_hwl = np.reshape(parent_occupancy_buf, (height, width, 1), order="F")[:, :, 0]
+    parent_occupancy_frac = parent_occupancy_hwl.astype(np.float64) / float(blk)
+    print(f"[[ parent_occupancy (Phase 1 sparse-reduce_select_any investigation): "
+          f"min={parent_occupancy_frac.min():.4f}, max={parent_occupancy_frac.max():.4f}, "
+          f"mean={parent_occupancy_frac.mean():.4f} (fraction of blk={blk} local rows with a "
+          f"real parent, per-PE, right before reduce_select_any) ]]")
 
     ts_hwl_u32 = None
     direction_history = None

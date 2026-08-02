@@ -1,20 +1,38 @@
 #!/usr/bin/env cs_python
-""" Standalone, isolated correctness test for collectives_2d/pe.csl's new
-  reduce_select_any() -- Stage 0 of the on-device parent resolution plan
-  (see the plan / project memory for the real d2h gRPC message-size
-  ceiling this collective ultimately fixes). No matrix/BFS logic at all:
-  every PE seeds a [count]u32 buffer (a controlled mix of all-sentinel
-  rows, exactly-one-real-value rows, and -- the actual point of this
-  collective, since a naive OR-style reduce would silently corrupt this
-  case -- rows where MULTIPLE PEs hold DIFFERENT real values), one
-  mpi_x.reduce_select_any() call per compile resolves each row toward a
-  compile-time `root` column, and the result is checked against the
-  correctness property: non-sentinel iff the row had at least one real
-  candidate, and whenever non-sentinel, a genuine MEMBER of that row's set
-  of real candidates -- never a specific expected value (which one wins
-  among several valid candidates is deliberately unspecified, same
-  tie-break-is-not-a-bug convention this repo already uses for BFS parent
-  selection) and never a corrupted bitwise mix.
+""" Standalone, isolated correctness test for collectives_2d/pe.csl's
+  reduce_select_any() and its explicit-index counterpart,
+  reduce_select_any_indexed() -- see docs/ERRORS.md #16/#17 for the real
+  d2h gRPC message-size ceiling the dense collective originally fixed, and
+  for the design history (a first sparse bitmap+compact-values attempt was
+  built, measured ~7.6-8x SLOWER on real hardware, and has since been
+  removed entirely -- #16). No matrix/BFS logic at all: every PE seeds a
+  [count]u32 buffer (a controlled mix of all-sentinel rows,
+  exactly-one-real-value rows, and -- the actual point of this collective,
+  since a naive OR-style reduce would silently corrupt this case -- rows
+  where MULTIPLE PEs hold DIFFERENT real values), one mpi_x.
+  reduce_select_any()/reduce_select_any_indexed() call per compile
+  resolves each row toward a compile-time `root` column, and the result is
+  checked against the correctness property: non-sentinel iff the row had
+  at least one real candidate, and whenever non-sentinel, a genuine MEMBER
+  of that row's set of real candidates -- never a specific expected value
+  (which one wins among several valid candidates is deliberately
+  unspecified, same tie-break-is-not-a-bug convention this repo already
+  uses for BFS parent selection) and never a corrupted bitwise mix.
+
+  --variant=dense (default) tests reduce_select_any(); --variant=indexed
+  tests reduce_select_any_indexed() -- same ground truth, same checking
+  logic, only the CSL kernel compiled differs (pe_reduce_select_test.csl
+  vs pe_reduce_select_indexed_test.csl), since the two collectives share
+  an identical caller-visible dense [count]u32/sentinel contract.
+
+  --occupancy controls what fraction of (row, word) cells get a real value
+  at all (the rest are all-sentinel) -- low occupancy is the regime
+  indexed's O(popcount) merge is actually for; high/near-dense occupancy
+  is the regime where its bandwidth win shrinks toward zero (still must
+  stay CORRECT there, just not necessarily cheaper). Real hardware
+  measured <1.2% mean occupancy at RMAT s17/s19 scale -- --occupancy=0.01
+  (or lower) reproduces that regime; --occupancy=0.95 stresses the
+  near-dense regime.
 
   Tests one root position per process (the simulator backend can't be
   instantiated twice in the same process -- same constraint
@@ -26,6 +44,8 @@
         --driver=<path to cslc> --count=8
      cs_python run_reduce_select_test.py --arch=wse3 --num_pe_cols=2 --num_pe_rows=2 \
         --count=1 --root=0   # single root position, one process, smallest P
+     cs_python run_reduce_select_test.py --arch=wse3 --num_pe_cols=8 --num_pe_rows=8 \
+        --count=64 --variant=indexed --occupancy=0.01   # low-occupancy regime
 """
 
 import argparse
@@ -47,6 +67,21 @@ def parse_args():
   parser.add_argument("--root", type=int, default=None,
                        help="single root column to test (default: re-invoke self once per "
                             "root in {0, P//2, P-1}, one subprocess each)")
+  parser.add_argument("--variant", choices=["dense", "indexed"], default="dense",
+                       help="dense = reduce_select_any(), indexed = reduce_select_any_indexed() "
+                            "(explicit row-index+value pairs instead of position-implicit "
+                            "compaction; measured 4.5-8.9x FASTER than dense on real hardware "
+                            "at grids where it compiles, see docs/ERRORS.md #17). A first "
+                            "sparse bitmap+compact-values attempt was measured ~7.6-8x SLOWER "
+                            "and has since been removed entirely (#16).")
+  parser.add_argument("--occupancy", type=float, default=2.0 / 3.0,
+                       help="fraction of (row, word) cells assigned a real value; the rest "
+                            "stay all-sentinel. Default 2/3 matches this test's original "
+                            "fixed category-0/1/2 cycle. Use a low value (e.g. 0.01) to "
+                            "reproduce the low-occupancy regime real hardware measured at "
+                            "RMAT s17/s19 scale, or a high value (e.g. 0.95) to stress the "
+                            "near-dense regime where indexed's bandwidth win shrinks toward "
+                            "zero.")
   parser.add_argument("--fabric-dims", help="Fabric dimension, i.e. <W>,<H>")
   parser.add_argument("--compile-only", action="store_true")
   parser.add_argument("--run-only", action="store_true")
@@ -61,15 +96,22 @@ def parse_args():
   return parser.parse_args()
 
 
-def make_test_data(P, count, seed=0):
+def make_test_data(P, count, seed=0, occupancy=2.0 / 3.0):
   """send_hwl: (P, P, count) uint32, SENTINEL everywhere except a
-  deliberately-cycled mix of row categories at each (h, l) position:
+  deliberately-mixed set of row categories at each (h, l) position:
     category 0: all-sentinel (no candidate at all)
     category 1: exactly one column has a real value
     category 2: every column has a DIFFERENT real value -- the actual
       collision case reduce_or's fused OR-combine cannot handle correctly
       (see this module's own docstring); with P<2 this degenerates to
       category 1, still valid but not exercising the real collision path.
+  `occupancy` is the fraction of (h, l) cells assigned category 1 or 2
+  (split evenly between them); the rest stay category 0. Low occupancy
+  reproduces the regime reduce_select_any_indexed()'s O(popcount) merge is
+  actually for (real hardware measured <1.2% mean occupancy at RMAT
+  s17/s19 scale); high occupancy stresses the regime where its bandwidth
+  win shrinks toward zero -- both must stay correct, so both are worth
+  testing.
   Returns (send_hwl, real_sets) where real_sets[h][l] is the python set of
   real (non-sentinel) values placed in row h, word l -- the ground truth
   the device result is checked against (membership, not equality)."""
@@ -83,9 +125,12 @@ def make_test_data(P, count, seed=0):
 
   for h in range(P):
     for l in range(count):
-      category = (h * count + l) % 3
-      if category == 0:
-        continue  # stays all-sentinel
+      if rng.random() >= occupancy:
+        continue  # category 0: stays all-sentinel
+      # deterministic (given the occupancy draw above already consumed
+      # randomness) alternation between category 1 and 2, same 50/50 split
+      # the original fixed 3-way cycle gave the two real categories.
+      category = 1 if (h * count + l) % 2 == 0 else 2
       if category == 1 or P < 2:
         w0 = int(rng.integers(0, P))
         v = real_value()
@@ -210,12 +255,28 @@ def main():
   count = args.count
   root = args.root
 
+  layout_name = {
+      "dense": "layout_reduce_select_test.csl",
+      "indexed": "layout_reduce_select_indexed_test.csl",
+  }[args.variant]
   code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "..", "src", "layout_reduce_select_test.csl")
+                           "..", "src", layout_name)
 
-  send_hwl, real_sets = make_test_data(P, count, seed=0)
+  send_hwl, real_sets = make_test_data(P, count, seed=0, occupancy=args.occupancy)
 
-  dirname = f"{args.latestlink}_root{root}"
+  # Host-side evidence of how sparse this run's data actually is -- the
+  # ground truth already fully determines per-PE occupancy, so no extra
+  # device-side byte-count instrumentation is needed to see whether a test
+  # run is actually exercising the low-occupancy regime
+  # reduce_select_any_indexed() is for, versus the near-dense regime where
+  # its bandwidth win (not its correctness) shrinks toward zero.
+  real_count_total = sum(1 for h in range(P) for l in range(count)
+                          for w in range(P) if send_hwl[h, w, l] != SENTINEL)
+  measured_occupancy = real_count_total / (P * P * count)
+  print(f"[[ root={root}: variant={args.variant} requested_occupancy={args.occupancy:.4f} "
+        f"measured_occupancy={measured_occupancy:.4f} ]]")
+
+  dirname = f"{args.latestlink}_{args.variant}_root{root}"
   recv_hwl = compile_and_run(cslc, code_csl, dirname, args, P, count, root, send_hwl)
   if recv_hwl is None:  # --compile-only
     return
@@ -238,7 +299,8 @@ def main():
         n_mismatch += 1
         bad.append((h, l, got, sorted(expected_set)))
 
-  print(f"[[ root={root}: P={P} count={count} collision-rows-checked={n_collision_rows_checked} ]]")
+  print(f"[[ root={root}: variant={args.variant} P={P} count={count} "
+        f"collision-rows-checked={n_collision_rows_checked} ]]")
   print(f"[[ root={root}: mismatches: {n_mismatch} / {P * count} ]]")
   if n_mismatch != 0:
     print(f"mismatched (row, word, device_got, expected_set): {bad[:20]}"
