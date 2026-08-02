@@ -461,12 +461,15 @@ def main():
 
     # Phase B of the on-device parent resolution plan: bool_pe.csl already
     # resolved each row's P per-PE candidates down to a single winner at
-    # PE-column 0, so only that one narrow column needs to leave the
+    # PE-column MID, so only that one narrow column needs to leave the
     # device -- the fix for the real d2h gRPC ~2GiB message-size ceiling
     # this exact appliance path hit at RMAT s20 (see project memory).
-    # width=1 here, not width -- do not widen this back out.
+    # width=1 here, not width -- do not widen this back out. Root moved
+    # from column 0 to MID to halve reduce_select_any's serial relay
+    # critical path (see its own comment in bool_pe.csl/pe.csl).
+    parent_mid_col = width // 2
     parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
-    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, 1, height, blk,
+    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, parent_mid_col, 0, 1, height, blk,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
@@ -528,6 +531,10 @@ def main():
       # is_iterative runs, unlike transpose_cycles' conditional switch.
       parent_resolve_cycles = read_tic_toc_delta_appliance(
           runner, sym_parent_resolve_tic_buffer, sym_parent_resolve_toc_buffer, height, width)
+      # Spatial (row, col) view -- see run_bfs.py's matching comment for why
+      # this needs the default C-order reshape, not "F" (read_tic_toc_delta_
+      # appliance's own final `.reshape(-1)` uses numpy's default order).
+      parent_resolve_grid = parent_resolve_cycles.reshape((height, width))
 
       # Always-correct round-trip span, independent of max_rounds/ts_buf
       # truncation -- see round_trip_start_buffer/round_trip_done_buffer's
@@ -688,6 +695,9 @@ def main():
           "local_nnz": local_nnz[:, :, 0].astype(np.int64),
           "local_nnz_cols": local_nnz_cols[:, :, 0].astype(np.int64),
           "local_nnz_rows": local_nnz_rows[:, :, 0].astype(np.int64),
+          # parent_resolve's own per-PE spatial grid (no round axis -- fires
+          # once, at convergence) -- see run_bfs.py's matching comment.
+          "parent_resolve_cycles": parent_resolve_grid.astype(np.int64),
       })
       print(f"saved per-PE timing grid to {pe_timing_out}")
 

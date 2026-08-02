@@ -501,14 +501,14 @@ const PARENT_NONE: u32 = 4294967295;
 // global id (Phase A), and now (Phase B) the send_buf for a one-time,
 // end-of-run mpi_x.reduce_select_any() call (see term_col_bcast_done()
 // below) that resolves each row's P per-PE candidates down to a single
-// winner AT PE-COLUMN 0 -- host readback only needs parent_relay_result's
-// column-0 slice afterward, cutting the d2h transfer P-fold versus reading
+// winner AT PE-COLUMN MID -- host readback only needs parent_relay_result's
+// column-MID slice afterward, cutting the d2h transfer P-fold versus reading
 // back every column's independent copy (see device_io.py's
 // extract_parent_result(), now much simpler since the per-row combine
 // happens here instead of host-side).
 var parent_local_buf = @zeros([blk]u32);
 // recv_buf for the parent-resolution reduce -- meaningful ONLY at PE-column
-// 0 after f_spmv_iter converges (every other column's copy is a
+// MID after f_spmv_iter converges (every other column's copy is a
 // non-root reduce participant, same "only the aggregation point's copy is
 // real" convention y_bitmap_reduced already uses for the diagonal).
 // No third scratch buffer needed -- reduce_select_any's own in-place
@@ -1079,15 +1079,22 @@ task term_col_bcast_done() void {
     } else {
         // BFS has converged. One-time, end-of-run parent resolution (Phase B
         // of the on-device parent resolution plan): resolve each row's P
-        // per-PE candidates down to a single winner at PE-column 0, instead
+        // per-PE candidates down to a single winner at PE-column MID, instead
         // of leaving that combine to the host after a full P-wide transfer
         // (see parent_local_buf's own declaration comment). Runs exactly
         // once per f_spmv_iter call, never mid-round -- safe to reuse mpi_x's
         // colors/queues/DSRs here since all other mpi_x traffic for this run
         // has already fully torn down by the time termination is reached.
+        // Rooted at MID (not 0): this relay is a fully serial linear chain
+        // (no fused ALU op like reduce_or's @or16 exists for select_merge_u32
+        // -- see its own comment), so root=0 forced a one-directional
+        // P-1-hop chain; MID lets two ~half-length chains converge from both
+        // sides in parallel, same latency-minimizing reasoning already used
+        // for reduce_fadds/broadcast above (see the P/MID comment near their
+        // declaration).
         if (is_iterative) {
             timestamp.get_timestamp(&parent_resolve_tic_buffer);
-            mpi_x.reduce_select_any(0, &parent_local_buf, &parent_relay_result,
+            mpi_x.reduce_select_any(MID, &parent_local_buf, &parent_relay_result,
                                      PARENT_NONE, blk, parent_resolve_done_task_id);
         } else {
             sys_mod.unblock_cmd_stream();
@@ -1117,7 +1124,7 @@ comptime {
     @export_symbol(ptr_rounds_completed, "rounds_completed");
     // Exported name stays "parent_local_buf" (host-side callers' runner.get_id
     // lookups are unchanged) but now points at parent_relay_result -- the
-    // POST-REDUCE buffer, meaningful only at PE-column 0 -- instead of each
+    // POST-REDUCE buffer, meaningful only at PE-column MID -- instead of each
     // PE's own raw candidate. See parent_relay_result's own declaration comment.
     @export_symbol(ptr_parent_relay_result, "parent_local_buf");
     @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");

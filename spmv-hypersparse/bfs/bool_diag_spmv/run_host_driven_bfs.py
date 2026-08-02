@@ -368,12 +368,14 @@ def main():
     # Phase B of the on-device parent resolution plan: by the time
     # f_spmv_iter's single launch below returns, bool_pe.csl has already
     # resolved each row's P per-PE candidates down to a single winner at
-    # PE-column 0 (term_col_bcast_done()'s reduce_select_any call, which
+    # PE-column MID (term_col_bcast_done()'s reduce_select_any call, which
     # only runs once BFS has fully converged -- exactly the state this
     # function is called in) -- so only that one narrow column needs to
-    # leave the device. width=1 here, not width.
+    # leave the device. width=1 here, not width. Root moved from column 0
+    # to MID to halve reduce_select_any's serial relay critical path.
+    parent_mid_col = width // 2
     buf_1d = np.zeros(height * 1 * blk, np.uint32)
-    runner.memcpy_d2h(buf_1d, sym_parent_local_buf, 0, 0, 1, height, blk,
+    runner.memcpy_d2h(buf_1d, sym_parent_local_buf, parent_mid_col, 0, 1, height, blk,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     return np.reshape(buf_1d, (height, 1, blk), order="F")

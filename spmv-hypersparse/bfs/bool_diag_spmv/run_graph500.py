@@ -354,10 +354,12 @@ def main():
     runner.launch("f_tic", nonblock=True)
     # Phase B of the on-device parent resolution plan: bool_pe.csl already
     # resolved each row's P per-PE candidates down to a single winner at
-    # PE-column 0, so only that one narrow column needs to leave the
-    # device. width=1 here, not width.
+    # PE-column MID, so only that one narrow column needs to leave the
+    # device. width=1 here, not width. Root moved from column 0 to MID to
+    # halve reduce_select_any's serial relay critical path.
+    parent_mid_col = width // 2
     parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
-    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, 0, 0, 1, height, blk,
+    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, parent_mid_col, 0, 1, height, blk,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     runner.launch("f_toc", nonblock=False)  # blocks -> the d2h read above is done

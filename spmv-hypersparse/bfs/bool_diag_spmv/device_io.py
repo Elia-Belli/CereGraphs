@@ -192,19 +192,20 @@ PARENT_NONE_GLOBAL = 4294967295
 
 
 def extract_parent_result(n, blk, P, parent_hwl):
-  """Assemble the length-n parent vector from parent_local_buf's PE-column-0
+  """Assemble the length-n parent vector from parent_local_buf's PE-column-MID
   slice. parent_hwl has shape (height=P, width=1, blk): Phase B of the
   on-device parent resolution plan resolves each row's P per-PE candidates
   down to a single winner ON-DEVICE (bool_pe.csl's term_col_bcast_done()
-  calls mpi_x.reduce_select_any(root=0, ...) exactly once, at the very end
+  calls mpi_x.reduce_select_any(root=MID, ...) exactly once, at the very end
   of the BFS, right before host readback -- see its own comment), landing
-  the result at a FIXED PE-column (0) for every row so the host can read
-  back a plain narrow rectangle instead of the full P-wide grid this used
-  to require (the fix for the real d2h gRPC ~2GiB message-size ceiling --
-  see project memory / docs/GRAPH500_BENCHMARK.md). No per-row combine needed
-  here any more -- just decode column 0's global ids and map the sentinel
-  to -1. `P` is accepted but unused (kept for call-site stability across
-  this repo's four callers)."""
+  the result at a FIXED PE-column (MID, not 0 -- moved to halve the relay's
+  serial critical path, see reduce_select_any's own comment) for every row
+  so the host can read back a plain narrow rectangle instead of the full
+  P-wide grid this used to require (the fix for the real d2h gRPC ~2GiB
+  message-size ceiling -- see project memory / docs/GRAPH500_BENCHMARK.md).
+  No per-row combine needed here any more -- just decode this column's
+  global ids and map the sentinel to -1. `P` is accepted but unused (kept
+  for call-site stability across this repo's four callers)."""
   del P  # unused in Phase B -- see docstring
   global_c = parent_hwl[:, 0, :].astype(np.int64)
   parent = np.where(global_c == PARENT_NONE_GLOBAL, -1, global_c).reshape(-1)[0:n]
