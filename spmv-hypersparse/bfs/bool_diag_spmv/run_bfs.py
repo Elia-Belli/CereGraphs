@@ -21,7 +21,8 @@
      Graph500-style GTEPS estimate (see docs/GRAPH500_BENCHMARK.md) -- appended
      as one row to bfs_timing.csv, plus the per-round stacked-bar plot
      (plot_bfs_timing.py, h2d/rounds/d2h/local_compute-split panels side by
-     side in one PNG) saved to plots/timing/.
+     side in one PNG) saved to plots/<hw|sim>/timing/ (hw vs sim matching
+     --csv, see plot_bfs_timing.results_variant).
 
   Replaces plot_bfs_tree.py and bench_timing.py (deleted -- this script
   does both, without the double compile+launch cost of running them
@@ -124,10 +125,12 @@ def parse_args():
                        help="CSV file to append this run's timing row to "
                             "(default: results/sim/bfs_timing.csv next to this script)")
   parser.add_argument("--out-tree", default=None,
-                       help="tree plot output path (default: plots/tree/<matrix>_<grid>_src<N>.png)")
+                       help="tree plot output path (default: plots/<hw|sim>/tree/<matrix>_<grid>_"
+                            "src<N>.png, hw vs sim matching --csv, see plot_bfs_timing."
+                            "results_variant)")
   parser.add_argument("--out-timing", default=None,
-                       help="timing plot output path (default: plots/timing/timing_<matrix>_"
-                            "<grid>_src<N>_ch<C>.png)")
+                       help="timing plot output path (default: plots/<hw|sim>/timing/timing_"
+                            "<matrix>_<grid>_src<N>_ch<C>.png, hw vs sim matching --csv)")
   parser.add_argument("--no-show-parent-mismatch", dest="show_parent_mismatch",
                        action="store_false",
                        help="don't color-highlight (orange, tree plot only) nodes where our "
@@ -142,13 +145,22 @@ def parse_args():
                             "(default off -- diagnostic only, for plot_pe_heatmap.py; not part "
                             "of the default tree/timing/correctness reports)")
   parser.add_argument("--pe-timing-out", default=None,
-                       help="path for --dump-pe-timing's .npz output (default: plots/heatmap/"
-                            "<matrix>_<grid>_src<N>/<matrix>_<grid>_src<N>.npz -- the same "
-                            "per-run folder plot_pe_heatmap.py renders its PNGs into)")
+                       help="path for --dump-pe-timing's .npz output (default: plots/<hw|sim>/"
+                            "heatmap/<matrix>_<grid>_src<N>/<matrix>_<grid>_src<N>.npz -- the same "
+                            "per-run folder plot_pe_heatmap.py renders its PNGs into; hw vs sim "
+                            "matching --csv)")
   parser.add_argument("--parent-resolve-variant", choices=["dense", "indexed"],
                        default="dense",
                        help="see run_bfs.appliance.py's own flag for the full explanation")
   return parser.parse_args()
+
+
+def _default_csv_path():
+  """results/sim/bfs_timing.csv, next to this script -- a hw run always
+  passes --csv explicitly (see plot_bfs_timing_poster.py's default_out_path
+  docstring), so this default is sim-only."""
+  return os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "sim",
+                       "bfs_timing.csv")
 
 
 def main():
@@ -564,7 +576,8 @@ def main():
   if not args.notree:
     matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
     out_tree = args.out_tree or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "plots", "sim", "tree",
+        os.path.dirname(os.path.abspath(__file__)), "plots",
+        plot_bfs_timing.results_variant(args.csv or _default_csv_path()), "tree",
         f"{matrix_stem}_{np_cols}x{np_rows}_src{source}.png")
     render_tree_comparison(
         A_csr, source, scipy_parent, scipy_visited, scipy_levels,
@@ -660,13 +673,18 @@ def main():
 
       matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
       run_id = f"{matrix_stem}_{np_cols}x{np_rows}_src{source}"
-      # lives inside plots/heatmap/<run_id>/ -- the same per-run folder
-      # plot_pe_heatmap.py renders its PNGs into (it derives that folder
-      # from wherever this .npz actually is, see its default_run_dir()),
-      # so the raw data and its plots stay together as one self-contained
-      # bundle rather than scattered across two top-level directories.
+      # lives inside plots/<hw|sim>/heatmap/<run_id>/ -- the same per-run
+      # folder plot_pe_heatmap.py renders its PNGs into (it derives that
+      # folder from wherever this .npz actually is, see its
+      # default_run_dir()), so the raw data and its plots stay together as
+      # one self-contained bundle rather than scattered across two
+      # top-level directories. hw vs sim mirrors --csv's own results/hw or
+      # results/sim (see plot_bfs_timing.results_variant), not a hardcoded
+      # guess -- so this stays consistent with out_timing's default below.
       pe_timing_out = args.pe_timing_out or os.path.join(
-          os.path.dirname(os.path.abspath(__file__)), "plots", "heatmap", run_id, f"{run_id}.npz")
+          os.path.dirname(os.path.abspath(__file__)), "plots",
+          plot_bfs_timing.results_variant(args.csv or _default_csv_path()),
+          "heatmap", run_id, f"{run_id}.npz")
       save_pe_phase_cycles(pe_timing_out, phase_cycles, {
           "infile_mtx": os.path.basename(infile_mtx),
           "pe_grid": f"{np_cols}x{np_rows}",
@@ -757,10 +775,7 @@ def main():
         round_duration_cycles, local_compute_max_cycles, local_term_cond_max_cycles,
         device_time_cycles, transpose_cycles.max())
 
-    csv_path = args.csv
-    if csv_path is None:
-      csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "sim",
-                               "bfs_timing.csv")
+    csv_path = args.csv or _default_csv_path()
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
     write_header = not os.path.exists(csv_path)
     if not write_header:
@@ -777,7 +792,8 @@ def main():
       writer.writerow(row)
     print(f"appended timing row to {csv_path}")
 
-    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots", "sim")
+    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots",
+                              plot_bfs_timing.results_variant(csv_path))
     out_timing = args.out_timing or plot_bfs_timing.default_out_path(
         plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
     plot_bfs_timing.plot_timing_row(row, out_timing)

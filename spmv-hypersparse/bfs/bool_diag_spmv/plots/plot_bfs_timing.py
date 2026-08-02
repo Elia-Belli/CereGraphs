@@ -205,10 +205,19 @@ STAT_TICK_HANDLES = [
 ]
 
 
+def results_variant(csv_path):
+  """"hw" if csv_path resolves under a results/hw/ directory, else "sim"
+  (covers both this script's own default and run_bfs.py's) -- lets
+  default_out_path's caller route into the matching plots/hw or plots/sim
+  subfolder instead of a stray top-level one."""
+  return "hw" if "hw" in os.path.normpath(os.path.abspath(csv_path)).split(os.sep) else "sim"
+
+
 def default_out_path(plots_dir, matrix, pe_grid, source, channels):
-  """plots_dir: the plots/ folder itself (this script's own directory when
-  called from here; bool_diag_spmv/plots when called from run_bfs.py,
-  which lives one directory up from here)."""
+  """plots_dir: the plots/hw or plots/sim folder (see results_variant) --
+  this script's own plots/<variant> when called from here, bool_diag_spmv/
+  plots/<variant> when called from run_bfs.py, which lives one directory up
+  from here)."""
   matrix_stem = os.path.splitext(matrix)[0]
   timing_dir = os.path.join(plots_dir, "timing")
   return os.path.join(timing_dir, f"timing_{matrix_stem}_{pe_grid}_src{source}_ch{channels}.png")
@@ -449,7 +458,7 @@ def parse_args(parser=None):
   if parser is None:
     parser = argparse.ArgumentParser()
   parser.add_argument("--csv", default=None, help="bfs_timing.csv path (default: "
-                                                    "../results/bfs_timing.csv, a sibling of "
+                                                    "../results/sim/bfs_timing.csv, a sibling of "
                                                     "this script's own plots/ directory)")
   parser.add_argument("--row", type=int, default=-1,
                        help="which CSV row to plot (0-indexed, default: -1 = last/most recent). "
@@ -460,8 +469,9 @@ def parse_args(parser=None):
   parser.add_argument("--channels", type=int, default=None,
                        help="filter to rows with this --channels value (bench_timing.py's I/O "
                             "channel count)")
-  parser.add_argument("--out", default=None, help="output PNG path (default: plots/timing_"
-                                                    "<matrix>_<grid>_src<N>.png)")
+  parser.add_argument("--out", default=None, help="output PNG path (default: plots/<hw|sim>/"
+                                                    "timing/timing_<matrix>_<grid>_src<N>.png, "
+                                                    "hw vs sim matching --csv, see results_variant)")
   return parser.parse_args()
 
 
@@ -509,15 +519,16 @@ def main():
 
   csv_path = args.csv
   if csv_path is None:
-    # results/ lives one directory up (bool_diag_spmv/results/), a sibling
-    # of this script's own plots/ directory.
+    # results/sim/ lives one directory up (bool_diag_spmv/results/sim/), a
+    # sibling of this script's own plots/ directory -- matches run_bfs.py's
+    # own --csv default, since a hw run always passes --csv explicitly.
     csv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             "results", "bfs_timing.csv")
+                             "results", "sim", "bfs_timing.csv")
   with open(csv_path, newline="", encoding="utf-8") as f:
     rows = list(csv.DictReader(f))
 
   row = select_row(rows, args)
-  plots_dir = os.path.dirname(os.path.abspath(__file__))
+  plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), results_variant(csv_path))
   out_path = args.out or default_out_path(
       plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
   plot_timing_row(row, out_path)

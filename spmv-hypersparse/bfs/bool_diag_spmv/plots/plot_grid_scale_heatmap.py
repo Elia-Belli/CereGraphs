@@ -13,7 +13,7 @@ is append-only; a matrix file can be rebalanced and rerun under the same
 (infile_mtx, pe_grid) key).
 
 Usage: cs_python plots/plot_grid_scale_heatmap.py
-         [--csv=results/hw/timings_heatmap.csv] [--out=plots/heatmap/rmat_grid_scale.png]
+         [--csv=results/hw/timings_heatmap.csv] [--out=plots/hw/heatmap/rmat_grid_scale.png]
 
 A missing (scale, grid) cell -- not yet run, or run and never landed a CSV
 row (compile/link failure) -- is drawn hatched, not colored zero; GTEPS=0

@@ -9,13 +9,15 @@ __pycache__/
 *.log
 *.nohup.out
 
-
+artifact_path.json
 sim_stats.json
 sim.log
 simconfig.json
+run_meta.json
 latest/
 
 .claude/
 
 *.o
 spmv-hypersparse/util/analyze
+clean.sh
