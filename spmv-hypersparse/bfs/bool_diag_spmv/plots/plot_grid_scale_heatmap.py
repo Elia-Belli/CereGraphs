@@ -13,7 +13,11 @@ is append-only; a matrix file can be rebalanced and rerun under the same
 (infile_mtx, pe_grid) key).
 
 Usage: cs_python plots/plot_grid_scale_heatmap.py
-         [--csv=results/hw/timings_heatmap.csv] [--out=plots/hw/heatmap/rmat_grid_scale.png]
+         [--csv=results/hw/timings_heatmap.csv] [--out=plots/hw/heatmap/rmat_grid_scale.svg]
+
+SVG only, no PNG -- this is a poster/report figure meant to be embedded and
+rescaled as vector output, not viewed as a standalone raster image (same
+convention as plot_bfs_timing_poster.py and plot_balance_before_after.py).
 
 A missing (scale, grid) cell -- not yet run, or run and never landed a CSV
 row (compile/link failure) -- is drawn hatched, not colored zero; GTEPS=0
@@ -59,11 +63,28 @@ ORANGE = "#eb6834"  # communication-bound pole of the comm/compute diverging pan
 AQUA = "#1baf7a"  # compute-bound pole of the comm/compute diverging panel
 NEUTRAL_MID = "#f0efec"  # this repo's documented diverging-pair midpoint
 # best-per-row cell callout -- a single dark violet, distinct from every hue
-# used in either panel's own colormap (blue, orange, aqua, gray). Dark enough
-# to stay legible against both the darkest cells (base BLUE/ORANGE) and the
-# lightest ones, so it doesn't need to switch shade per cell like the
-# ordinary (non-highlighted) cell text below does.
+# used in either panel's own colormap (blue, orange, aqua, gray). Carried only
+# by the underline mark below the cell's number, never by the number's own
+# ink: at mid-to-dark BLUE/ORANGE cells this violet sits too close in hue and
+# luminance to the fill (measured contrast ~2.2:1, well under the ~4.5:1 a
+# glyph needs), so text stays in the same adaptive TEXT_PRIMARY/white ink the
+# ordinary (non-highlighted) cell text below uses -- legible against every
+# cell regardless of darkness -- and this violet marks "best" via the
+# underline (a thin mark reads fine at lower contrast than a filled glyph).
 BEST_HIGHLIGHT = "#5b2a86"
+
+# Title/label font sizes and suptitle/title/plot spacing, shared verbatim
+# (same names, same values) with plot_bfs_timing_poster.py and
+# plot_balance_before_after.py -- the "hw/heatmap", "timing poster", and
+# "balancing" figure families are meant to read as one visual system, not
+# three scripts each with their own ad hoc sizing.
+SUPTITLE_FONTSIZE = 14
+PANEL_TITLE_FONTSIZE = 12
+AXIS_LABEL_FONTSIZE = 10
+TICK_LABEL_FONTSIZE = 8
+SUPTITLE_Y = 0.98  # fraction of figure height; matplotlib's own suptitle default
+TITLE_PAD = 10  # points between a panel's title and its own plot area
+TOP_MARGIN = 0.88  # tight_layout rect top -- headroom reserved for the suptitle
 
 RMAT_RE = re.compile(r"^rmat_s(\d+)_e16\.balanced(\d+)x(\d+)\.mtx$")
 
@@ -203,7 +224,7 @@ def main():
   p.add_argument("--csv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                                                 "results", "hw", "timings_heatmap.csv"))
   p.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                "hw", "heatmap", "rmat_grid_scale.png"))
+                                                "hw", "heatmap", "rmat_grid_scale.svg"))
   args = p.parse_args()
 
   by_key = load_rows(args.csv)
@@ -298,9 +319,11 @@ def main():
     # Hatch every missing cell so "not run / failed" is never confused with
     # a real, low value. The best-GTEPS PE grid for each RMAT scale (picked
     # once from the GTEPS panel, see best_j_per_row above) is called out on
-    # BOTH panels as bold, underlined text in the violet BEST_HIGHLIGHT
-    # shades, so it reads at a glance instead of requiring the reader to
-    # spot a thin box outline.
+    # BOTH panels as bold text underlined in BEST_HIGHLIGHT, so it reads at a
+    # glance instead of requiring the reader to spot a thin box outline. The
+    # number's own ink stays the same adaptive white/TEXT_PRIMARY every other
+    # cell uses -- BEST_HIGHLIGHT only colors the underline (see BEST_HIGHLIGHT
+    # comment above for why the glyph itself can't carry that color).
     for i in range(len(scales)):
       for j in range(len(grids)):
         if np.isnan(grid_mat[i, j]):
@@ -309,16 +332,13 @@ def main():
           continue
         is_best = best_j_per_row[i] == j
         cell_label = fmt(grid_mat[i, j], panel_vmax)
-        if is_best:
-          color = BEST_HIGHLIGHT
-        else:
-          color = "white" if contrast_fn(grid_mat[i, j]) >= 0.6 else TEXT_PRIMARY
+        color = "white" if contrast_fn(grid_mat[i, j]) >= 0.6 else TEXT_PRIMARY
         ax.text(j, i, cell_label, ha="center", va="center", fontsize=7,
                 fontweight="bold" if is_best else "normal", color=color, zorder=7)
         if is_best:
           half_width = min(0.42, 0.09 + 0.09 * len(cell_label))
           ax.plot([j - half_width, j + half_width], [i - 0.19, i - 0.19],
-                  color=color, linewidth=1.4, solid_capstyle="butt", zorder=7)
+                  color=BEST_HIGHLIGHT, linewidth=1.4, solid_capstyle="butt", zorder=7)
 
     # Dark staircase border between the run region and the never-run (OOM)
     # region -- every missing cell here is a small-grid/large-scale
@@ -349,41 +369,44 @@ def main():
               fontsize=15, fontweight="bold", color=TEXT_MUTED, zorder=4)
 
     ax.set_xticks(range(len(grids)))
-    ax.set_xticklabels([f"{g}x{g}" for g in grids], rotation=45, ha="right", fontsize=8,
-                        color=TEXT_MUTED)
+    ax.set_xticklabels([f"{g}x{g}" for g in grids], rotation=45, ha="right",
+                        fontsize=TICK_LABEL_FONTSIZE, color=TEXT_MUTED)
     ax.set_yticks(range(len(scales)))
     if ax is axes[0]:
-      ax.set_yticklabels([f"s{s}" for s in scales], fontsize=8, color=TEXT_MUTED)
+      ax.set_yticklabels([f"s{s}" for s in scales], fontsize=TICK_LABEL_FONTSIZE,
+                          color=TEXT_MUTED)
     else:
       # Same RMAT-scale rows as the left panel (shared y-axis convention) --
       # the tick labels (and the ticks themselves) would just duplicate it.
       ax.tick_params(left=False, labelleft=False)
-    ax.set_xlabel("PE grid", color=TEXT_PRIMARY)
-    ax.set_title(label, color=TEXT_PRIMARY, fontsize=13)
+    ax.set_xlabel("PE grid", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_title(label, color=TEXT_PRIMARY, fontsize=PANEL_TITLE_FONTSIZE, pad=TITLE_PAD)
     ax.set_facecolor(SURFACE)
     for spine in ax.spines.values():
       spine.set_visible(False)
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(cbar_label, color=TEXT_PRIMARY)
-    cbar.ax.tick_params(colors=TEXT_MUTED)
+    cbar.set_label(cbar_label, color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
+    cbar.ax.tick_params(colors=TEXT_MUTED, labelsize=TICK_LABEL_FONTSIZE)
     # Colorbar.solids defaults to rasterized=True regardless of the
     # mappable's own type -- force it vector too, so the SVG has no
     # embedded bitmaps left.
     cbar.solids.set_rasterized(False)
 
-  axes[0].set_ylabel("RMAT scale", color=TEXT_PRIMARY)
+  axes[0].set_ylabel("RMAT scale", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
 
-  fig.suptitle("Performance and Communication share across Scales and PE Grids",
-               color=TEXT_PRIMARY, fontsize=14)
+  fig.suptitle("Performance and Communication Share across Scales and PE Grids",
+               color=TEXT_PRIMARY, fontsize=SUPTITLE_FONTSIZE, y=SUPTITLE_Y)
   fig.patch.set_facecolor(SURFACE)
+  # Reserve headroom for the suptitle above both panel titles -- same
+  # TOP_MARGIN convention as plot_bfs_timing_poster.py/
+  # plot_balance_before_after.py, so the gap between suptitle and panel
+  # titles reads the same across all three figure families.
+  fig.tight_layout(rect=[0, 0, 1, TOP_MARGIN])
 
   os.makedirs(os.path.dirname(args.out), exist_ok=True)
   fig.savefig(args.out, dpi=200, bbox_inches="tight")
   print(f"wrote {args.out}")
-  svg_path = os.path.splitext(args.out)[0] + ".svg"
-  fig.savefig(svg_path, dpi=200, bbox_inches="tight")
-  print(f"wrote {svg_path}")
 
 
 if __name__ == "__main__":

@@ -33,15 +33,17 @@
   colors so this stays behaviorally consistent with the original -- only
   the layout and fused/recolored round segments are new.
 
-  The host-device/parent_resolve and h2d_matrix panels show mean +/- std
-  across every matching row instead of a single sample -- real hardware
-  showed genuine run-to-run jitter in the host-transfer brackets
-  (h2d_matrix/h2d_seed/d2h; see docs/GRAPH500_BENCHMARK.md section 15), so
-  a single run isn't representative on its own. The per-round device-time
-  panel is drawn from a single representative run (the most recent match)
-  -- on-device work showed no comparable variance, confirmed on real
-  hardware. The mean +/- std methodology itself isn't captioned on the
-  figure -- it's explained externally, wherever this poster gets used.
+  Every bar in every panel -- including the per-round compute/communication
+  stacks, which used to be drawn from a single representative run on the
+  theory that on-device work showed no comparable run-to-run variance --
+  shows mean +/- std across every matching row instead of a single sample,
+  so no panel looks methodologically different from any other. The
+  host-device/parent_resolve/h2d_matrix bars are where real hardware jitter
+  actually shows up as a visibly nonzero error bar (see
+  docs/GRAPH500_BENCHMARK.md section 15); the round panel's error bars are
+  expected to come out small, not absent. The mean +/- std methodology
+  itself isn't captioned on the figure -- it's explained externally,
+  wherever this poster gets used.
 
   --log-scale: an alternative to the whole small-multiples approach above
   -- ONE panel, ONE log-scale y-axis, 6 solo bars (compute + communication,
@@ -73,13 +75,14 @@ import re
 import sys
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bfs_timing import CLOCK_FREQ_HZ  # pylint: disable=wrong-import-position
 from plot_bfs_timing import (  # pylint: disable=wrong-import-position
-    BASELINE, GRIDLINE, H2D_COLORS, PARENT_RESOLVE_COLOR, SURFACE, TEXT_MUTED, TEXT_PRIMARY,
+    BASELINE, GRIDLINE, H2D_BASE_HEX, PARENT_RESOLVE_COLOR, SURFACE, TEXT_MUTED, TEXT_PRIMARY,
     parse_args, parse_cycle_list, select_rows,
 )
 
@@ -88,16 +91,34 @@ from plot_bfs_timing import (  # pylint: disable=wrong-import-position
 # one visual language for "compute" vs "communication".
 COMPUTE_COLOR = "#1baf7a"  # aqua
 COMMUNICATION_COLOR = "#eb6834"  # orange
-# d2h no longer gets its own hue from plot_bfs_timing.py (that file's
-# D2H_COLOR is the SAME "#eb6834" now claimed by "communication" above --
-# reusing it here would make two different, differently-paneled quantities
-# look identical) -- next unused step in this repo's validated categorical
-# order (palette.md slot 4) instead.
-D2H_COLOR = "#eda100"  # yellow
+# h2d_seed/h2d_matrix collapse to ONE color (instead of plot_bfs_timing.py's
+# own H2D_COLORS, 2 magenta tints) -- both already name themselves on their
+# own x-tick, so color here only needs to say "Host to Device", not
+# distinguish the two individually. resolve keeps plot_bfs_timing.py's own
+# PARENT_RESOLVE_COLOR blue and its own "Parent Resolve" legend entry rather
+# than folding into d2h's color/group: it's on-device work, not an actual
+# host transfer (see the log-scale grouping comment below for why it still
+# gets grouped NEXT TO d2h positionally even though its color now says
+# otherwise). Every one of these 3 colors gets its own legend swatch -- see
+# the legend-assembly comment below.
+HOST_TO_DEVICE_COLOR = H2D_BASE_HEX  # magenta -- h2d_seed + h2d_matrix
+DEVICE_TO_HOST_COLOR = "#eda100"  # yellow -- d2h only
 
-TITLE_FONTSIZE = 15
-PANEL_TITLE_FONTSIZE = 13
+# Same names/values as plot_grid_scale_heatmap.py/plot_balance_before_after.py
+# -- the "hw/heatmap", "timing poster", and "balancing" figure families are
+# meant to read as one visual system, not three scripts each with their own
+# ad hoc sizing. SUPTITLE_Y (0.98, matplotlib's own suptitle default) and
+# TOP_MARGIN (0.88) match those two files' tight_layout rect top too; this
+# file's own further axes-top override to 0.85 below is this figure's own
+# documented tight_layout-incompatibility workaround, not a divergent
+# convention.
+SUPTITLE_FONTSIZE = 14
+PANEL_TITLE_FONTSIZE = 12
 LEGEND_FONTSIZE = 11
+AXIS_LABEL_FONTSIZE = 10
+TICK_LABEL_FONTSIZE = 8
+SUPTITLE_Y = 0.98
+TOP_MARGIN = 0.88
 
 
 def cycles_to_ms(cycles, clock_freq_hz):
@@ -139,6 +160,44 @@ def mean_std_ms(rows, cycles_key, clock_freq_hz):
   return float(values.mean()), (float(values.std(ddof=1)) if len(values) > 1 else 0.0)
 
 
+def _mean_std(stack, axis):
+  """Sample mean + std dev (ddof=1, 0.0 when there's only 1 entry along
+  `axis`) along `axis` of an ndarray -- mean_std_ms's same one-row-std-is-
+  undefined edge case, generalized from a flat per-row array to an ndarray
+  (per_round_compute_communication's per-row-per-round stacks)."""
+  mean = stack.mean(axis=axis)
+  std = stack.std(axis=axis, ddof=1) if stack.shape[axis] > 1 else np.zeros_like(mean)
+  return mean, std
+
+
+def per_round_compute_communication(rows, clock_freq_hz):
+  """Per-row, per-round compute/communication arrays (ms), each shape
+  (n_rows, n_rounds) -- the shared derivation (local_compute+local_term_cond,
+  clip(round_duration - that, 0, None)) both poster modes' round/compute/
+  communication bars build their own mean/std from: per-round for
+  _plot_timing_row_poster_linear's round panel, summed-across-rounds-per-row
+  for _plot_timing_row_poster_log's single compute/communication totals.
+  Every row must report the same round count for this column (true for
+  every repeated run of the same (infile_mtx, pe_grid) config seen so far);
+  asserts rather than silently truncating/broadcasting if that ever stops
+  holding."""
+  compute_per_row, communication_per_row = [], []
+  for r in rows:
+    local_compute = cycles_to_ms(
+        parse_cycle_list(r["local_compute_max_cycles"]).astype(np.float64), clock_freq_hz)
+    local_term_cond = cycles_to_ms(
+        parse_cycle_list(r["local_term_cond_max_cycles"]).astype(np.float64), clock_freq_hz)
+    round_duration = cycles_to_ms(
+        parse_cycle_list(r["round_duration_cycles"]).astype(np.float64), clock_freq_hz)
+    compute_per_row.append(local_compute + local_term_cond)
+    communication_per_row.append(np.clip(round_duration - local_compute - local_term_cond, 0.0, None))
+  lengths = {len(a) for a in compute_per_row}
+  assert len(lengths) == 1, (
+      f"rows have mismatched round counts {sorted(lengths)} -- can't average per-round "
+      "compute/communication across runs with different round counts")
+  return np.stack(compute_per_row), np.stack(communication_per_row)
+
+
 def plot_timing_row_poster(rows, out_path, log_scale=False):
   """Dispatches to one of two entirely different renderings of the same
   underlying data -- see _plot_timing_row_poster_linear/_log's own
@@ -154,30 +213,29 @@ def plot_timing_row_poster(rows, out_path, log_scale=False):
 def _plot_timing_row_poster_linear(rows, out_path):
   """Small multiples: 3 separate linear-scale panels (rounds, h2d_seed/
   resolve/d2h, h2d_matrix), one per order of magnitude -- see the module
-  docstring for why. The per-round device-time panel (left) is purely
-  on-device work with no real run-to-run variance (confirmed on real
-  hardware, section 15), so it's drawn from a single representative run
-  (the most recent). The other two panels show mean +/- std across ALL of
-  `rows` instead -- real hardware jitter actually shows up there."""
+  docstring for why. Every bar in every panel is a mean across ALL of `rows`
+  now, error bars included -- the round panel used to be drawn from a
+  single representative run on the theory that on-device work showed no
+  real run-to-run variance, but that's a reason the error bars should come
+  out tiny, not a reason to skip plotting them and be the one panel that
+  looks inconsistent with the other two."""
   row = rows[-1]
   matrix = row["infile_mtx"]
   pe_grid = row["pe_grid"]
   clock_freq_hz = float(row.get("clock_freq_hz") or CLOCK_FREQ_HZ)
 
-  round_duration = cycles_to_ms(parse_cycle_list(row["round_duration_cycles"]).astype(float),
-                                 clock_freq_hz)
+  # fused: local_compute + local_term_cond, one "compute" segment (see
+  # module docstring). compute/communication are per-round MEANS across
+  # `rows`; round_total_std (mean+std centered on the same total each bar's
+  # stack already sums to, same convention as every other bar in this
+  # figure) is the error bar plotted on top of each round's stack below.
+  compute_stack, communication_stack = per_round_compute_communication(rows, clock_freq_hz)
+  compute, _ = _mean_std(compute_stack, axis=0)
+  communication, _ = _mean_std(communication_stack, axis=0)
+  _, round_total_std = _mean_std(compute_stack + communication_stack, axis=0)
   # profiled_rounds (not rounds_completed) is authoritative -- see
   # plot_bfs_timing.py's own comment on this same truncation subtlety.
-  profiled_rounds = len(round_duration)
-
-  local_compute = cycles_to_ms(parse_cycle_list(row["local_compute_max_cycles"]).astype(float),
-                                clock_freq_hz)
-  local_term_cond = cycles_to_ms(parse_cycle_list(row["local_term_cond_max_cycles"]).astype(float),
-                                  clock_freq_hz)
-  # fused: local_compute + local_term_cond, one "compute" segment (see
-  # module docstring).
-  compute = local_compute + local_term_cond
-  communication = np.clip(round_duration - local_compute - local_term_cond, 0.0, None)
+  profiled_rounds = len(compute)
 
   # sync-corrected cross-PE span (see bfs_timing.read_sync_corrected_span) --
   # the only h2d_matrix/h2d_seed/d2h timing this project records now.
@@ -221,7 +279,13 @@ def _plot_timing_row_poster_linear(rows, out_path):
     candidate_labels.append((ax, txt, xpos, 0.0, height, bar_width))
 
   bottom = np.zeros(profiled_rounds)
-  segments = [("compute", compute, COMPUTE_COLOR), ("communication", communication,
+  # "Compute"/"Communication" (capitalized) here ONLY -- these two labels
+  # feed straight into the figure legend below (this panel's own x-ticks are
+  # "round 0"/"round 1"/..., not these names), so they follow the legend's
+  # own capitalization convention, not this file's lowercase
+  # variable-name-as-bar-label convention (h2d_seed/resolve/d2h/h2d_matrix,
+  # each still lowercase on ITS OWN x-tick, are unaffected).
+  segments = [("Compute", compute, COMPUTE_COLOR), ("Communication", communication,
                                                       COMMUNICATION_COLOR)]
   for name, heights, color in segments:
     ax_rounds.bar(round_xs, heights, width=bar_width, bottom=bottom, color=color,
@@ -234,15 +298,24 @@ def _plot_timing_row_poster_linear(rows, out_path):
       candidate_labels.append((ax_rounds, txt, r, bottom[i], total_heights[i], bar_width))
     bottom = total_heights
 
-  add_solo_bar(ax_h2d_matrix, 0, h2d_matrix_mean, H2D_COLORS["h2d_matrix"],
+  # One error bar per round, centered on that round's total (compute +
+  # communication) stack height -- same elinewidth/capsize/capthick/ecolor
+  # as add_solo_bar's own error bars below, for a consistent look across
+  # every bar in the figure. `bottom` here is each round's total mean
+  # height (the stack loop above just finished summing up to it).
+  if np.any(round_total_std > 0):
+    ax_rounds.errorbar(round_xs, bottom, yerr=round_total_std, fmt="none", ecolor=TEXT_PRIMARY,
+                        elinewidth=1.4, capsize=4, capthick=1.4, zorder=5)
+
+  add_solo_bar(ax_h2d_matrix, 0, h2d_matrix_mean, HOST_TO_DEVICE_COLOR,
                "h2d_matrix", yerr=h2d_matrix_std)
-  add_solo_bar(ax_transfer, transfer_xs[0], h2d_seed_mean, H2D_COLORS["h2d_seed"],
+  add_solo_bar(ax_transfer, transfer_xs[0], h2d_seed_mean, HOST_TO_DEVICE_COLOR,
                "h2d_seed", yerr=h2d_seed_std)
   add_solo_bar(ax_transfer, transfer_xs[1], parent_resolve_mean, PARENT_RESOLVE_COLOR,
                "resolve", yerr=parent_resolve_std)
-  add_solo_bar(ax_transfer, transfer_xs[2], d2h_mean, D2H_COLOR, "d2h", yerr=d2h_std)
+  add_solo_bar(ax_transfer, transfer_xs[2], d2h_mean, DEVICE_TO_HOST_COLOR, "d2h", yerr=d2h_std)
 
-  round_max = max(round_duration.max() if profiled_rounds else 0.0, 1e-9)
+  round_max = max((bottom + round_total_std).max() if profiled_rounds else 0.0, 1e-9)
   transfer_max = max(h2d_seed_mean + h2d_seed_std, parent_resolve_mean + parent_resolve_std,
                       d2h_mean + d2h_std, 1e-9)
   h2d_matrix_max = max(h2d_matrix_mean + h2d_matrix_std, 1e-9)
@@ -250,9 +323,19 @@ def _plot_timing_row_poster_linear(rows, out_path):
   ax_transfer.set_ylim(0, transfer_max * 1.15)
   ax_h2d_matrix.set_ylim(0, h2d_matrix_max * 1.15)
   # h2d_matrix is tens of thousands of ms -- compact 1-5-digit tick labels
-  # (e.g. "1", "2", "3") plus a single "1e4"-style offset text above the
-  # axis, instead of a full "20000"/"40000" on every tick.
-  ax_h2d_matrix.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+  # (e.g. "1", "2", "3") plus a single "x10^4"-style offset text above the
+  # axis, instead of a full "20000"/"40000" on every tick. That offset text
+  # carries real information (misread it and every tick label on this panel
+  # is off by 4 orders of magnitude), so it can't inherit tick_params'
+  # TEXT_MUTED color/default small size the way an ordinary tick label can --
+  # explicitly upsized, bolded, and darkened below. useMathText=True renders
+  # it as an actual "x10^4" superscript instead of the terser, easier-to-miss
+  # default "1e4" plain text.
+  ax_h2d_matrix.ticklabel_format(axis="y", style="sci", scilimits=(0, 0), useMathText=True)
+  offset_text = ax_h2d_matrix.yaxis.get_offset_text()
+  offset_text.set_fontsize(11)
+  offset_text.set_color(TEXT_PRIMARY)
+  offset_text.set_fontweight("bold")
 
   # No direction (TD/BU) suffix -- these poster plots only ever show
   # top-down rounds, so the label would be redundant on every round.
@@ -260,7 +343,16 @@ def _plot_timing_row_poster_linear(rows, out_path):
 
   ax_h2d_matrix.set_xticks([0])
   ax_h2d_matrix.set_xticklabels(["h2d_matrix"])
-  ax_h2d_matrix.set_xlim(-0.8, 0.2)
+  # Same "-0.8, N - 0.2" margin convention as ax_rounds/ax_transfer below (N=1
+  # category here) -- this panel previously hardcoded the literal "0.2" from
+  # that pattern's own N=1 case instead of computing N - 0.2, so the right
+  # edge sat at 0.2 while the bar itself (width 0.62, centered at x=0) already
+  # extends out to 0.31: the bar's right side was clipped against the axis
+  # limit. That clipping was also why the error bar cap looked off-center --
+  # it's centered on the bar's true x=0, but the visibly-clipped bar reads
+  # narrower on its right side, so the cap appears shifted right relative to
+  # what's actually visible.
+  ax_h2d_matrix.set_xlim(-0.8, 0.8)
   ax_rounds.set_xticks(round_xs)
   ax_rounds.set_xticklabels(round_labels)
   ax_rounds.set_xlim(-0.8, max(profiled_rounds - 0.2, 0.2))
@@ -286,26 +378,40 @@ def _plot_timing_row_poster_linear(rows, out_path):
   # No "ms" ylabel on ax_h2d_matrix -- ax_rounds (leftmost) already
   # establishes the unit for the whole figure; repeating it on the
   # rightmost panel is redundant.
-  ax_rounds.set_ylabel("ms", labelpad=8)
+  ax_rounds.set_ylabel("ms", labelpad=8, fontsize=AXIS_LABEL_FONTSIZE)
 
   fig.suptitle(f"Timing Split on {poster_title_input(matrix)} and {pe_grid} PE Grid",
-               fontsize=TITLE_FONTSIZE, y=0.98)
+               fontsize=SUPTITLE_FONTSIZE, y=SUPTITLE_Y)
   for ax in (ax_h2d_matrix, ax_rounds, ax_transfer):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["left"].set_color(BASELINE)
     ax.spines["bottom"].set_color(BASELINE)
-    ax.tick_params(colors=TEXT_MUTED)
+    ax.tick_params(colors=TEXT_MUTED, labelsize=TICK_LABEL_FONTSIZE)
     ax.yaxis.grid(True, color=GRIDLINE, linewidth=1, zorder=0)
     ax.set_axisbelow(True)
     ax.set_facecolor(SURFACE)
   fig.patch.set_facecolor(SURFACE)
 
-  handles, labels = [], []
-  for ax in (ax_h2d_matrix, ax_rounds, ax_transfer):
-    h, l = ax.get_legend_handles_labels()
-    handles += h
-    labels += l
+  # ax_rounds's own "Compute"/"Communication" handles (the only bars whose
+  # identity isn't already spelled out by their own x-tick label -- round
+  # bars are ticked "round 0"/"round 1"/..., not "Compute"/"Communication"),
+  # plus one proxy swatch per transfer color -- HOST_TO_DEVICE_COLOR covers
+  # 2 differently-named bars (h2d_seed+h2d_matrix), so unlike
+  # compute/communication the color alone no longer maps to one obvious
+  # name; PARENT_RESOLVE_COLOR/DEVICE_TO_HOST_COLOR are each already
+  # 1-bar-1-color again, but get their own swatch too for the same reason
+  # h2d_matrix/h2d_seed/resolve/d2h lost theirs -- consistency: every color
+  # actually used in this figure gets exactly one legend entry, no more, no
+  # fewer. Every legend label capitalized -- research-poster convention (a
+  # legend is read as prose, like an axis label, not as a literal
+  # variable/field name) -- while the bars' OWN x-tick labels underneath
+  # stay lowercase, matching this codebase's field-name convention for
+  # those (h2d_seed/resolve/d2h/h2d_matrix/round N).
+  handles, labels = ax_rounds.get_legend_handles_labels()
+  handles += [Patch(color=HOST_TO_DEVICE_COLOR), Patch(color=PARENT_RESOLVE_COLOR),
+              Patch(color=DEVICE_TO_HOST_COLOR)]
+  labels += ["Host to Device", "Parent Resolve", "Device to Host"]
   fig.legend(handles, labels, loc="lower center", ncol=len(handles), frameon=False,
              fontsize=LEGEND_FONTSIZE, bbox_to_anchor=(0.5, 0.01), columnspacing=1.8,
              handletextpad=0.6, labelspacing=1.0)
@@ -313,9 +419,27 @@ def _plot_timing_row_poster_linear(rows, out_path):
   # externally, wherever this poster gets used (see module docstring).
   # rect's right=0.97 (not 1.0) leaves a sliver of padding so ax_h2d_matrix's
   # bar/ticks don't butt right up against the figure's own right edge;
-  # top=0.88 (not 0.93) leaves clear air between the panel titles below and
-  # the suptitle above (see title_y), instead of the two crowding together.
-  plt.tight_layout(rect=[0, 0.08, 0.97, 0.88])
+  # top=TOP_MARGIN (not 0.93) leaves clear air between the panel titles below
+  # and the suptitle above (see title_y), instead of the two crowding
+  # together -- same TOP_MARGIN value plot_grid_scale_heatmap.py/
+  # plot_balance_before_after.py reserve for their own suptitle headroom.
+  plt.tight_layout(rect=[0, 0.08, 0.97, TOP_MARGIN])
+
+  # tight_layout's own rect top above is silently ignored for this specific
+  # figure -- this file's own "Axes ... not compatible with tight_layout"
+  # warning is exactly that incompatibility, and every axes' top edge lands
+  # at 0.88 regardless of what rect[3] says (confirmed by printing
+  # ax.get_position() before/after changing it). So the real headroom this
+  # panel needs for ax_h2d_matrix's bold "x10^4" offset text (see its own
+  # comment) to clear "...Host-Device Time" above without crowding it has to
+  # come from directly overriding each axes' top edge post-hoc instead --
+  # applied to all 3 (not just ax_h2d_matrix) so their plot areas stay
+  # aligned. title_y below is unchanged, so the gap ABOVE the panel titles
+  # (before the suptitle) is untouched too.
+  new_axes_top = 0.85
+  for ax in (ax_rounds, ax_transfer, ax_h2d_matrix):
+    pos = ax.get_position()
+    ax.set_position([pos.x0, pos.y0, pos.width, new_axes_top - pos.y0])
 
   # Panel titles as fig.text at one shared, absolute figure-fraction y,
   # positioned AFTER tight_layout (using each axes' own now-final
@@ -325,12 +449,18 @@ def _plot_timing_row_poster_linear(rows, out_path):
   # panels have), so ax.set_title() alone renders the three titles at
   # different heights. One shared figure-space y sidesteps that entirely.
   title_y = 0.90
-  for ax, text in ((ax_rounds, "Per-Round Device Time"),
-                   (ax_transfer, "Host-Device + Parent Resolve"),
-                   (ax_h2d_matrix, "h2d_matrix")):
-    pos = ax.get_position()
-    fig.text((pos.x0 + pos.x1) / 2, title_y, text, ha="center", va="bottom",
-              fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
+  pos_rounds = ax_rounds.get_position()
+  fig.text((pos_rounds.x0 + pos_rounds.x1) / 2, title_y, "Per-Round Device Time",
+            ha="center", va="bottom", fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
+  # ax_transfer and ax_h2d_matrix share ONE title spanning both, centered
+  # over their combined width, instead of each getting its own -- they're
+  # the same "host-transfer cost" concept split across two panels only for
+  # the scale mismatch (see module docstring), not two different things.
+  pos_transfer = ax_transfer.get_position()
+  pos_h2d_matrix = ax_h2d_matrix.get_position()
+  fig.text((pos_transfer.x0 + pos_h2d_matrix.x1) / 2, title_y,
+            "Parent Resolve + Host-Device Time",
+            ha="center", va="bottom", fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
 
   # SVG only -- no PNG. Vector output for a poster figure that gets
   # embedded/rescaled, not viewed as a standalone raster image.
@@ -353,30 +483,28 @@ def _plot_timing_row_poster_log(rows, out_path):
   gaps between bars are multiplicative, not additive. See the module
   docstring for the fuller tradeoff discussion.
 
-  compute/communication have no error bars (single representative run,
-  same as the linear mode's round panel -- on-device work showed no
-  real run-to-run variance). h2d_matrix/h2d_seed/resolve/d2h show mean +/-
-  std across ALL of `rows`, same as the linear mode's other two panels."""
+  Every bar is a mean across ALL of `rows`, error bars included -- same
+  convention as the linear mode's every panel now (see its own docstring)."""
   row = rows[-1]
   matrix = row["infile_mtx"]
   pe_grid = row["pe_grid"]
   clock_freq_hz = float(row.get("clock_freq_hz") or CLOCK_FREQ_HZ)
 
-  round_duration = cycles_to_ms(parse_cycle_list(row["round_duration_cycles"]).astype(float),
-                                 clock_freq_hz)
-  local_compute = cycles_to_ms(parse_cycle_list(row["local_compute_max_cycles"]).astype(float),
-                                clock_freq_hz)
-  local_term_cond = cycles_to_ms(parse_cycle_list(row["local_term_cond_max_cycles"]).astype(float),
-                                  clock_freq_hz)
-  compute = local_compute + local_term_cond
-  communication = np.clip(round_duration - local_compute - local_term_cond, 0.0, None)
-  # Summed (not averaged) across rounds -- these totals stand in for the
-  # same whole-search "on-device time" the linear mode's round panel shows
-  # as a stack, just collapsed to 2 numbers. A tiny positive floor, not 0:
-  # log(0) is undefined, and communication_total (or compute_total, for a
-  # single-round search) can be genuinely ~0.
-  compute_total = max(float(compute.sum()), 1e-6)
-  communication_total = max(float(communication.sum()), 1e-6)
+  # Summed across rounds PER ROW first, then mean/std taken across rows --
+  # these totals stand in for the same whole-search "on-device time" the
+  # linear mode's round panel shows as a stack, just collapsed to 2 numbers
+  # (so summed across rounds), while still averaging across repeated runs of
+  # this same config like every other bar here (so meaned across rows). A
+  # tiny positive floor on the mean, not 0: log(0) is undefined, and
+  # communication_total (or compute_total, for a single-round search) can be
+  # genuinely ~0.
+  compute_stack, communication_stack = per_round_compute_communication(rows, clock_freq_hz)
+  compute_row_totals = compute_stack.sum(axis=1)
+  communication_row_totals = communication_stack.sum(axis=1)
+  compute_total, compute_total_std = _mean_std(compute_row_totals, axis=0)
+  communication_total, communication_total_std = _mean_std(communication_row_totals, axis=0)
+  compute_total = max(float(compute_total), 1e-6)
+  communication_total = max(float(communication_total), 1e-6)
 
   h2d_matrix_mean, h2d_matrix_std = mean_std_ms(rows, "h2d_matrix_span_cycles", clock_freq_hz)
   h2d_seed_mean, h2d_seed_std = mean_std_ms(rows, "h2d_seed_span_cycles", clock_freq_hz)
@@ -389,15 +517,21 @@ def _plot_timing_row_poster_log(rows, out_path):
   # h2d_seed), Kernel (compute, communication), Device to Host (resolve,
   # d2h -- resolve is on-device only, but it's the on-device step that
   # produces exactly what d2h then reads off, so it belongs with d2h's
-  # phase, not the Kernel's). See group_spans below for the separators/
-  # labels that make these 3 groups visually explicit.
+  # phase POSITIONALLY, not the Kernel's). See group_spans below for the
+  # separators/labels that make these 3 groups visually explicit -- same
+  # HOST_TO_DEVICE_COLOR/PARENT_RESOLVE_COLOR/DEVICE_TO_HOST_COLOR colors as
+  # _plot_timing_row_poster_linear now: h2d_matrix/h2d_seed share one color
+  # (both already named on their own x-tick, color only needs to say which
+  # phase), but resolve keeps its own distinct PARENT_RESOLVE_COLOR rather
+  # than d2h's -- it sits in the "Device to Host" group by position/label,
+  # not by color, since it isn't actually a host transfer.
   bars = [
-      ("h2d_matrix", h2d_matrix_mean, H2D_COLORS["h2d_matrix"], h2d_matrix_std),
-      ("h2d_seed", h2d_seed_mean, H2D_COLORS["h2d_seed"], h2d_seed_std),
-      ("compute", compute_total, COMPUTE_COLOR, 0.0),
-      ("communication", communication_total, COMMUNICATION_COLOR, 0.0),
+      ("h2d_matrix", h2d_matrix_mean, HOST_TO_DEVICE_COLOR, h2d_matrix_std),
+      ("h2d_seed", h2d_seed_mean, HOST_TO_DEVICE_COLOR, h2d_seed_std),
+      ("compute", compute_total, COMPUTE_COLOR, compute_total_std),
+      ("communication", communication_total, COMMUNICATION_COLOR, communication_total_std),
       ("resolve", parent_resolve_mean, PARENT_RESOLVE_COLOR, parent_resolve_std),
-      ("d2h", d2h_mean, D2H_COLOR, d2h_std),
+      ("d2h", d2h_mean, DEVICE_TO_HOST_COLOR, d2h_std),
   ]
   group_spans = [("Host to Device", 0, 1), ("Kernel", 2, 3), ("Device to Host", 4, 5)]
 
@@ -435,12 +569,12 @@ def _plot_timing_row_poster_log(rows, out_path):
   ax.set_xticks(xs)
   ax.set_xticklabels([name for name, _, _, _ in bars])
   ax.set_xlim(-0.8, len(bars) - 0.2)
-  ax.set_ylabel("ms (log scale)", labelpad=8)
+  ax.set_ylabel("ms (log scale)", labelpad=8, fontsize=AXIS_LABEL_FONTSIZE)
   ax.spines["top"].set_visible(False)
   ax.spines["right"].set_visible(False)
   ax.spines["left"].set_color(BASELINE)
   ax.spines["bottom"].set_color(BASELINE)
-  ax.tick_params(colors=TEXT_MUTED)
+  ax.tick_params(colors=TEXT_MUTED, labelsize=TICK_LABEL_FONTSIZE)
   ax.yaxis.grid(True, which="major", color=GRIDLINE, linewidth=1, zorder=0)
   ax.set_axisbelow(True)
   ax.set_facecolor(SURFACE)
@@ -455,7 +589,11 @@ def _plot_timing_row_poster_log(rows, out_path):
              fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY, transform=group_transform)
 
   fig.suptitle(f"Timing Split on {poster_title_input(matrix)} and {pe_grid} PE Grid "
-               "(log scale)", fontsize=TITLE_FONTSIZE, y=0.98)
+               "(log scale)", fontsize=SUPTITLE_FONTSIZE, y=SUPTITLE_Y)
+  # top=0.92, not TOP_MARGIN (0.88) -- this figure has a single axes plus a
+  # lighter group-label band via axes-transform text (see group_transform
+  # above), not the linear mode's separate fig-wide panel-title row, so it
+  # needs less top headroom reserved.
   plt.tight_layout(rect=[0, 0.02, 1, 0.92])
 
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)

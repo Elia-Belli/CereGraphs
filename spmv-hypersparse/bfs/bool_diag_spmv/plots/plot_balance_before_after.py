@@ -7,15 +7,22 @@ Produces two side-by-side (before/after) figures from a real raw matrix and
 its already-balanced counterpart (both already on disk from the normal
 prep pipeline -- this script does not call util/analyze itself):
 
-  1. sparsity_before_after.png -- scatter of every nonzero's (row, col) in
+  1. sparsity_before_after.svg -- scatter of every nonzero's (row, col) in
      the ORIGINAL vertex order vs. the BALANCED vertex order, with the PE
      grid lines overlaid on the "after" panel.
-  2. nnz_per_pe_before_after.png -- nnz-per-PE-block heatmap computed two
+  2. nnz_per_pe_before_after.svg -- nnz-per-PE-block heatmap computed two
      ways: "before" chops the ORIGINAL matrix into the same grid (the
      naive distribution util/analyze itself starts from, its own
      distribute() function), "after" is the real balanced matrix's actual
      per-block load. Same color scale on both panels so the improvement is
      visually honest, not an artifact of two different scales.
+
+SVG only, no PNG -- these are poster/report figures meant to be
+embedded/rescaled as vector output, not viewed as standalone raster images
+(same convention as plot_grid_scale_heatmap.py/plot_bfs_timing_poster.py).
+Both figures share one FIGSIZE/RIGHT_MARGIN/TOP_MARGIN layout (see their own
+comments below) so they come out the same pixel size despite only one of
+them carrying a colorbar.
 
 Reuses plot_bfs_scaling.py's exact SURFACE/TEXT_PRIMARY/GRIDLINE/BASELINE
 palette and plot_grid_scale_heatmap.py's sequential single-hue (blue) ramp
@@ -43,6 +50,30 @@ BASELINE = "#c3c2b7"
 SURFACE = "#fcfcfb"
 BLUE = "#2a78d6"
 
+# Title/label font sizes and suptitle/title/plot spacing, shared verbatim
+# (same names, same values) with plot_grid_scale_heatmap.py and
+# plot_bfs_timing_poster.py -- the "hw/heatmap", "timing poster", and
+# "balancing" figure families are meant to read as one visual system, not
+# three scripts each with their own ad hoc sizing.
+SUPTITLE_FONTSIZE = 14
+PANEL_TITLE_FONTSIZE = 12
+AXIS_LABEL_FONTSIZE = 10
+TICK_LABEL_FONTSIZE = 8
+SUPTITLE_Y = 0.98  # fraction of figure height; matplotlib's own suptitle default
+TITLE_PAD = 10  # points between a panel's title and its own plot area
+TOP_MARGIN = 0.88  # tight_layout rect top -- headroom reserved for the suptitle
+
+# Shared by plot_sparsity/plot_nnz_per_pe so their two output figures are
+# literally the same pixel size -- plot_nnz_per_pe's colorbar would
+# otherwise push bbox_inches="tight"'s auto-cropped bbox wider than
+# plot_sparsity's (which has no colorbar), even at an identical figsize.
+# RIGHT_MARGIN reserves the same right-hand band in both (colorbar in one,
+# blank in the other) and both now save at a fixed bbox instead of a
+# "tight" one, so neither figure's final canvas depends on what it happens
+# to draw near its own edges.
+FIGSIZE = (11, 5.5)
+RIGHT_MARGIN = 0.90
+
 
 def read_mtx(path):
   with open(path) as f:
@@ -68,7 +99,7 @@ def sequential_ramp(base_hex, n):
 
 
 def plot_sparsity(n_raw, rows_raw, cols_raw, n_bal, rows_bal, cols_bal, out_path):
-  fig, axes = plt.subplots(1, 2, figsize=(11, 5.5), gridspec_kw={"wspace": 0.06})
+  fig, axes = plt.subplots(1, 2, figsize=FIGSIZE, gridspec_kw={"wspace": 0.06})
   panels = [
       (axes[0], "Original", rows_raw, cols_raw, n_raw, True),
       (axes[1], "Balanced", rows_bal, cols_bal, n_bal, False),
@@ -78,30 +109,38 @@ def plot_sparsity(n_raw, rows_raw, cols_raw, n_bal, rows_bal, cols_bal, out_path
     ax.set_xlim(0, n)
     ax.set_ylim(n, 0)
     ax.set_aspect("equal")
-    ax.set_title(title, color=TEXT_PRIMARY, fontsize=11)
+    ax.set_title(title, color=TEXT_PRIMARY, fontsize=PANEL_TITLE_FONTSIZE, pad=TITLE_PAD)
     ax.set_facecolor(SURFACE)
     for spine in ax.spines.values():
       spine.set_color(BASELINE)
-    ax.tick_params(colors=TEXT_MUTED, labelsize=8)
-    ax.set_xlabel("vertex index (column)", color=TEXT_PRIMARY, fontsize=9)
+    ax.tick_params(colors=TEXT_MUTED, labelsize=TICK_LABEL_FONTSIZE)
+    ax.set_xlabel("vertex index (column)", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
     if show_ylabel:
-      ax.set_ylabel("vertex index (row)", color=TEXT_PRIMARY, fontsize=9)
+      ax.set_ylabel("vertex index (row)", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
     else:
       # Same 0..n range as the left panel (shared axis convention) -- the
       # tick numbers (and the ticks themselves) would just duplicate what's
       # already readable there.
       ax.tick_params(left=False, labelleft=False)
 
-  fig.suptitle("Non-Zero Elements Layout across PE Grid", color=TEXT_PRIMARY, fontsize=12)
+  fig.suptitle("Non-Zero Elements Layout across PE Grid", color=TEXT_PRIMARY,
+               fontsize=SUPTITLE_FONTSIZE, y=SUPTITLE_Y)
   fig.patch.set_facecolor(SURFACE)
-  # scatter layers are real vector paths now (rasterized=False above), not
-  # embedded bitmaps -- the SVG is bigger at 20k+ points, but every mark
-  # stays editable/recolorable downstream instead of being a dead pixel blob.
-  fig.savefig(out_path, dpi=220, bbox_inches="tight")
+  # Reserve the same top/right margins plot_nnz_per_pe reserves for its own
+  # suptitle/colorbar (see RIGHT_MARGIN/TOP_MARGIN comments above) -- this
+  # panel has no colorbar, so its right band just stays blank, but the two
+  # figures end up the same shape and (see the fixed-bbox save below) the
+  # same pixel size.
+  fig.tight_layout(rect=[0, 0, RIGHT_MARGIN, TOP_MARGIN])
+
+  # SVG only, no PNG (poster/report figure, vector output meant to be
+  # embedded/rescaled). No bbox_inches="tight" -- unlike this file's own
+  # colorbar panel below, a "tight" bbox here would crop to exactly this
+  # panel's own (colorbar-less) content and no longer match
+  # plot_nnz_per_pe's saved size; a fixed FIGSIZE-at-dpi bbox for both
+  # guarantees the two companion figures are pixel-identical.
+  fig.savefig(out_path, dpi=220)
   print(f"wrote {out_path}")
-  png_path = os.path.splitext(out_path)[0] + ".png"
-  fig.savefig(png_path, dpi=220, bbox_inches="tight")
-  print(f"wrote {png_path}")
 
 
 def block_counts(rows, cols, n, grid):
@@ -116,7 +155,7 @@ def block_counts(rows, cols, n, grid):
 def plot_nnz_per_pe(blocks_before, blocks_after, out_path):
   vmax = max(blocks_before.max(), blocks_after.max())
   cmap = sequential_ramp(BLUE, 256)
-  fig, axes = plt.subplots(1, 2, figsize=(11, 5.5), gridspec_kw={"wspace": 0.06})
+  fig, axes = plt.subplots(1, 2, figsize=FIGSIZE, gridspec_kw={"wspace": 0.06})
   panels = [
       (axes[0], "Original", blocks_before, True),
       (axes[1], "Balanced", blocks_after, False),
@@ -141,36 +180,43 @@ def plot_nnz_per_pe(blocks_before, blocks_after, out_path):
         ax.text(j, i, f"{v}", ha="center", va="center", fontsize=8, color=color)
     ax.set_xticks(range(grid))
     ax.set_yticks(range(grid))
-    ax.set_xticklabels(range(grid), fontsize=7, color=TEXT_MUTED)
-    ax.set_xlabel("PE column", color=TEXT_PRIMARY, fontsize=9)
+    ax.set_xticklabels(range(grid), fontsize=TICK_LABEL_FONTSIZE, color=TEXT_MUTED)
+    ax.set_xlabel("PE column", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
     if show_yticklabels:
-      ax.set_yticklabels(range(grid), fontsize=7, color=TEXT_MUTED)
-      ax.set_ylabel("PE row", color=TEXT_PRIMARY, fontsize=9)
+      ax.set_yticklabels(range(grid), fontsize=TICK_LABEL_FONTSIZE, color=TEXT_MUTED)
+      ax.set_ylabel("PE row", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
     else:
       # Same 0..grid-1 PE-row range as the left panel (shared axis
       # convention) -- the tick numbers (and the ticks themselves) would
       # just duplicate it.
       ax.tick_params(left=False, labelleft=False)
-    ax.set_title(title, color=TEXT_PRIMARY, fontsize=11)
+    ax.set_title(title, color=TEXT_PRIMARY, fontsize=PANEL_TITLE_FONTSIZE, pad=TITLE_PAD)
     ax.set_facecolor(SURFACE)
     for spine in ax.spines.values():
       spine.set_visible(False)
 
+  # Reserve the same top/right margins plot_sparsity reserves (see
+  # RIGHT_MARGIN/TOP_MARGIN comments above) -- fig.colorbar(ax=axes) below
+  # carves its space FROM these two (already tight_layout-positioned) axes
+  # rather than growing the figure, so it lands inside the reserved
+  # RIGHT_MARGIN band.
+  fig.tight_layout(rect=[0, 0, RIGHT_MARGIN, TOP_MARGIN])
+
   cbar = fig.colorbar(im, ax=axes, fraction=0.025, pad=0.03)
-  cbar.set_label("Non-Zero Elements per PE", color=TEXT_PRIMARY)
-  cbar.ax.tick_params(colors=TEXT_MUTED)
+  cbar.set_label("Non-Zero Elements per PE", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
+  cbar.ax.tick_params(colors=TEXT_MUTED, labelsize=TICK_LABEL_FONTSIZE)
   # Colorbar.solids defaults to rasterized=True regardless of the mappable's
   # own type -- force it vector too, so the SVG has no embedded bitmaps left.
   cbar.solids.set_rasterized(False)
 
   fig.suptitle("Non-Zero Elements Distribution across PE grid",
-               color=TEXT_PRIMARY, fontsize=12)
+               color=TEXT_PRIMARY, fontsize=SUPTITLE_FONTSIZE, y=SUPTITLE_Y)
   fig.patch.set_facecolor(SURFACE)
-  fig.savefig(out_path, dpi=220, bbox_inches="tight")
+  # SVG only, no PNG; no bbox_inches="tight" -- see plot_sparsity's own
+  # comment on why: a fixed FIGSIZE-at-dpi bbox on both is what makes these
+  # two companion figures come out pixel-identical.
+  fig.savefig(out_path, dpi=220)
   print(f"wrote {out_path}")
-  png_path = os.path.splitext(out_path)[0] + ".png"
-  fig.savefig(png_path, dpi=220, bbox_inches="tight")
-  print(f"wrote {png_path}")
   print(f"before: min={blocks_before.min()} max={blocks_before.max()} "
         f"(ratio {blocks_before.max() / max(1, blocks_before.min()):.1f}x)")
   print(f"after:  min={blocks_after.min()} max={blocks_after.max()} "
