@@ -84,7 +84,14 @@ AXIS_LABEL_FONTSIZE = 10
 TICK_LABEL_FONTSIZE = 8
 SUPTITLE_Y = 0.98  # fraction of figure height; matplotlib's own suptitle default
 TITLE_PAD = 10  # points between a panel's title and its own plot area
-TOP_MARGIN = 0.88  # tight_layout rect top -- headroom reserved for the suptitle
+# tight_layout rect top -- headroom reserved for the suptitle. NOT the same
+# value as plot_balance_before_after.py/plot_bfs_timing_poster.py's own
+# TOP_MARGIN=0.88 despite the "shared convention" above: this figure's
+# panels aren't aspect-locked, so tight_layout actually sizes them (no
+# silent-no-op like the aspect-locked panels elsewhere) and reserves its
+# own internal padding below whatever rect top you give it -- 0.88 left a
+# large dead band between the panel titles and the suptitle above them.
+TOP_MARGIN = 0.965
 
 RMAT_RE = re.compile(r"^rmat_s(\d+)_e16\.balanced(\d+)x(\d+)\.mtx$")
 
