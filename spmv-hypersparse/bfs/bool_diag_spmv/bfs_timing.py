@@ -162,6 +162,49 @@ def read_sync_corrected_span(runner, sym_tsc_start, sym_tsc_end, sym_tsc_ref,
   return int(corrected_toc.max() - corrected_tic.min())
 
 
+def timed_transfer(runner, height, width, transfer_fn, *, need_timing=True,
+                    span_reader=read_sync_corrected_span,
+                    sym_tsc_start=None, sym_tsc_end=None, sym_tsc_ref=None,
+                    enable_tsc=False):
+  """Run one host<->device transfer inside a device-side TSC bracket
+  (f_sync_hostdevice/f_tic ... f_toc/span_reader), structurally guaranteeing
+  no host-side numpy marshaling leaks into the timed window: `transfer_fn`
+  must be a zero-arg closure containing ONLY pre-marshaled memcpy_h2d/
+  memcpy_d2h/send_h2d_chunked calls -- any hwl_to_oned_colmajor/np.zeros
+  work belongs in the caller, before this call. Introduced to fix h2d_matrix/
+  d2h span_cycles being contaminated by interleaved host-side reshaping
+  (see docs/GRAPH500_BENCHMARK.md) -- previously each of run_bfs.py/
+  run_bfs.appliance.py/run_graph500.py hand-duplicated this bracket 3x with
+  that contamination baked in.
+
+  need_timing=False skips the bracket entirely (no f_sync_hostdevice/f_tic/
+  f_toc/span_reader, sym_tsc_* never touched) but still runs transfer_fn()
+  -- the transfer itself is never optional, only the timing scaffolding is.
+  Returns the span_cycles int, or None when need_timing is False.
+
+  span_reader lets run_bfs.appliance.py pass its own
+  read_sync_corrected_span_appliance (pb2 enums) instead of this module's
+  simulator-pybind version above.
+
+  Brackets run strictly serially: f_tic/f_toc share one on-device buffer
+  pair, so this call must fully complete (through span_reader's d2h
+  readback) before the next timed_transfer starts."""
+  if need_timing:
+    assert sym_tsc_start is not None and sym_tsc_end is not None and sym_tsc_ref is not None
+    if enable_tsc:
+      runner.launch("f_enable_tsc", nonblock=False)
+    runner.launch("f_sync_hostdevice", nonblock=False)
+    runner.launch("f_tic", nonblock=True)
+
+  transfer_fn()
+
+  if not need_timing:
+    return None
+
+  runner.launch("f_toc", nonblock=False)
+  return span_reader(runner, sym_tsc_start, sym_tsc_end, sym_tsc_ref, height, width)
+
+
 def compute_round_summary(round_start, round_end):
   """round_time: per round, max over PEs of (that round's
   TS_TERM_COL_BCAST_DONE - TS_VBCAST_ISSUE) -- justified because the

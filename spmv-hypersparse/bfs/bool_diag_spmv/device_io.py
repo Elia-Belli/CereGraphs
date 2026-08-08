@@ -53,6 +53,49 @@ _H2D_WIRE_ITEMSIZE = 4
 _H2D_MAX_MESSAGE_LENGTH = (1024**3 * 2) - 1024
 
 
+def prepare_h2d_chunked(A_hwl: np.ndarray, height: int, width: int, elt_per_pe: int, dtype,
+                        max_bytes_per_call: int = 1_610_612_736):
+  """Pure-marshaling half of memcpy_h2d_chunked: does every hwl_to_oned_colmajor
+  call (including the chunked path's per-row-band slicing) up front and
+  performs no device I/O, so this can run entirely outside a
+  bfs_timing.timed_transfer bracket -- keeping host-side reshape cost out of
+  a transfer-time measurement. Returns a list of (y0, h, chunk_1d) tuples
+  consumed by send_h2d_chunked below; for the common single-chunk case this
+  is a 1-element list with y0=0, h=height. See memcpy_h2d_chunked's own
+  docstring for why chunking happens along the PE-row axis."""
+  total_bytes = _H2D_WIRE_ITEMSIZE * height * width * elt_per_pe
+  if total_bytes <= max_bytes_per_call:
+    return [(0, height, hwl_to_oned_colmajor(height, width, elt_per_pe, A_hwl, dtype))]
+
+  num_chunks = -(-total_bytes // max_bytes_per_call)  # ceil div
+  row_chunk = -(-height // num_chunks)  # ceil div
+  assert _H2D_WIRE_ITEMSIZE * row_chunk * width * elt_per_pe <= max_bytes_per_call
+  chunks = []
+  y0 = 0
+  while y0 < height:
+    h = min(row_chunk, height - y0)
+    chunks.append((y0, h, hwl_to_oned_colmajor(h, width, elt_per_pe, A_hwl[y0:y0 + h], dtype)))
+    y0 += h
+  return chunks
+
+
+def send_h2d_chunked(runner, dest_sym, prepared, width: int, elt_per_pe: int, data_type, order,
+                     nonblock: bool):
+  """Pure-transfer half of memcpy_h2d_chunked: issues runner.memcpy_h2d for
+  each (y0, h, chunk_1d) produced by prepare_h2d_chunked above, with no numpy
+  work -- safe to call from inside a bfs_timing.timed_transfer closure.
+  Multi-chunk bands are always nonblock=True except the last, which takes
+  the caller's `nonblock` -- so a caller wanting a blocking finish (e.g.
+  need_timing=True, "the last transfer in the bracket must block so f_toc
+  reads an accurate timestamp") still gets it even when the matrix was large
+  enough to need chunking."""
+  last = len(prepared) - 1
+  for i, (y0, h, chunk_1d) in enumerate(prepared):
+    runner.memcpy_h2d(dest_sym, chunk_1d, 0, y0, width, h, elt_per_pe,
+                       streaming=False, data_type=data_type, order=order,
+                       nonblock=nonblock if i == last else True)
+
+
 def memcpy_h2d_chunked(runner, dest_sym, A_hwl: np.ndarray, height: int, width: int,
                        elt_per_pe: int, dtype, data_type, order, nonblock: bool,
                        max_bytes_per_call: int = 1_610_612_736):
@@ -68,24 +111,13 @@ def memcpy_h2d_chunked(runner, dest_sym, A_hwl: np.ndarray, height: int, width: 
   documented, precedented origin offsets in this codebase (the
   reduce_select_any d2h fix already narrows `w`); a nonzero starting offset
   into elt_per_pe has no precedent here and is unverified, so this is the
-  lower-risk axis to split on."""
-  total_bytes = _H2D_WIRE_ITEMSIZE * height * width * elt_per_pe
-  if total_bytes <= max_bytes_per_call:
-    A_1d = hwl_to_oned_colmajor(height, width, elt_per_pe, A_hwl, dtype)
-    runner.memcpy_h2d(dest_sym, A_1d, 0, 0, width, height, elt_per_pe,
-                       streaming=False, data_type=data_type, order=order, nonblock=nonblock)
-    return
+  lower-risk axis to split on.
 
-  num_chunks = -(-total_bytes // max_bytes_per_call)  # ceil div
-  row_chunk = -(-height // num_chunks)  # ceil div
-  assert _H2D_WIRE_ITEMSIZE * row_chunk * width * elt_per_pe <= max_bytes_per_call
-  y0 = 0
-  while y0 < height:
-    h = min(row_chunk, height - y0)
-    chunk_1d = hwl_to_oned_colmajor(h, width, elt_per_pe, A_hwl[y0:y0 + h], dtype)
-    runner.memcpy_h2d(dest_sym, chunk_1d, 0, y0, width, h, elt_per_pe,
-                       streaming=False, data_type=data_type, order=order, nonblock=True)
-    y0 += h
+  Thin wrapper over prepare_h2d_chunked/send_h2d_chunked (kept for
+  run_single_spmv.py/run_host_driven_bfs.py, which don't need marshaling
+  and transfer isolated into separate timing windows)."""
+  prepared = prepare_h2d_chunked(A_hwl, height, width, elt_per_pe, dtype, max_bytes_per_call)
+  send_h2d_chunked(runner, dest_sym, prepared, width, elt_per_pe, data_type, order, nonblock)
 
 
 def oned_to_hwl_colmajor(height: int, width: int, pe_length: int, A_1d: np.ndarray, dtype):

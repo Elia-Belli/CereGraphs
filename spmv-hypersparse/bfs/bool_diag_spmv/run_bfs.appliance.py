@@ -94,11 +94,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "plo
 import plot_bfs_timing
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, check_round_vs_total_communication,
                          compute_m_and_gteps, decode_pe_phase_cycles, decode_phase_row,
-                         save_pe_phase_cycles)
+                         save_pe_phase_cycles, timed_transfer)
 from bfs_tree_plot import build_digraph, invalid_parents, render_tree_comparison
 from device_io import (csl_compile_core_appliance, derive_visited_from_parent,
-                        extract_parent_result, hwl_to_oned_colmajor, memcpy_h2d_chunked,
-                        single_source_seed_pe)
+                        extract_parent_result, hwl_to_oned_colmajor, prepare_h2d_chunked,
+                        send_h2d_chunked, single_source_seed_pe)
 
 from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder  # pylint: disable=import-error,no-name-in-module
 from cerebras.sdk.client import SdkRuntime  # pylint: disable=import-error,no-name-in-module
@@ -407,69 +407,80 @@ def main():
 
     # load()/run() are called by SdkRuntime's own __enter__ in appliance mode.
 
-    if need_timing:
-      print("enabling tsc...")
-      runner.launch("f_enable_tsc", nonblock=False)
-      print("timing h2d: matrix structure upload (Graph500-style 'construction')...")
-      runner.launch("f_sync_hostdevice", nonblock=False)
-      runner.launch("f_tic", nonblock=True)
-
-    memcpy_h2d_chunked(runner, sym_mat_rows_buf, mat_rows_buf, height, width, max_local_nnz,
-                       np.uint32, MemcpyDataType.MEMCPY_16BIT, MemcpyOrder.COL_MAJOR, True)
+    # All host-side marshaling for the matrix-structure upload happens here,
+    # BEFORE the timed bracket below -- see bfs_timing.timed_transfer's
+    # docstring for why this split (marshal fully, then transfer-only
+    # inside the tic/toc window) is load-bearing, not stylistic:
+    # hwl_to_oned_colmajor used to run interleaved between the memcpy_h2d
+    # calls, inside the window, contaminating h2d_matrix_span_cycles with
+    # host reshape time.
+    mat_rows_prepared = prepare_h2d_chunked(mat_rows_buf, height, width, max_local_nnz, np.uint32)
     mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
                                               np.uint32)
-    runner.memcpy_h2d(sym_mat_col_idx_buf, mat_col_idx_buf_1d, 0, 0, width, height,
-                       max_local_nnz_cols, streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=True)
     mat_col_loc_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_loc_buf,
                                               np.uint32)
-    runner.memcpy_h2d(sym_mat_col_loc_buf, mat_col_loc_buf_1d, 0, 0, width, height,
-                       max_local_nnz_cols, streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=True)
     mat_col_len_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_len_buf,
                                               np.uint32)
-    runner.memcpy_h2d(sym_mat_col_len_buf, mat_col_len_buf_1d, 0, 0, width, height,
-                       max_local_nnz_cols, streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=True)
     local_nnz_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz, np.uint32)
-    runner.memcpy_h2d(sym_local_nnz, local_nnz_1d, 0, 0, width, height, 1,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=True)
     local_nnz_cols_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz_cols, np.uint32)
-    runner.memcpy_h2d(sym_local_nnz_cols, local_nnz_cols_1d, 0, 0, width, height, 1,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=True)
     local_nnz_rows_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz_rows, np.uint32)
-    runner.memcpy_h2d(sym_local_nnz_rows, local_nnz_rows_1d, 0, 0, width, height, 1,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=not need_timing)
 
-    h2d_matrix_span_cycles = None
     if need_timing:
-      runner.launch("f_toc", nonblock=False)
-      h2d_matrix_span_cycles = read_sync_corrected_span_appliance(
-          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
+      print("enabling tsc...")
+      print("timing h2d: matrix structure upload (Graph500-style 'construction')...")
+
+    def _send_h2d_matrix():
+      send_h2d_chunked(runner, sym_mat_rows_buf, mat_rows_prepared, width, max_local_nnz,
+                       MemcpyDataType.MEMCPY_16BIT, MemcpyOrder.COL_MAJOR, nonblock=True)
+      runner.memcpy_h2d(sym_mat_col_idx_buf, mat_col_idx_buf_1d, 0, 0, width, height,
+                         max_local_nnz_cols, streaming=False,
+                         data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.COL_MAJOR,
+                         nonblock=True)
+      runner.memcpy_h2d(sym_mat_col_loc_buf, mat_col_loc_buf_1d, 0, 0, width, height,
+                         max_local_nnz_cols, streaming=False,
+                         data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.COL_MAJOR,
+                         nonblock=True)
+      runner.memcpy_h2d(sym_mat_col_len_buf, mat_col_len_buf_1d, 0, 0, width, height,
+                         max_local_nnz_cols, streaming=False,
+                         data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.COL_MAJOR,
+                         nonblock=True)
+      runner.memcpy_h2d(sym_local_nnz, local_nnz_1d, 0, 0, width, height, 1,
+                         streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                         order=MemcpyOrder.COL_MAJOR, nonblock=True)
+      runner.memcpy_h2d(sym_local_nnz_cols, local_nnz_cols_1d, 0, 0, width, height, 1,
+                         streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                         order=MemcpyOrder.COL_MAJOR, nonblock=True)
+      runner.memcpy_h2d(sym_local_nnz_rows, local_nnz_rows_1d, 0, 0, width, height, 1,
+                         streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
+                         order=MemcpyOrder.COL_MAJOR, nonblock=not need_timing)
+
+    h2d_matrix_span_cycles = timed_transfer(
+        runner, height, width, _send_h2d_matrix, need_timing=need_timing,
+        span_reader=read_sync_corrected_span_appliance,
+        sym_tsc_start=sym_tsc_start_buffer if need_timing else None,
+        sym_tsc_end=sym_tsc_end_buffer if need_timing else None,
+        sym_tsc_ref=sym_tsc_ref_buffer if need_timing else None,
+        enable_tsc=True)
+    if need_timing:
       print("timing h2d: seed x upload (Graph500-style per-search cost)...")
-      runner.launch("f_sync_hostdevice", nonblock=False)
-      runner.launch("f_tic", nonblock=True)
 
-    runner.memcpy_h2d(sym_x_bitmap, seed_local_x, seed_px, seed_py, 1, 1, bitmap_words,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
+    def _send_h2d_seed():
+      runner.memcpy_h2d(sym_x_bitmap, seed_local_x, seed_px, seed_py, 1, 1, bitmap_words,
+                         streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+                         order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
-    h2d_seed_span_cycles = None
-    if need_timing:
-      runner.launch("f_toc", nonblock=False)
-      h2d_seed_span_cycles = read_sync_corrected_span_appliance(
-          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
+    h2d_seed_span_cycles = timed_transfer(
+        runner, height, width, _send_h2d_seed, need_timing=need_timing,
+        span_reader=read_sync_corrected_span_appliance,
+        sym_tsc_start=sym_tsc_start_buffer if need_timing else None,
+        sym_tsc_end=sym_tsc_end_buffer if need_timing else None,
+        sym_tsc_ref=sym_tsc_ref_buffer if need_timing else None)
 
     print("running f_spmv_iter...")
     runner.launch("f_spmv_iter", nonblock=False)
 
     if need_timing:
       print("timing d2h readback (parent_local_buf -- the real BFS output)...")
-      runner.launch("f_sync_hostdevice", nonblock=False)
-      runner.launch("f_tic", nonblock=True)
 
     # Phase B of the on-device parent resolution plan: bool_pe.csl already
     # resolved each row's P per-PE candidates down to a single winner at
@@ -479,17 +490,21 @@ def main():
     # width=1 here, not width -- do not widen this back out. Root moved
     # from column 0 to MID to halve reduce_select_any's serial relay
     # critical path (see its own comment in bool_pe.csl/pe.csl).
+    # (Allocation moved out of the timed bracket below -- see timed_transfer.)
     parent_mid_col = width // 2
     parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
-    runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, parent_mid_col, 0, 1, height, blk,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
-    d2h_span_cycles = None
-    if need_timing:
-      runner.launch("f_toc", nonblock=False)
-      d2h_span_cycles = read_sync_corrected_span_appliance(
-          runner, sym_tsc_start_buffer, sym_tsc_end_buffer, sym_tsc_ref_buffer, height, width)
+    def _read_d2h_parent():
+      runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, parent_mid_col, 0, 1, height,
+                         blk, streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+                         order=MemcpyOrder.COL_MAJOR, nonblock=False)
+
+    d2h_span_cycles = timed_transfer(
+        runner, height, width, _read_d2h_parent, need_timing=need_timing,
+        span_reader=read_sync_corrected_span_appliance,
+        sym_tsc_start=sym_tsc_start_buffer if need_timing else None,
+        sym_tsc_end=sym_tsc_end_buffer if need_timing else None,
+        sym_tsc_ref=sym_tsc_ref_buffer if need_timing else None)
 
     rounds_buf = np.zeros(height * width, np.uint32)
     runner.memcpy_d2h(rounds_buf, sym_rounds_completed, 0, 0, width, height, 1,
