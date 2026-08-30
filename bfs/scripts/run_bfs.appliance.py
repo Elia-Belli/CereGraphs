@@ -86,11 +86,18 @@ from datetime import datetime, timezone
 
 import networkx as nx
 import numpy as np
+
+# This script lives in scripts/; device_io.py/graph_loader.py/preprocess_bool.py/
+# bfs_timing.py live in ../implementation/, plot_bfs_timing.py/bfs_tree_plot.py
+# in ../plots/ -- see run_bfs.py's matching comment.
+BFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BFS_ROOT, "implementation"))
+sys.path.insert(0, os.path.join(BFS_ROOT, "plots"))
+
 from graph_loader import load_graph
 from preprocess_bool import preprocess
 from scipy.sparse.csgraph import breadth_first_order
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots"))
 import plot_bfs_timing
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, check_round_vs_total_communication,
                          compute_m_and_gteps, decode_pe_phase_cycles, decode_phase_row,
@@ -177,7 +184,8 @@ def parse_args():
   parser.add_argument("--width-west-buf", default=0, type=int, help="width of west buffer")
   parser.add_argument("--width-east-buf", default=0, type=int, help="width of east buffer")
   parser.add_argument("--channels", default=1, type=int, help="number of I/O channels, 1-16")
-  parser.add_argument("--arch", help="wse2 or wse3 (default wse2)")
+  parser.add_argument("--arch", choices=["wse3"], default="wse3",
+                       help="WSE-3 only -- this kernel is no longer tested/supported on WSE-2")
   parser.add_argument("--latestlink", default="out/latest", help="folder for the compiled ELFs")
   parser.add_argument("--source", type=int, default=0, help="single BFS source vertex")
   parser.add_argument("--simulator", action="store_true",
@@ -337,7 +345,7 @@ def main():
   # Unlike run_bfs.py's code_csl (one joined absolute path), the appliance
   # client wants the containing directory and the bare filename separately
   # -- see csl_compile_core_appliance's own docstring.
-  csl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+  csl_dir = os.path.join(BFS_ROOT, "implementation", "src")
   csl_file = "layout_bool.csl"
 
   if args.compile_only:
@@ -571,8 +579,8 @@ def main():
           runner, sym_transpose_tic_buffer, sym_transpose_toc_buffer, height, width)
 
       # mpi_x.reduce_select_any()'s one-time end-of-run cost (Phase B of the
-      # on-device parent resolution plan) -- always fires once for
-      # is_iterative runs, unlike transpose_cycles' conditional switch.
+      # on-device parent resolution plan) -- always fires once per run,
+      # unlike transpose_cycles' conditional switch.
       parent_resolve_cycles = read_tic_toc_delta_appliance(
           runner, sym_parent_resolve_tic_buffer, sym_parent_resolve_toc_buffer, height, width)
       # Spatial (row, col) view -- see run_bfs.py's matching comment for why
@@ -637,7 +645,7 @@ def main():
   if not args.notree:
     matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
     out_tree = args.out_tree or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "plots",
+        BFS_ROOT, "results",
         "sim" if args.simulator else "hw", "tree",
         f"{matrix_stem}_{np_cols}x{np_rows}_src{source}.png")
     render_tree_comparison(
@@ -727,7 +735,7 @@ def main():
       matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
       run_id = f"{matrix_stem}_{np_cols}x{np_rows}_src{source}"
       pe_timing_out = args.pe_timing_out or os.path.join(
-          os.path.dirname(os.path.abspath(__file__)), "plots", "heatmap", run_id, f"{run_id}.npz")
+          BFS_ROOT, "results", "heatmap", run_id, f"{run_id}.npz")
       save_pe_phase_cycles(pe_timing_out, phase_cycles, {
           "infile_mtx": os.path.basename(infile_mtx),
           "pe_grid": f"{np_cols}x{np_rows}",
@@ -811,7 +819,7 @@ def main():
 
     csv_path = args.csv
     if csv_path is None:
-      csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results",
+      csv_path = os.path.join(BFS_ROOT, "results",
                                "sim" if args.simulator else "hw", "bfs_timing.csv")
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
     write_header = not os.path.exists(csv_path)
@@ -829,7 +837,7 @@ def main():
       writer.writerow(row)
     print(f"appended timing row to {csv_path}")
 
-    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots",
+    plots_dir = os.path.join(BFS_ROOT, "results",
                               "sim" if args.simulator else "hw")
     out_timing = args.out_timing or plot_bfs_timing.default_out_path(
         plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])

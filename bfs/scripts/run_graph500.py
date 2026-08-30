@@ -48,13 +48,18 @@ import time
 from datetime import datetime, timezone
 
 import numpy as np
+
+# This script lives in scripts/; device_io.py/graph_loader.py/preprocess_bool.py/
+# bfs_timing.py live in ../implementation/, bfs_tree_plot.py in ../plots/ --
+# see run_bfs.py's matching comment.
+BFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BFS_ROOT, "implementation"))
+sys.path.insert(0, os.path.join(BFS_ROOT, "plots"))
+
 from graph_loader import load_graph
 from preprocess_bool import preprocess
 from scipy.sparse.csgraph import breadth_first_order
 
-# bfs_tree_plot.py lives in plots/ now -- see that folder's own scripts for
-# the matching bootstrap back to this directory.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots"))
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, check_round_vs_total_communication,
                          compute_m_and_gteps, decode_phase_row, read_tic_toc_delta,
                          timed_transfer)
@@ -81,7 +86,8 @@ def parse_args():
   parser.add_argument("--channels", default=1, type=int, help="number of I/O channels, 1-16")
   parser.add_argument("-d", "--driver", help="path to the CSL compiler")
   parser.add_argument("--cmaddr", help="CM address and port, i.e. <IP>:<port>")
-  parser.add_argument("--arch", help="wse2 or wse3 (default wse2)")
+  parser.add_argument("--arch", choices=["wse3"], default="wse3",
+                       help="WSE-3 only -- this kernel is no longer tested/supported on WSE-2")
   parser.add_argument("--latestlink", default="out/latest", help="folder for the compiled ELFs")
 
   parser.add_argument("--num-searches", type=int, default=64,
@@ -120,8 +126,8 @@ def pick_sources(args, A_csc, n):
   # roots with degree >= 1, NOT COUNTING SELF-LOOPS -- a source with only a
   # self-loop (or no edges at all) can never discover anything new, so
   # m/GTEPS for it would be a meaningless divide-by-(effectively)-zero.
-  # row=dest/col=source (see generate_boolean_reference in
-  # run_single_spmv.py), so raw out-degree is the per-column nnz count;
+  # row=dest/col=source (this kernel's boolean semiring convention:
+  # y = OR_j (A[i,j] AND x[j])), so raw out-degree is the per-column nnz count;
   # subtract 1 for any column that also has a diagonal (self-loop) entry.
   # gen_rmat.py's own output never has self-loops, but an arbitrary
   # --infile_mtx (e.g. data/rand600.mtx) can.
@@ -238,7 +244,7 @@ def main():
   assert fabric_width >= min_fabric_width
   assert fabric_height >= min_fabric_height
 
-  code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "layout_bool.csl")
+  code_csl = os.path.join(BFS_ROOT, "implementation", "src", "layout_bool.csl")
 
   start = time.time()
   csl_compile_core(
@@ -496,8 +502,7 @@ def main():
         + ("" if is_symmetric else "  -- directed graph: not Graph500-spec-comparable, "
                                     "see m_convention"))
 
-  csv_path = args.csv or os.path.join(os.path.dirname(os.path.abspath(__file__)), "results",
-                                       "sim", "graph500_searches.csv")
+  csv_path = args.csv or os.path.join(BFS_ROOT, "results", "sim", "graph500_searches.csv")
   os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
   write_header = not os.path.exists(csv_path)
   if not write_header:
@@ -515,7 +520,7 @@ def main():
   print(f"appended {len(search_rows)} per-search rows to {csv_path}")
 
   summary_csv_path = args.summary_csv or os.path.join(
-      os.path.dirname(os.path.abspath(__file__)), "results", "sim", "graph500_summary.csv")
+      BFS_ROOT, "results", "sim", "graph500_summary.csv")
   os.makedirs(os.path.dirname(os.path.abspath(summary_csv_path)), exist_ok=True)
   write_header = not os.path.exists(summary_csv_path)
   if not write_header:

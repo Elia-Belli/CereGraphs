@@ -8,7 +8,7 @@
 # RMAT s20, n=1,049,250 -- see grow_sweep.log) shouldn't skip the others.
 # Each graph's outcome (OK / FAILED + why) is logged independently.
 #
-# Usage: ./bfs/bool_diag_spmv/run_snap_sweep.sh
+# Usage: ./bfs/scripts/run_snap_sweep.sh
 #
 # Order below is smallest-predicted-d2h-transfer first (d2h total size for
 # this kernel's parent_local_buf readback is ~ grid_width * n * 4 bytes,
@@ -22,12 +22,12 @@ set -uo pipefail
 
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
 
-LOG="bfs/bool_diag_spmv/run_snap_sweep.log"
+LOG="bfs/scripts/run_snap_sweep.log"
 GRID=750
 SOURCE=0
 CHANNELS=16
 ARCH=wse3
-RUN_SCRIPT="bfs/bool_diag_spmv/run_bfs.appliance.py"
+RUN_SCRIPT="bfs/scripts/run_bfs.appliance.py"
 
 export no_proxy="10.125.8.2,.cerebras.internal,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
 export NO_PROXY="$no_proxy"
@@ -55,8 +55,8 @@ for name in "${NAMES[@]}"; do
 
   matrix_base="$(basename "$matrix" .mtx)"
   OUT_ARGS=(
-    "--csv=bfs/bool_diag_spmv/results/hw/bfs_timing.csv"
-    "--out-timing=bfs/bool_diag_spmv/plots/hw/timing/timing_${matrix_base}_${GRID}x${GRID}_src${SOURCE}_ch${CHANNELS}.png"
+    "--csv=bfs/results/hw/bfs_timing.csv"
+    "--out-timing=bfs/results/hw/timing/timing_${matrix_base}_${GRID}x${GRID}_src${SOURCE}_ch${CHANNELS}.png"
   )
 
   log "compiling $name (writes artifact_path.json)"

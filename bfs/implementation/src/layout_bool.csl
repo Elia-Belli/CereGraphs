@@ -1,8 +1,8 @@
-// Boolean, diagonal-reduce SpMV (one iteration). Modeled on
-// gemv-collectives_2d/layout.csl: uses <collectives_2d> for all PE-to-PE
-// communication instead of hand-rolled routing, so there's no separate
-// per-module layout.csl the way hypersparse_spmv has one -- bool_pe.csl is
-// the whole per-PE kernel.
+// Boolean, diagonal-reduce SpMV, iterated on-device into a full BFS
+// (f_spmv_iter). Modeled on gemv-collectives_2d/layout.csl: uses
+// <collectives_2d> for all PE-to-PE communication instead of hand-rolled
+// routing, so there's no separate per-module layout.csl the way
+// hypersparse_spmv has one -- bool_pe.csl is the whole per-PE kernel.
 //
 // color/task-id map (mirrors the convention in gemv-collectives_2d/layout.csl)
 //   0 c2d_x_color_0    10 compute_task_id           18 term_row_bcast_done_task_id
@@ -23,20 +23,18 @@ param max_local_nnz: u16;
 param max_local_nnz_cols: u16;
 param max_local_nnz_rows: u16;
 // upper bound on f_spmv_iter rounds profiled by ts_buf (see bool_pe.csl) --
-// defaulted so existing callers (run_single_spmv.py/run_host_driven_bfs.py)
-// that don't care about per-round timing don't need to pass anything;
-// run_bfs.py overrides it explicitly.
+// defaulted so callers that don't care about per-round timing don't need to
+// pass anything; run_bfs.py overrides it explicitly.
 param max_rounds: u16 = 10;
 // direction-optimizing BFS switch threshold (see bool_pe.csl's own comment) --
-// defaulted effectively unreachable so existing callers that don't pass it
-// keep today's pure-top-down behavior unchanged; run_bfs.py-class callers
-// override it with a real fraction of n. u32 (not f32) since cslc's
-// --params CLI flag only accepts unsigned integers.
+// defaulted effectively unreachable so callers that don't pass it keep
+// pure-top-down behavior; run_bfs.py-class callers override it with a real
+// fraction of n. u32 (not f32) since cslc's --params CLI flag only accepts
+// unsigned integers.
 param tau_switch_count: u32 = 4294967295;
 // A/B/C switch for the two sparse reduce_select_any counterparts -- see
 // bool_pe.csl's own param comment. Defaulted to 0 (dense, the production
-// path) so existing callers that don't pass it keep today's behavior
-// unchanged.
+// path) so callers that don't pass it keep today's behavior unchanged.
 param parent_resolve_variant: u16 = 0;
 
 comptime {
@@ -117,7 +115,6 @@ layout {
     @export_name("nf_history", [*]u32, true);
     @export_name("direction_history", [*]u16, true);
 
-    @export_name("f_spmv", fn()void);
     @export_name("f_spmv_iter", fn()void);
     @export_name("f_enable_tsc", fn()void);
     @export_name("f_tic", fn()void);

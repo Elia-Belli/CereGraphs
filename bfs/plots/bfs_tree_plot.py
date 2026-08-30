@@ -15,10 +15,9 @@ import numpy as np
 
 
 def build_digraph(A_csr):
-  """A_csr is row=dest/col=source (bool_diag_spmv's convention -- see
-  generate_boolean_reference in run_single_spmv.py): edge col->row is the
-  real adjacency direction. Self-loops are dropped, they'd just clutter the
-  picture and never contribute to a BFS tree."""
+  """A_csr is row=dest/col=source (bool_diag_spmv's convention: edge
+  col->row is the real adjacency direction). Self-loops are dropped,
+  they'd just clutter the picture and never contribute to a BFS tree."""
   G = nx.DiGraph()
   G.add_nodes_from(range(A_csr.shape[0]))
   coo = A_csr.tocoo()
@@ -174,8 +173,7 @@ def plot_panel(ax, G, pos, parent, visited, source, mismatch, title, extra_label
 def invalid_parents(parent, visited_arr, A_csr, source):
   """Nodes whose recorded parent isn't a valid BFS predecessor -- visited,
   and a real edge in the ORIGINAL matrix (A_csr[v, u] != 0, per
-  bool_diag_spmv's row=dest/col=source convention -- see
-  generate_boolean_reference in run_single_spmv.py). This is
+  bool_diag_spmv's row=dest/col=source convention). This is
   sdk-hypersparse-spmv-bfs/run_bfs.py's own verify_bfs() definition of "valid", deliberately
   NOT an exact-parent match against scipy's breadth_first_order: scipy picks
   its own arbitrary valid predecessor when a node has several, using a

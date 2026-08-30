@@ -1,5 +1,5 @@
 """ Format-agnostic graph-matrix loading shared by bool_diag_spmv's scripts
-  (run_bfs.py, run_single_spmv.py, run_host_driven_bfs.py, run_graph500.py) --
+  (run_bfs.py, run_bfs.appliance.py, run_graph500.py) --
   each used to call scipy.io.mmread(infile_mtx) directly and assume Matrix
   Market. load_graph adds a second format: a SNAP-style edge list (plain
   whitespace/tab-separated "src dst" pairs, '#'-prefixed comment lines,

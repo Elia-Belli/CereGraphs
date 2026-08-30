@@ -1,6 +1,6 @@
 """ Shared host<->device data-marshaling helpers for bool_diag_spmv's scripts
-  (run_single_spmv.py, run_host_driven_bfs.py, run_bfs.py) -- the low-level
-  hwl<->1d layout conversions, diagonal/parent result extraction, and the
+  (run_bfs.py, run_bfs.appliance.py, run_graph500.py) -- the low-level
+  hwl<->1d layout conversions, parent result extraction, and the
   cslc invocation, none of which are specific to any one script's purpose.
 """
 
@@ -55,14 +55,24 @@ _H2D_MAX_MESSAGE_LENGTH = (1024**3 * 2) - 1024
 
 def prepare_h2d_chunked(A_hwl: np.ndarray, height: int, width: int, elt_per_pe: int, dtype,
                         max_bytes_per_call: int = 1_610_612_736):
-  """Pure-marshaling half of memcpy_h2d_chunked: does every hwl_to_oned_colmajor
-  call (including the chunked path's per-row-band slicing) up front and
-  performs no device I/O, so this can run entirely outside a
-  bfs_timing.timed_transfer bracket -- keeping host-side reshape cost out of
-  a transfer-time measurement. Returns a list of (y0, h, chunk_1d) tuples
-  consumed by send_h2d_chunked below; for the common single-chunk case this
-  is a 1-element list with y0=0, h=height. See memcpy_h2d_chunked's own
-  docstring for why chunking happens along the PE-row axis."""
+  """Pure-marshaling half of the h2d-chunking split (paired with
+  send_h2d_chunked below): does every hwl_to_oned_colmajor call (including
+  the chunked path's per-row-band slicing) up front and performs no device
+  I/O, so this can run entirely outside a bfs_timing.timed_transfer
+  bracket -- keeping host-side reshape cost out of a transfer-time
+  measurement. Splits large transfers into multiple PE-row-band chunks,
+  each safely under the ~2GiB gRPC message-size ceiling -- works around a
+  real ceiling this repo hit uploading mat_rows_buf for graphs with high
+  per-PE nonzero skew (berkstan, orkut; see docs/ERRORS.md #4).
+  max_bytes_per_call (default 1.5GiB, real margin under the 2,147,482,624-
+  byte ceiling -- not the vendor chunker's near-zero margin). Chunks along
+  the PE-row (`height`) axis, not `elt_per_pe` -- x/y are documented,
+  precedented origin offsets in this codebase (the reduce_select_any d2h
+  fix already narrows `w`); a nonzero starting offset into elt_per_pe has
+  no precedent here and is unverified, so this is the lower-risk axis to
+  split on. Returns a list of (y0, h, chunk_1d) tuples consumed by
+  send_h2d_chunked below; for the common single-chunk case this is a
+  1-element list with y0=0, h=height."""
   total_bytes = _H2D_WIRE_ITEMSIZE * height * width * elt_per_pe
   if total_bytes <= max_bytes_per_call:
     return [(0, height, hwl_to_oned_colmajor(height, width, elt_per_pe, A_hwl, dtype))]
@@ -81,7 +91,7 @@ def prepare_h2d_chunked(A_hwl: np.ndarray, height: int, width: int, elt_per_pe: 
 
 def send_h2d_chunked(runner, dest_sym, prepared, width: int, elt_per_pe: int, data_type, order,
                      nonblock: bool):
-  """Pure-transfer half of memcpy_h2d_chunked: issues runner.memcpy_h2d for
+  """Pure-transfer half of the h2d-chunking split: issues runner.memcpy_h2d for
   each (y0, h, chunk_1d) produced by prepare_h2d_chunked above, with no numpy
   work -- safe to call from inside a bfs_timing.timed_transfer closure.
   Multi-chunk bands are always nonblock=True except the last, which takes
@@ -96,30 +106,6 @@ def send_h2d_chunked(runner, dest_sym, prepared, width: int, elt_per_pe: int, da
                        nonblock=nonblock if i == last else True)
 
 
-def memcpy_h2d_chunked(runner, dest_sym, A_hwl: np.ndarray, height: int, width: int,
-                       elt_per_pe: int, dtype, data_type, order, nonblock: bool,
-                       max_bytes_per_call: int = 1_610_612_736):
-  """memcpy_h2d wrapper that splits large transfers into multiple PE-row-band
-  calls, each safely under the ~2GiB gRPC message-size ceiling -- works
-  around a real ceiling this repo hit uploading mat_rows_buf for graphs
-  with high per-PE nonzero skew (berkstan, orkut; see docs/ERRORS.md #4). Below
-  max_bytes_per_call (default 1.5GiB, real margin under the 2,147,482,624-
-  byte ceiling -- not the vendor chunker's near-zero margin), this is a
-  single unchanged memcpy_h2d call, identical to every pre-existing caller.
-
-  Chunks along the PE-row (`height`) axis, not `elt_per_pe` -- x/y are
-  documented, precedented origin offsets in this codebase (the
-  reduce_select_any d2h fix already narrows `w`); a nonzero starting offset
-  into elt_per_pe has no precedent here and is unverified, so this is the
-  lower-risk axis to split on.
-
-  Thin wrapper over prepare_h2d_chunked/send_h2d_chunked (kept for
-  run_single_spmv.py/run_host_driven_bfs.py, which don't need marshaling
-  and transfer isolated into separate timing windows)."""
-  prepared = prepare_h2d_chunked(A_hwl, height, width, elt_per_pe, dtype, max_bytes_per_call)
-  send_h2d_chunked(runner, dest_sym, prepared, width, elt_per_pe, data_type, order, nonblock)
-
-
 def oned_to_hwl_colmajor(height: int, width: int, pe_length: int, A_1d: np.ndarray, dtype):
   """
     Given a 1-D tensor A_1d[height*width*pe_length], transform it to
@@ -128,20 +114,6 @@ def oned_to_hwl_colmajor(height: int, width: int, pe_length: int, A_1d: np.ndarr
   assert dtype == np.float32, "only support f32 readback for this kernel"
   assert A_1d.dtype == np.float32, "only support f32 to f32"
   return np.reshape(A_1d, (height, width, pe_length), order="F")
-
-
-# x is boolean, length n. Only the diagonal PE of each column (py == px)
-# gets a real slice; every other PE starts at zero and receives the
-# broadcast from phase 1. This replaces hypersparse_spmv's dist_x_to_hwl,
-# which spread x across every PE in a column.
-def dist_x_to_diag_hwl(n, x_bool, blk, P):
-  x_pad = np.zeros(P * blk, dtype=np.float32)
-  x_pad[0:n] = x_bool.astype(np.float32)
-
-  x_hwl = np.zeros((P, P, blk), dtype=np.float32)
-  for p in range(P):
-    x_hwl[(p, p)] = x_pad[p * blk:(p + 1) * blk]
-  return x_hwl
 
 
 def single_source_seed_pe(source, blk, P):
@@ -165,53 +137,15 @@ def single_source_seed_pe(source, blk, P):
   column-broadcast, in visited_bcast_done(), before compute() ever reads
   it).
 
-  Only valid for this single-source, f_spmv_iter case -- NOT for
-  run_host_driven_bfs.py's multi-source frontier (several diagonal PEs can
-  be genuinely live at once there) or run_single_spmv.py's one-shot
-  f_spmv (which never touches x_bitmap itself, so has no such self-zeroing
-  invariant)."""
+  Only valid for this single-source case -- a multi-source frontier (several
+  diagonal PEs genuinely live at once) would need a different seeding
+  approach entirely."""
   p = source // blk
   bitmap_words = (blk + 31) // 32
   local_x = np.zeros(bitmap_words, dtype=np.uint32)
   local_idx = source % blk
   local_x[local_idx >> 5] = np.uint32(1) << (local_idx & 31)
   return p, p, local_x
-
-
-def pack_dense_to_bitmap(height, width, blk, dense_hwl):
-  """Inverse of unpack_bitmap_to_dense: dense_hwl is a (height, width, blk)
-  float32/bool array (0.0/1.0 or False/True); returns a (height, width,
-  bitmap_words) uint32 array packed the same way bool_pe.csl's
-  x_bitmap/y_bitmap/visited_bitmap are (bit k of word k>>5, bit position
-  k&31)."""
-  bitmap_words = (blk + 31) // 32
-  bitmap = np.zeros((height, width, bitmap_words), dtype=np.uint32)
-  bits = dense_hwl != 0
-  for k in range(blk):
-    bitmap[:, :, k >> 5] |= bits[:, :, k].astype(np.uint32) << (k & 31)
-  return bitmap
-
-
-# Extract the diagonal PEs' y_bitmap_reduced (the only ones holding a
-# meaningful final result) and reassemble into the length-n boolean output
-# vector.
-def extract_diag_result(n, blk, P, y_hwl):
-  parts = [y_hwl[(p, p)] for p in range(P)]
-  y_pad = np.concatenate(parts)
-  return y_pad[0:n] > 0.0
-
-
-def unpack_bitmap_to_dense(height, width, blk, bitmap_hwl):
-  """bitmap_hwl: (height, width, bitmap_words) uint32, bit k of word (k>>5)
-  at bit position (k&31) -- bool_pe.csl's y_bitmap/y_bitmap_reduced layout
-  exactly (see its own declaration comment there). Returns a dense
-  (height, width, blk) float32 array (0.0/1.0), matching the dtype
-  extract_diag_result already assumes, so callers can feed the result
-  straight into extract_diag_result unchanged."""
-  dense = np.zeros((height, width, blk), dtype=np.float32)
-  for k in range(blk):
-    dense[:, :, k] = ((bitmap_hwl[:, :, k >> 5] >> (k & 31)) & 1).astype(np.float32)
-  return dense
 
 
 # Must match bool_pe.csl's PARENT_NONE exactly. Phase A of the on-device
@@ -369,9 +303,9 @@ def csl_compile_core_appliance(
   3-argument version, which appears to be from a different/older SDK
   build than the one this was verified against.
 
-  Local import: this module is also imported by run_bfs.py/
-  run_single_spmv.py/run_host_driven_bfs.py, which only ever run against
-  the simulator and don't have (or need) cerebras.sdk.client installed.
+  Local import: this module is also imported by run_bfs.py, which only
+  ever runs against the simulator and doesn't have (or need)
+  cerebras.sdk.client installed.
 
   fabric_width/fabric_height are passed through as given -- the CALLER
   decides whether these are minimal simulator-sized dims or the real

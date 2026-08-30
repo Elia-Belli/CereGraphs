@@ -25,7 +25,7 @@
 #
 #   screen -dmS rmat_grid_sweep bash -c \
 #     'source /home/elia/cs_appliance_sdk/bin/activate && \
-#      /home/elia/CereGraphs/spmv-hypersparse/bfs/bool_diag_spmv/rmat_grid_sweep.sh'
+#      /home/elia/CereGraphs/bfs/scripts/rmat_grid_sweep.sh'
 #   screen -r rmat_grid_sweep      # reattach to watch
 #   Ctrl-A D                       # detach again without killing it
 #
@@ -36,12 +36,16 @@ set -uo pipefail
 
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
 
-LOG="bfs/bool_diag_spmv/rmat_grid_sweep.log"
-CSV="bfs/bool_diag_spmv/results/hw/bfs_timing.csv"
+# util/analyze is a native binary, not committed -- build (or rebuild, if
+# stale) it for this node's toolchain before the sweep's first use.
+make -C util
+
+LOG="bfs/scripts/rmat_grid_sweep.log"
+CSV="bfs/results/hw/bfs_timing.csv"
 EDGEFACTOR=16
 SOURCE=0
 ARCH=wse3
-RUN_SCRIPT="bfs/bool_diag_spmv/run_bfs.appliance.py"
+RUN_SCRIPT="bfs/scripts/run_bfs.appliance.py"
 SCALES=(10 11 12 13 14 15 16 17 18 19 20)
 GRIDS=(4 8 16 32 64 128 256 512 750)
 MAX_LINKER_RETRIES=2
@@ -103,7 +107,7 @@ run_case() {
   matrix_base="$(basename "$matrix" .mtx)"
   local OUT_ARGS=(
     "--csv=${CSV}"
-    "--out-timing=bfs/bool_diag_spmv/plots/hw/timing/timing_${matrix_base}_${grid}x${grid}_src${SOURCE}_ch${channels}.png"
+    "--out-timing=bfs/results/hw/timing/timing_${matrix_base}_${grid}x${grid}_src${SOURCE}_ch${channels}.png"
   )
 
   local attempt=0

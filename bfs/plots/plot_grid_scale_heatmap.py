@@ -13,7 +13,7 @@ is append-only; a matrix file can be rebalanced and rerun under the same
 (infile_mtx, pe_grid) key).
 
 Usage: cs_python plots/plot_grid_scale_heatmap.py
-         [--csv=results/hw/timings_heatmap.csv] [--out=plots/hw/heatmap/rmat_grid_scale.svg]
+         [--csv=results/hw/timings_heatmap.csv] [--out=results/hw/heatmap/rmat_grid_scale.svg]
 
 SVG only, no PNG -- this is a poster/report figure meant to be embedded and
 rescaled as vector output, not viewed as a standalone raster image (same
@@ -230,8 +230,8 @@ def main():
   p = argparse.ArgumentParser()
   p.add_argument("--csv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                                                 "results", "hw", "timings_heatmap.csv"))
-  p.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                "hw", "heatmap", "rmat_grid_scale.svg"))
+  p.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                                                "results", "hw", "heatmap", "rmat_grid_scale.svg"))
   args = p.parse_args()
 
   by_key = load_rows(args.csv)

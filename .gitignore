@@ -20,4 +20,5 @@ latest/
 
 *.o
 spmv-hypersparse/util/analyze
+/util/analyze
 clean.sh

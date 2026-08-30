@@ -57,9 +57,9 @@
   produces the plot without a separate manual step. It's also runnable
   standalone, to re-plot an existing CSV row without re-running the device:
 
-  How to run (from bool_diag_spmv/, or use --csv's own default: ../results/bfs_timing.csv)
-     python3 plots/plot_bfs_timing.py --csv results/bfs_timing.csv --row -1
-     python3 plots/plot_bfs_timing.py --csv results/bfs_timing.csv --infile_mtx rand600.mtx --pe_grid 8x8
+  How to run (from bool_diag_spmv/, or use --csv's own default: ../results/sim/bfs_timing.csv)
+     python3 plots/plot_bfs_timing.py --csv ../results/sim/bfs_timing.csv --row -1
+     python3 plots/plot_bfs_timing.py --csv ../results/sim/bfs_timing.csv --infile_mtx rand600.mtx --pe_grid 8x8
 """
 
 import argparse
@@ -71,11 +71,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
 
-# bfs_timing.py lives one directory up (bool_diag_spmv/, this script's own
-# parent) -- add it to sys.path so this import works whether this script is
-# run standalone or imported by run_bfs.py (which already adds plots/ to
-# its own sys.path, see its own top-of-file comment).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# bfs_timing.py lives in ../implementation/ (a sibling of this script's own
+# plots/ directory) -- add it to sys.path so this import works whether this
+# script is run standalone or imported by run_bfs.py (which already adds
+# implementation/ to its own sys.path, see its own top-of-file comment).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "implementation"))
 from bfs_timing import H2D_PARTS  # pylint: disable=wrong-import-position
 
 # dataviz skill's validated categorical palette (references/palette.md) --
@@ -208,18 +209,18 @@ STAT_TICK_HANDLES = [
 def results_variant(csv_path):
   """"hw" if csv_path resolves under a results/hw/ directory, else "sim"
   (covers both this script's own default and run_bfs.py's) -- lets
-  default_out_path's caller route into the matching plots/hw or plots/sim
-  subfolder instead of a stray top-level one."""
+  default_out_path's caller route into the matching results/hw or
+  results/sim subfolder instead of a stray top-level one."""
   return "hw" if "hw" in os.path.normpath(os.path.abspath(csv_path)).split(os.sep) else "sim"
 
 
-def default_out_path(plots_dir, matrix, pe_grid, source, channels):
-  """plots_dir: the plots/hw or plots/sim folder (see results_variant) --
-  this script's own plots/<variant> when called from here, bool_diag_spmv/
-  plots/<variant> when called from run_bfs.py, which lives one directory up
-  from here)."""
+def default_out_path(results_dir, matrix, pe_grid, source, channels):
+  """results_dir: the results/hw or results/sim folder (see
+  results_variant) -- this script's own ../results/<variant> when called
+  from here, bool_diag_spmv/results/<variant> when called from run_bfs.py,
+  a sibling of that script's own scripts/ directory."""
   matrix_stem = os.path.splitext(matrix)[0]
-  timing_dir = os.path.join(plots_dir, "timing")
+  timing_dir = os.path.join(results_dir, "timing")
   return os.path.join(timing_dir, f"timing_{matrix_stem}_{pe_grid}_src{source}_ch{channels}.png")
 
 
@@ -469,7 +470,7 @@ def parse_args(parser=None):
   parser.add_argument("--channels", type=int, default=None,
                        help="filter to rows with this --channels value (bench_timing.py's I/O "
                             "channel count)")
-  parser.add_argument("--out", default=None, help="output PNG path (default: plots/<hw|sim>/"
+  parser.add_argument("--out", default=None, help="output PNG path (default: results/<hw|sim>/"
                                                     "timing/timing_<matrix>_<grid>_src<N>.png, "
                                                     "hw vs sim matching --csv, see results_variant)")
   return parser.parse_args()
@@ -528,9 +529,10 @@ def main():
     rows = list(csv.DictReader(f))
 
   row = select_row(rows, args)
-  plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), results_variant(csv_path))
+  results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "results", results_variant(csv_path))
   out_path = args.out or default_out_path(
-      plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
+      results_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])
   plot_timing_row(row, out_path)
 
 

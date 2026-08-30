@@ -7,21 +7,17 @@
   1. **tree** (default on, --notree to skip): a two-panel plot comparing
      the on-device BFS tree against scipy.sparse.csgraph.breadth_first_order,
      a fully independent reference (see bfs_tree_plot.py). Saved to
-     plots/tree/.
+     results/<hw|sim>/tree/.
   2. **correctness** (default on, --nocorrectness to skip): prints the same
      scipy cross-check as (1) as numbers -- visited-set mismatches, invalid
      parents, tie-break differences from scipy's own pick -- without
-     needing the plot. This is a single-source, real-BFS-shaped check;
-     run_host_driven_bfs.py (formerly test_iterative.py) is the *stress
-     test* for the iterative machinery itself (random multi-source
-     frontier, checked bit-for-bit against a host-driven baseline) and is
-     intentionally kept as its own separate script, not folded in here.
+     needing the plot. This is a single-source, real-BFS-shaped check.
   3. **timing** (default on, --notimings to skip): per-round phase cycle
      counts (bfs_timing.py/record_ts()), h2d/d2h transfer cycles, and a
      Graph500-style GTEPS estimate (see docs/GRAPH500_BENCHMARK.md) -- appended
      as one row to bfs_timing.csv, plus the per-round stacked-bar plot
      (plot_bfs_timing.py, h2d/rounds/d2h/local_compute-split panels side by
-     side in one PNG) saved to plots/<hw|sim>/timing/ (hw vs sim matching
+     side in one PNG) saved to results/<hw|sim>/timing/ (hw vs sim matching
      --csv, see plot_bfs_timing.results_variant).
 
   Replaces plot_bfs_tree.py and bench_timing.py (deleted -- this script
@@ -32,12 +28,12 @@
   rendering), plot_bfs_timing.py (timing bar chart, also still runnable
   standalone against an existing CSV row).
 
-  How to compile and run
-     cs_python run_bfs.py --arch=wse3 --num_pe_cols=8 --num_pe_rows=8
+  How to compile and run (from the repo root)
+     cs_python bfs/scripts/run_bfs.py --arch=wse3 --num_pe_cols=8 --num_pe_rows=8
         --channels=1 --driver=<path to cslc> --infile_mtx=<path to mtx file>
         --source=0
-     cs_python run_bfs.py ... --notree                 # timing + correctness only
-     cs_python run_bfs.py ... --notimings --nocorrectness  # tree only
+     cs_python bfs/scripts/run_bfs.py ... --notree                 # timing + correctness only
+     cs_python bfs/scripts/run_bfs.py ... --notimings --nocorrectness  # tree only
 """
 
 import argparse
@@ -50,15 +46,19 @@ from datetime import datetime, timezone
 
 import networkx as nx
 import numpy as np
+
+# This script lives in scripts/; device_io.py/graph_loader.py/preprocess_bool.py/
+# bfs_timing.py live in ../implementation/, plot_bfs_timing.py/bfs_tree_plot.py
+# in ../plots/ -- add both to sys.path so the plain imports below resolve
+# regardless of them being sibling directories, not this same one.
+BFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BFS_ROOT, "implementation"))
+sys.path.insert(0, os.path.join(BFS_ROOT, "plots"))
+
 from graph_loader import load_graph
 from preprocess_bool import preprocess
 from scipy.sparse.csgraph import breadth_first_order
 
-# plot_bfs_timing.py/bfs_tree_plot.py live in plots/ (see that folder's own
-# scripts for the matching bootstrap back to this directory) -- add it to
-# sys.path so the plain imports below keep working regardless of it being a
-# sibling directory now, not this same one.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots"))
 import plot_bfs_timing
 from bfs_timing import (CLOCK_FREQ_HZ, NUM_TS_SLOTS, check_round_vs_total_communication,
                          compute_m_and_gteps, decode_pe_phase_cycles, decode_phase_row,
@@ -96,7 +96,8 @@ def parse_args():
   parser.add_argument("--channels", default=1, type=int, help="number of I/O channels, 1-16")
   parser.add_argument("-d", "--driver", help="path to the CSL compiler")
   parser.add_argument("--cmaddr", help="CM address and port, i.e. <IP>:<port>")
-  parser.add_argument("--arch", help="wse2 or wse3 (default wse2)")
+  parser.add_argument("--arch", choices=["wse3"], default="wse3",
+                       help="WSE-3 only -- this kernel is no longer tested/supported on WSE-2")
   parser.add_argument("--latestlink", default="out/latest", help="folder for the compiled ELFs")
   parser.add_argument("--source", type=int, default=0, help="single BFS source vertex")
 
@@ -123,13 +124,14 @@ def parse_args():
                             "pre-direction-optimizing kernel.")
   parser.add_argument("--csv", default=None,
                        help="CSV file to append this run's timing row to "
-                            "(default: results/sim/bfs_timing.csv next to this script)")
+                            "(default: results/sim/bfs_timing.csv, a sibling of this script's "
+                            "own scripts/ directory)")
   parser.add_argument("--out-tree", default=None,
-                       help="tree plot output path (default: plots/<hw|sim>/tree/<matrix>_<grid>_"
+                       help="tree plot output path (default: results/<hw|sim>/tree/<matrix>_<grid>_"
                             "src<N>.png, hw vs sim matching --csv, see plot_bfs_timing."
                             "results_variant)")
   parser.add_argument("--out-timing", default=None,
-                       help="timing plot output path (default: plots/<hw|sim>/timing/timing_"
+                       help="timing plot output path (default: results/<hw|sim>/timing/timing_"
                             "<matrix>_<grid>_src<N>_ch<C>.png, hw vs sim matching --csv)")
   parser.add_argument("--no-show-parent-mismatch", dest="show_parent_mismatch",
                        action="store_false",
@@ -145,7 +147,7 @@ def parse_args():
                             "(default off -- diagnostic only, for plot_pe_heatmap.py; not part "
                             "of the default tree/timing/correctness reports)")
   parser.add_argument("--pe-timing-out", default=None,
-                       help="path for --dump-pe-timing's .npz output (default: plots/<hw|sim>/"
+                       help="path for --dump-pe-timing's .npz output (default: results/<hw|sim>/"
                             "heatmap/<matrix>_<grid>_src<N>/<matrix>_<grid>_src<N>.npz -- the same "
                             "per-run folder plot_pe_heatmap.py renders its PNGs into; hw vs sim "
                             "matching --csv)")
@@ -156,11 +158,11 @@ def parse_args():
 
 
 def _default_csv_path():
-  """results/sim/bfs_timing.csv, next to this script -- a hw run always
-  passes --csv explicitly (see plot_bfs_timing_poster.py's default_out_path
-  docstring), so this default is sim-only."""
-  return os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "sim",
-                       "bfs_timing.csv")
+  """results/sim/bfs_timing.csv, a sibling of this script's own scripts/
+  directory -- a hw run always passes --csv explicitly (see
+  plot_bfs_timing_poster.py's default_out_path docstring), so this default
+  is sim-only."""
+  return os.path.join(BFS_ROOT, "results", "sim", "bfs_timing.csv")
 
 
 def main():
@@ -252,9 +254,9 @@ def main():
     print(f"--directional: tau_switch_count = {tau_switch_count} "
           f"({DEFAULT_TAU_SWITCH_FRAC * 100:.0f}% of n={n})")
 
-  # single-source seed -- a real BFS workload, not run_host_driven_bfs.py's
-  # random ~50%-density stress frontier (which would mask most rounds'
-  # costs behind one giant first round, and wouldn't be a single tree).
+  # single-source seed -- a real BFS workload, not a dense multi-source
+  # frontier (which would mask most rounds' costs behind one giant first
+  # round, and wouldn't be a single tree).
   # Only the one diagonal PE owning `source` needs a real host write -- see
   # single_source_seed_pe()'s own docstring for why every other PE's x_bitmap
   # is already provably zero.
@@ -279,7 +281,7 @@ def main():
   assert fabric_width >= min_fabric_width
   assert fabric_height >= min_fabric_height
 
-  code_csl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "layout_bool.csl")
+  code_csl = os.path.join(BFS_ROOT, "implementation", "src", "layout_bool.csl")
 
   start = time.time()
   csl_compile_core(
@@ -508,7 +510,7 @@ def main():
 
     # mpi_x.reduce_select_any()'s one-time end-of-run cost (Phase B of the
     # on-device parent resolution plan) -- unlike transpose_cycles this is
-    # NOT conditional (always fires once for is_iterative runs), so no
+    # NOT conditional (always fires once per run), so no
     # "did it fire" zero-check is needed here.
     parent_resolve_cycles = read_tic_toc_delta(
         runner, sym_parent_resolve_tic_buffer, sym_parent_resolve_toc_buffer, height, width)
@@ -584,7 +586,7 @@ def main():
   if not args.notree:
     matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
     out_tree = args.out_tree or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "plots",
+        BFS_ROOT, "results",
         plot_bfs_timing.results_variant(args.csv or _default_csv_path()), "tree",
         f"{matrix_stem}_{np_cols}x{np_rows}_src{source}.png")
     render_tree_comparison(
@@ -681,7 +683,7 @@ def main():
 
       matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
       run_id = f"{matrix_stem}_{np_cols}x{np_rows}_src{source}"
-      # lives inside plots/<hw|sim>/heatmap/<run_id>/ -- the same per-run
+      # lives inside results/<hw|sim>/heatmap/<run_id>/ -- the same per-run
       # folder plot_pe_heatmap.py renders its PNGs into (it derives that
       # folder from wherever this .npz actually is, see its
       # default_run_dir()), so the raw data and its plots stay together as
@@ -690,7 +692,7 @@ def main():
       # results/sim (see plot_bfs_timing.results_variant), not a hardcoded
       # guess -- so this stays consistent with out_timing's default below.
       pe_timing_out = args.pe_timing_out or os.path.join(
-          os.path.dirname(os.path.abspath(__file__)), "plots",
+          BFS_ROOT, "results",
           plot_bfs_timing.results_variant(args.csv or _default_csv_path()),
           "heatmap", run_id, f"{run_id}.npz")
       save_pe_phase_cycles(pe_timing_out, phase_cycles, {
@@ -800,7 +802,7 @@ def main():
       writer.writerow(row)
     print(f"appended timing row to {csv_path}")
 
-    plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots",
+    plots_dir = os.path.join(BFS_ROOT, "results",
                               plot_bfs_timing.results_variant(csv_path))
     out_timing = args.out_timing or plot_bfs_timing.default_out_path(
         plots_dir, row["infile_mtx"], row["pe_grid"], row["source"], row["channels"])

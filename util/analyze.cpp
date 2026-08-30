@@ -15,9 +15,10 @@
  *    (P,Q) = argmin{ var(nnz(Bij)): B = A(P,Q)}
  *
  * How to compile
- *   g++ -Wall -g -I include -std=c++17 -O3 -g -c analyze.cpp
- *   gcc -c mmio.c
- *   g++ -Wall -g -I include -std=c++17 -O3 -g -o analyze analyze.o mmio.o
+ *   make -C util          (from the repo root), or just `make` from here --
+ *   see util/Makefile. Not committed as a binary: a native build like this
+ *   one routinely refuses to run on a different machine's glibc/libstdc++
+ *   (see docs/ERRORS.md), so it must be (re)built after every fresh clone.
  *
  * How to run: suppose A is distributed into 5-by-4 grid
  *   ./analyze --matrix <path to input file>  --rand 0 --fabx 5 --faby 4

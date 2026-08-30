@@ -14,6 +14,10 @@ set -uo pipefail
 
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
 
+# util/analyze is a native binary, not committed -- build (or rebuild, if
+# stale) it for this node's toolchain before the first balancing call below.
+make -C util
+
 GRID="${1:-750}"
 LOG="datasets/prep_snap.log"
 

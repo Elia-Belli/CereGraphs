@@ -79,7 +79,8 @@ from matplotlib.patches import Patch
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "implementation"))
 from bfs_timing import CLOCK_FREQ_HZ  # pylint: disable=wrong-import-position
 from plot_bfs_timing import (  # pylint: disable=wrong-import-position
     BASELINE, GRIDLINE, H2D_BASE_HEX, PARENT_RESOLVE_COLOR, SURFACE, TEXT_MUTED, TEXT_PRIMARY,
@@ -136,13 +137,13 @@ def poster_title_input(matrix):
   return f"Scale {m.group(1)}" if m else os.path.splitext(matrix)[0]
 
 
-def default_out_path(plots_dir, matrix, pe_grid, source, channels, log_scale=False):
+def default_out_path(results_dir, matrix, pe_grid, source, channels, log_scale=False):
   matrix_stem = os.path.splitext(matrix)[0]
-  # NOT "timings" -- every poster actually gets saved under plots/hw/
+  # NOT "timings" -- every poster actually gets saved under results/hw/
   # timing-poster/ (see the tracked files themselves); this default just
   # never matched that until now, so every real invocation so far has
   # passed --out explicitly instead of relying on it.
-  timing_dir = os.path.join(plots_dir, "hw", "timing-poster")
+  timing_dir = os.path.join(results_dir, "hw", "timing-poster")
   suffix = "_logscale" if log_scale else ""
   return os.path.join(
       timing_dir, f"timing_poster_{matrix_stem}_{pe_grid}_src{source}_ch{channels}{suffix}.svg")
@@ -625,9 +626,10 @@ def main():
 
   matched = select_rows(rows, args)
   last = matched[-1]
-  plots_dir = os.path.dirname(os.path.abspath(__file__))
+  results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "results")
   out_path = args.out or default_out_path(
-      plots_dir, last["infile_mtx"], last["pe_grid"], last["source"], last["channels"],
+      results_dir, last["infile_mtx"], last["pe_grid"], last["source"], last["channels"],
       log_scale=args.log_scale)
   plot_timing_row_poster(matched, out_path, log_scale=args.log_scale)
 

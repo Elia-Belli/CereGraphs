@@ -1,4 +1,4 @@
-// Boolean-semiring SpMV, one iteration, using collectives_2d (a local, in-tree
+// Boolean-semiring SpMV with diagonal reduce, using collectives_2d (a local, in-tree
 // copy -- see src/collectives_2d/, vendored from the container's <collectives_2d>
 // stdlib so stage 2 of the bitmap work can add an OR-reduce without touching
 // the system-wide module other kernels/examples import) instead of
@@ -30,8 +30,8 @@
 // exactly the PE that needs to source the next iteration's broadcast down
 // its own column.
 //
-// f_spmv_iter runs this without a host round trip, masking each round's raw
-// result against a cumulative visited_bitmap (see reduce_done()) before
+// The kernel (f_spmv_iter) runs this without a host round trip, masking
+// each round's raw result against a cumulative visited_bitmap (see reduce_done()) before
 // feeding it back as the next round's x -- i.e. only genuinely new
 // discoveries propagate, same as sdk-hypersparse-spmv-bfs/run_bfs.py's host-side
 // `new_mask = candidate & ~visited`. It stops once a 4-phase relay (see
@@ -213,7 +213,7 @@ var transpose_toc_buffer = @zeros([timestamp.tsc_size_words]u16);
 // launch doesn't return to the host until this reduce has also finished),
 // so none of decode_phase_row's per-round windows span it and it would
 // otherwise silently understate search_time_cycles/GTEPS. Unlike
-// transpose, this always fires exactly once per is_iterative run (not
+// transpose, this always fires exactly once per run (not
 // conditionally), so tic/toc are captured unconditionally around the
 // reduce_select_any call itself, not around a maybe-skipped branch --
 // tic is captured right before issuing the (async) reduce, toc inside its
@@ -307,7 +307,7 @@ const mpi_y = @import_module("./collectives_2d/pe.csl", .{
     .src1_dsr_ids = [1]u16{2},
     });
 
-// matrix structure, populated per-PE by run_single_spmv.py/run_bfs.py via
+// matrix structure, populated per-PE by run_bfs.py via
 // memcpy (hypersparse compressed-column format, identical to
 // hypersparse_spmv minus mat_vals_buf)
 var mat_rows_buf = @zeros([max_local_nnz]u16);
@@ -443,8 +443,7 @@ var x_bitmap = @zeros([BITMAP_WORDS]u32);
 // each round via visited_bcast_done() (same "only the diagonal's copy is
 // real, broadcast overwrites everyone else's" convention x_bitmap already
 // uses) -- compute() needs this at every PE to gate parent tracking (see
-// the module docstring above). Never used or touched by plain f_spmv (see
-// the is_iterative guards below).
+// the module docstring above).
 var visited_bitmap = @zeros([BITMAP_WORDS]u32);
 
 var y_bitmap = @zeros([BITMAP_WORDS]u32);
@@ -454,9 +453,7 @@ var y_bitmap = @zeros([BITMAP_WORDS]u32);
 // internal FSM assumes send/recv buffers are independent (e.g. the root
 // PE's own-copy merge step reads both), so they must not alias. Replaces
 // the old dense-f32 y_buf (and the y_local_buf send-side copy it needed)
-// now that the row-reduce operates directly on the bitmap. The host reads
-// back the full rectangle and keeps only the diagonal entries (see
-// device_io.unpack_bitmap_to_dense/extract_diag_result).
+// now that the row-reduce operates directly on the bitmap.
 var y_bitmap_reduced = @zeros([BITMAP_WORDS]u32);
 
 // Fast dense-buffer reset: a single DSD op per buffer instead of a
@@ -625,10 +622,6 @@ var prow_id: u16;
 // mpi_x/mpi_y.init() only needs to run per device session, not per launch
 var mpi_initialized: bool = false;
 
-// true for f_spmv_iter calls (masking/visited/termination-relay logic
-// applies), false for plain f_spmv (always exactly one round, untouched).
-var is_iterative: bool = false;
-
 fn f_enable_tsc() void {
     timestamp.enable_tsc();
     sys_mod.unblock_cmd_stream();
@@ -693,10 +686,10 @@ fn start_spmv() void {
     pcol_id = mpi_x.pe_id;
     prow_id = mpi_y.pe_id;
 
-    // At the start of new BFS: 
+    // At the start of new BFS:
     // - Reset the visited as the new x
     // - Reset the parent_local_buf to PARENT_NONE
-    if (is_iterative and pcol_id == prow_id) {
+    if (pcol_id == prow_id) {
 
         var w: u16 = 0;
         while (w < BITMAP_WORDS) : (w += 1)
@@ -704,45 +697,35 @@ fn start_spmv() void {
             visited_bitmap[w] = x_bitmap[w];
         }
     }
-    if (is_iterative) {
-
-        var p: u16 = 0;
-        while (p < blk) : (p += 1)
-        {
-            parent_local_buf[p] = PARENT_NONE;
-        }
-
-        // Every fresh BFS must start top-down: nf at the root is always far
-        // below tau_switch_count anyway, but relying on that implicitly
-        // instead of an explicit reset would be fragile (and see
-        // is_bottom_up's own comment for why this can only ever flip once
-        // per call).
-        is_bottom_up = false;
-        is_bottom_up_dbg[0] = 0;
+    var p: u16 = 0;
+    while (p < blk) : (p += 1)
+    {
+        parent_local_buf[p] = PARENT_NONE;
     }
 
+    // Every fresh BFS must start top-down: nf at the root is always far
+    // below tau_switch_count anyway, but relying on that implicitly
+    // instead of an explicit reset would be fragile (and see
+    // is_bottom_up's own comment for why this can only ever flip once
+    // per call).
+    is_bottom_up = false;
+    is_bottom_up_dbg[0] = 0;
 
-    // Start the first round of SpMV (or the next round of iterative SpMV)
-    if (is_iterative) {
 
-        rounds_completed[0] = 0;
-        ts_round = rounds_completed[0];
-        record_ts(ts_round, TS_VBCAST_ISSUE);
-        // Unconditional (not max_rounds-gated) -- see round_trip_start_buffer's
-        // own declaration comment. Runs exactly once, right here, since
-        // start_spmv() only ever begins round 0 once per f_spmv_iter call.
-        timestamp.get_timestamp(&round_trip_start_buffer);
-        if (ts_round < max_rounds) {
-            direction_history[ts_round] = 0; // round 0 always starts top-down
-        }
-
-        // Phase 1: broadcast visited bitmap along each row (needed for parent tracking)
-        mpi_x.broadcast(prow_id, &visited_bitmap, BITMAP_WORDS, visited_bcast_done_task_id);
-
-    } else {
-        // SpMV: just broadcast x_bitmap down the column
-        mpi_y.broadcast(pcol_id, &x_bitmap, BITMAP_WORDS, compute_task_id);
+    // Start the first round of SpMV
+    rounds_completed[0] = 0;
+    ts_round = rounds_completed[0];
+    record_ts(ts_round, TS_VBCAST_ISSUE);
+    // Unconditional (not max_rounds-gated) -- see round_trip_start_buffer's
+    // own declaration comment. Runs exactly once, right here, since
+    // start_spmv() only ever begins round 0 once per f_spmv_iter call.
+    timestamp.get_timestamp(&round_trip_start_buffer);
+    if (ts_round < max_rounds) {
+        direction_history[ts_round] = 0; // round 0 always starts top-down
     }
+
+    // Phase 1: broadcast visited bitmap along each row (needed for parent tracking)
+    mpi_x.broadcast(prow_id, &visited_bitmap, BITMAP_WORDS, visited_bcast_done_task_id);
 }
 
 task visited_bcast_done() void {
@@ -750,20 +733,13 @@ task visited_bcast_done() void {
     mpi_y.broadcast(pcol_id, &x_bitmap, BITMAP_WORDS, compute_task_id);
 }
 
-// compute y = A*x, one iteration, boolean semiring, reduce to the diagonal
-fn f_spmv() void {
-    is_iterative = false;
-    start_spmv();
-}
-
-// same as f_spmv, but after reducing to the diagonal, copies y back into x
-// (broadcasting it again down the diagonal's column) and repeats until the
-// termination relay (see reduce_done()) agrees no row found anything new --
-// i.e. the output of each round becomes the next round's input vector, for
-// as many rounds as real BFS convergence takes, before returning control to
-// the host.
+// On-device iterative BFS: after reducing to the diagonal, copies y back
+// into x (broadcasting it again down the diagonal's column) and repeats
+// until the termination relay (see reduce_done()) agrees no row found
+// anything new -- i.e. the output of each round becomes the next round's
+// input vector, for as many rounds as real BFS convergence takes, before
+// returning control to the host.
 fn f_spmv_iter() void {
-    is_iterative = true;
     start_spmv();
 }
 
@@ -897,15 +873,13 @@ fn compute_topdown() void {
             while (j < len) : (j += 1) {
                 const k = mat_rows_buf[loc + j]; // dense row index, 0..blk-1
                 y_bitmap[k >> 5] |= (@as(u32, 1) << (k & 31));
-                if (is_iterative) {
-                    // Compute the FULL global vertex id on-device (Phase A of the
-                    // u32 migration) instead of storing the bare local column index --
-                    // pcol_id/blk are u16, so the product must be done in u32 arithmetic
-                    // to avoid silently truncating for any pcol_id*blk >= 65536.
-                    if ((visited_bitmap[k >> 5] >> (k & 31)) & 1 == 0) {
-                        const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
-                        parent_local_buf[k] = global_c;
-                    }
+                // Compute the FULL global vertex id on-device (Phase A of the
+                // u32 migration) instead of storing the bare local column index --
+                // pcol_id/blk are u16, so the product must be done in u32 arithmetic
+                // to avoid silently truncating for any pcol_id*blk >= 65536.
+                if ((visited_bitmap[k >> 5] >> (k & 31)) & 1 == 0) {
+                    const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
+                    parent_local_buf[k] = global_c;
                 }
             }
         }
@@ -936,12 +910,10 @@ fn compute_bottomup() void {
             const c = mat_rows_buf[loc + j]; // source column, post-transpose
             if ((x_bitmap[c >> 5] >> (c & 31)) & 1 != 0) {
                 y_bitmap[r >> 5] |= (@as(u32, 1) << (r & 31));
-                if (is_iterative) {
-                    // See compute_topdown()'s matching comment -- same global-id
-                    // computation, u32 arithmetic required.
-                    const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
-                    parent_local_buf[r] = global_c;
-                }
+                // See compute_topdown()'s matching comment -- same global-id
+                // computation, u32 arithmetic required.
+                const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
+                parent_local_buf[r] = global_c;
                 break; // first hit wins -- no need to look at r's other columns
             }
         }
@@ -949,9 +921,7 @@ fn compute_bottomup() void {
 }
 
 task compute() void {
-    if (is_iterative) {
-        record_ts(ts_round, TS_COMPUTE_ENTRY);
-    }
+    record_ts(ts_round, TS_COMPUTE_ENTRY);
 
     // Reset y_bitmap and y_bitmap_reduced
     @mov32(y_bitmap_dsd, fill_bitmap_u32);
@@ -966,9 +936,7 @@ task compute() void {
         compute_topdown();
     }
 
-    if (is_iterative) {
-        record_ts(ts_round, TS_REDUCE_ISSUE);
-    }
+    record_ts(ts_round, TS_REDUCE_ISSUE);
 
     // Phase 4: OR-reduce this row's local contributions toward its
     // diagonal -- reduce_or operates directly on y_bitmap's packed words,
@@ -977,12 +945,6 @@ task compute() void {
 }
 
 task reduce_done() void {
-    if (!is_iterative) {
-        // Single SpMV End: all PEs exit
-        sys_mod.unblock_cmd_stream();
-        return;
-    }
-
     record_ts(ts_round, TS_REDUCE_DONE);
 
     // Phase 5: local termination condition (output mask)
@@ -1155,44 +1117,40 @@ task term_col_bcast_done() void {
         // sides in parallel, same latency-minimizing reasoning already used
         // for reduce_fadds/broadcast above (see the P/MID comment near their
         // declaration).
-        if (is_iterative) {
-            // Phase 1 instrumentation (see occ_bitmap's own declaration
-            // comment): build "row k has a real parent candidate" as a
-            // bitmap (same bit-set idiom compute_topdown() uses), then
-            // popcount it via the existing 16-bit-granularity @popcnt +
-            // u16-view trick reduce_done() already uses for nz_local. Purely
-            // local compute, zero fabric traffic, runs once -- does not
-            // change reduce_select_any's own behavior below at all.
-            var occ_w: u16 = 0;
-            while (occ_w < BITMAP_WORDS) : (occ_w += 1) {
-                occ_bitmap[occ_w] = 0;
+        // Phase 1 instrumentation (see occ_bitmap's own declaration
+        // comment): build "row k has a real parent candidate" as a
+        // bitmap (same bit-set idiom compute_topdown() uses), then
+        // popcount it via the existing 16-bit-granularity @popcnt +
+        // u16-view trick reduce_done() already uses for nz_local. Purely
+        // local compute, zero fabric traffic, runs once -- does not
+        // change reduce_select_any's own behavior below at all.
+        var occ_w: u16 = 0;
+        while (occ_w < BITMAP_WORDS) : (occ_w += 1) {
+            occ_bitmap[occ_w] = 0;
+        }
+        var occ_k: u16 = 0;
+        while (occ_k < blk) : (occ_k += 1) {
+            if (parent_local_buf[occ_k] != PARENT_NONE) {
+                occ_bitmap[occ_k >> 5] |= (@as(u32, 1) << (occ_k & 31));
             }
-            var occ_k: u16 = 0;
-            while (occ_k < blk) : (occ_k += 1) {
-                if (parent_local_buf[occ_k] != PARENT_NONE) {
-                    occ_bitmap[occ_k >> 5] |= (@as(u32, 1) << (occ_k & 31));
-                }
-            }
-            @popcnt(occ_popcnt_dst_dsd, occ_popcnt_src_dsd);
-            parent_occupancy[0] = 0;
-            var occ_pw: u16 = 0;
-            while (occ_pw < 2 * BITMAP_WORDS) : (occ_pw += 1) {
-                parent_occupancy[0] += @as(u32, occ_popcnt_scratch[occ_pw]);
-            }
+        }
+        @popcnt(occ_popcnt_dst_dsd, occ_popcnt_src_dsd);
+        parent_occupancy[0] = 0;
+        var occ_pw: u16 = 0;
+        while (occ_pw < 2 * BITMAP_WORDS) : (occ_pw += 1) {
+            parent_occupancy[0] += @as(u32, occ_popcnt_scratch[occ_pw]);
+        }
 
-            timestamp.get_timestamp(&parent_resolve_tic_buffer);
-            if (parent_resolve_variant == 2) {
-                mpi_x.reduce_select_any_indexed(MID, &parent_local_buf, &parent_relay_result,
-                                                 &parent_send_bitmap, &parent_recv_bitmap,
-                                                 &parent_send_indices, &parent_recv_indices,
-                                                 &parent_send_values, &parent_recv_values,
-                                                 PARENT_NONE, blk, parent_resolve_done_task_id);
-            } else {
-                mpi_x.reduce_select_any(MID, &parent_local_buf, &parent_relay_result,
-                                         PARENT_NONE, blk, parent_resolve_done_task_id);
-            }
+        timestamp.get_timestamp(&parent_resolve_tic_buffer);
+        if (parent_resolve_variant == 2) {
+            mpi_x.reduce_select_any_indexed(MID, &parent_local_buf, &parent_relay_result,
+                                             &parent_send_bitmap, &parent_recv_bitmap,
+                                             &parent_send_indices, &parent_recv_indices,
+                                             &parent_send_values, &parent_recv_values,
+                                             PARENT_NONE, blk, parent_resolve_done_task_id);
         } else {
-            sys_mod.unblock_cmd_stream();
+            mpi_x.reduce_select_any(MID, &parent_local_buf, &parent_relay_result,
+                                     PARENT_NONE, blk, parent_resolve_done_task_id);
         }
     }
 }
@@ -1248,7 +1206,6 @@ comptime {
     @export_symbol(ptr_nf_history, "nf_history");
     @export_symbol(ptr_direction_history, "direction_history");
 
-    @export_symbol(f_spmv);
     @export_symbol(f_spmv_iter);
     @export_symbol(f_enable_tsc);
     @export_symbol(f_tic);

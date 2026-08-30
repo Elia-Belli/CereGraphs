@@ -4,19 +4,20 @@
 # that script's own module docstring) across a list of (RMAT scale,
 # edgefactor, PE grid) test cases, generating + balancing any matrix that
 # doesn't already exist in data/. Each run appends its own row to
-# bfs/bool_diag_spmv/results/bfs_timing.csv (run_bfs.py's own default) and
-# renders its own per-run timing plot (plot_bfs_timing.py) -- this script
-# doesn't touch either, it only drives the sweep.
+# bfs/results/sim/bfs_timing.csv or bfs/results/hw/bfs_timing.csv
+# (run_bfs.py/run_bfs.appliance.py's own default) and renders its own
+# per-run timing plot (plot_bfs_timing.py) -- this script doesn't touch
+# either, it only drives the sweep.
 #
 # Edit CASES below to whatever (scale, edgefactor, grid) triples you actually
 # want -- this is a small smoke-test default. One row per case: "scale
 # edgefactor grid" (grid is a single int -- the design requires a square
 # PxP grid).
 #
-# Usage:
-#   ./bfs/bool_diag_spmv/sweep_bfs.sh                    # simulator (local, cs_python), wse2
-#   ./bfs/bool_diag_spmv/sweep_bfs.sh appliance-sim      # appliance client, simulator backend, wse3
-#   ./bfs/bool_diag_spmv/sweep_bfs.sh appliance          # appliance client, REAL hardware, wse3
+# Usage (wse3 only -- this kernel is no longer tested/supported on wse2):
+#   ./bfs/scripts/sweep_bfs.sh                    # simulator (local, cs_python), wse3
+#   ./bfs/scripts/sweep_bfs.sh appliance-sim      # appliance client, simulator backend, wse3
+#   ./bfs/scripts/sweep_bfs.sh appliance          # appliance client, REAL hardware, wse3
 #
 # `simulator` uses run_bfs.py through this repo's local cs_python container
 # wrapper -- what every other command_wse*.sh script in this repo already
@@ -33,12 +34,16 @@
 # software stack, without spending a real hardware allocation, and is the
 # closest thing to a dry run this script can offer.
 #
-# Relocates to the repo root itself (same convention as commands_wse2.sh),
+# Relocates to the repo root itself (same convention as commands_wse3_graph500.sh),
 # so it's safe to invoke from anywhere.
 
 set -e
 
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
+
+# util/analyze is a native binary, not committed -- build (or rebuild, if
+# stale) it for this node's toolchain before the sweep's first use.
+make -C util
 
 MODE="${1:-simulator}"
 SOURCE=0
@@ -50,7 +55,7 @@ CASES=(
 case "$MODE" in
   appliance)
     ARCH=wse3
-    RUN_SCRIPT="bfs/bool_diag_spmv/run_bfs.appliance.py"
+    RUN_SCRIPT="bfs/scripts/run_bfs.appliance.py"
     PYTHON=python
     SIM_FLAG=""
     # SdkRuntime's memcpy gRPC streams can get reset if https_proxy/HTTPS_PROXY
@@ -64,7 +69,7 @@ case "$MODE" in
     ;;
   appliance-sim)
     ARCH=wse3
-    RUN_SCRIPT="bfs/bool_diag_spmv/run_bfs.appliance.py"
+    RUN_SCRIPT="bfs/scripts/run_bfs.appliance.py"
     PYTHON=python
     SIM_FLAG="--simulator"
     export no_proxy="10.125.8.2,.cerebras.internal,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
@@ -72,8 +77,8 @@ case "$MODE" in
     echo "=== appliance-sim mode: appliance client, simulator backend, --arch=$ARCH ==="
     ;;
   simulator)
-    ARCH=wse2
-    RUN_SCRIPT="bfs/bool_diag_spmv/run_bfs.py"
+    ARCH=wse3
+    RUN_SCRIPT="bfs/scripts/run_bfs.py"
     PYTHON=cs_python
     SIM_FLAG=""
     echo "=== simulator mode (local cs_python): --arch=$ARCH ==="
@@ -116,8 +121,8 @@ for case in "${CASES[@]}"; do
   if [ "$MODE" = "appliance" ]; then
     matrix_base="$(basename "$matrix" .mtx)"
     OUT_ARGS=(
-      "--csv=bfs/bool_diag_spmv/results/hw/bfs_timing.csv"
-      "--out-timing=bfs/bool_diag_spmv/plots/hw/timing/timing_${matrix_base}_${grid}x${grid}_src${SOURCE}_ch${channels}.png"
+      "--csv=bfs/results/hw/bfs_timing.csv"
+      "--out-timing=bfs/results/hw/timing/timing_${matrix_base}_${grid}x${grid}_src${SOURCE}_ch${channels}.png"
     )
   fi
 
@@ -135,4 +140,4 @@ for case in "${CASES[@]}"; do
 done
 
 echo ""
-echo "=== sweep done -- see bfs/bool_diag_spmv/results/bfs_timing.csv ==="
+echo "=== sweep done -- see bfs/results/sim/bfs_timing.csv or bfs/results/hw/bfs_timing.csv ==="

@@ -43,12 +43,12 @@ Usage: cs_python plots/plot_balance_before_after.py
          --balanced=../../data/rmat_s10_e16.balanced8x8.mtx
          --grid=8
 
-Writes into plots/balancing/<dataset>/ (one subfolder per --raw input, named
+Writes into results/balancing/<dataset>/ (one subfolder per --raw input, named
 after its basename minus ".mtx" -- e.g. "snap_berkstan", "rmat_s10_e16") so
 multiple datasets/grid sizes don't clobber each other's output. Filenames
 inside that folder carry the grid size instead of the dataset name (the
 folder already disambiguates that): sparsity_<grid>x<grid>.svg,
-nnz_<grid>x<grid>.svg. Override the parent with --outdir if plots/balancing
+nnz_<grid>x<grid>.svg. Override the parent with --outdir if results/balancing
 itself isn't where a given run should land.
 """
 
@@ -629,7 +629,7 @@ def main():
   p.add_argument("--balanced", required=True)
   p.add_argument("--grid", type=int, required=True)
   p.add_argument("--outdir", default=os.path.join(
-      os.path.dirname(os.path.abspath(__file__)), "balancing"))
+      os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results", "balancing"))
   args = p.parse_args()
 
   n_raw, _, rows_raw, cols_raw = read_mtx(args.raw)

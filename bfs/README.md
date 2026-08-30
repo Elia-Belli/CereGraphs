@@ -10,87 +10,80 @@ what's genuinely done versus what's still a stub.
 
 ## Directory layout
 
-- `src/` — the CSL kernel.
-- `plots/` — every plotting script (`plot_bfs_timing.py`, `plot_pe_heatmap.py`,
-  `bfs_tree_plot.py`) AND their rendered output (`plots/heatmap/`,
-  `plots/timing/`, `plots/tree/`) live together here.
-- `results/` — every CSV/JSONL log (`bfs_timing.csv`, `graph500_searches.csv`,
-  `graph500_summary.csv`, `iterative_results.jsonl`).
+- `implementation/` — everything the running kernel and its host-side glue
+  code are made of, nothing runnable on its own:
+  - `implementation/src/` — the CSL kernel (`layout_bool.csl`, `bool_pe.csl`,
+    `collectives_2d/`).
+  - `implementation/device_io.py`, `graph_loader.py`, `preprocess_bool.py`,
+    `bfs_timing.py` — host<->device marshaling, matrix loading, hypersparse
+    partitioning, and timing decode/constants, shared by every script below.
+- `scripts/` — every runnable entrypoint: the Python drivers (`run_bfs.py`,
+  `run_bfs.appliance.py`, `run_graph500.py`) and the shell orchestration
+  scripts around them (smoke tests, sweeps, slurm submission).
+- `plots/` — the plotting *code* only (`plot_bfs_timing.py`,
+  `plot_pe_heatmap.py`, `bfs_tree_plot.py`, and the poster/report figure
+  generators) — no rendered output lives here.
+- `results/` — every output artifact, both data and images: the CSV/JSONL
+  logs (`hw/bfs_timing.csv`, `sim/bfs_timing.csv`, `graph500_searches.csv`,
+  `graph500_summary.csv`) and the rendered PNG/SVG trees, timing charts, and
+  heatmaps the scripts above save (`results/<hw|sim>/tree/`,
+  `results/<hw|sim>/timing/`, `results/hw/heatmap/`, `results/balancing/`).
 - `out/` — compiled kernel ELFs, one subfolder per `--latestlink` target
-  (`out/wse2`, `out/wse3`, `out/wse3_iter`, `out/wse3_graph500`, `out/latest`
-  for anything run without an explicit `--latestlink`) — freely regenerable
-  in seconds via `cslc`, unlike `plots/`/`results/`.
+  (`out/wse3`, `out/latest` for anything run without an explicit
+  `--latestlink`) — freely regenerable in seconds via `cslc`,
+  unlike `results/`.
 
 ## Files
 
-- `src/layout_bool.csl` — top-level layout: sets up `memcpy` and
-  `<collectives_2d>` params, asserts a square PE grid, exports buffers and
-  `f_spmv`/timing functions.
-- `src/bool_pe.csl` — the whole per-PE kernel in one flat file (no nested
-  module-import layer like `sdk-hypersparse-spmv/src/hypersparse_spmv/`) — modeled
-  on the SDK's `gemv-collectives_2d/pe.csl` example.
-- `preprocess_bool.py` — structural fork of `../../spmv/sdk-hypersparse-spmv/preprocess.py`:
-  identical hypersparse compressed-column partitioning
-  (`mat_col_idx/loc/len_buf`, `mat_rows_buf`, `y_rows_init_buf`), minus
-  `mat_vals_buf` (boolean semiring never uses edge weights).
-- `device_io.py` — shared host<->device data-marshaling helpers (hwl<->1d
-  layout conversions, diagonal/parent result extraction, the `cslc`
-  invocation) used by every driver script below — not runnable on its own.
-- `bfs_timing.py` — shared per-round timing constants/decoders (the
-  `TS_*`/`PHASES` slot map matching `bool_pe.csl`'s `record_ts()`, the
+- `implementation/src/layout_bool.csl` — top-level layout: sets up `memcpy`
+  and `<collectives_2d>` params, asserts a square PE grid, exports buffers
+  and the `f_spmv_iter`/timing functions.
+- `implementation/src/bool_pe.csl` — the whole per-PE kernel in one flat
+  file (no nested module-import layer like
+  `sdk-hypersparse-spmv/src/hypersparse_spmv/`) — modeled on the SDK's
+  `gemv-collectives_2d/pe.csl` example.
+- `implementation/preprocess_bool.py` — structural fork of
+  `../../spmv/sdk-hypersparse-spmv/preprocess.py`: identical hypersparse
+  compressed-column partitioning (`mat_col_idx/loc/len_buf`,
+  `mat_rows_buf`, `y_rows_init_buf`), minus `mat_vals_buf` (boolean
+  semiring never uses edge weights).
+- `implementation/device_io.py` — shared host<->device data-marshaling
+  helpers (hwl<->1d layout conversions, parent result extraction, the
+  `cslc` invocation) used by every driver script below — not runnable on
+  its own.
+- `implementation/bfs_timing.py` — shared per-round timing constants/decoders
+  (the `TS_*`/`PHASES` slot map matching `bool_pe.csl`'s `record_ts()`, the
   `read_tic_toc_delta()`/`decode_round_timestamps()` helpers) — single
-  source of truth for `run_bfs.py` (writes `results/bfs_timing.csv`) and
-  `plots/plot_bfs_timing.py` (reads it back), not runnable on its own.
+  source of truth for `run_bfs.py` (writes `results/sim/bfs_timing.csv`)
+  and `plots/plot_bfs_timing.py` (reads it back), not runnable on its own.
 - `plots/bfs_tree_plot.py` — shared BFS-tree-comparison rendering (digraph
   construction, the radial BFS-level layout, panel drawing, parent
   validity checking) — used by `run_bfs.py`, not runnable on its own.
-- `run_single_spmv.py` (formerly `run_bool.py`) — host driver for the base,
-  one-shot `f_spmv` entrypoint: seeds `x` only at the PE grid's diagonal,
-  launches `f_spmv` once, reads back the full rectangle, keeps only the
-  diagonal entries, verifies against an independent scipy boolean
-  reference. A foundational sanity check independent of any BFS-specific
-  machinery (masking, termination, parent tracking) — see "run_bfs.py vs.
-  the two test scripts" below for how this relates to `run_bfs.py`.
-- `run_host_driven_bfs.py` (formerly `test_iterative.py`) — regression test
-  for the on-device iterative entrypoint `f_spmv_iter` (see "Status"
-  below): runs one `f_spmv_iter` launch (runs until the on-device
-  termination relay agrees nothing new was found — no round cap) against
-  the same compiled kernel's `f_spmv`, called in a host-side loop that
-  applies the identical visited-mask and stops the same way, seeded with a
-  random ~50%-density *multi-source* frontier specifically to stress-test
-  masking across many simultaneous discoveries at once — then checks
-  `visited_buf`, the terminating round's raw (unmasked) `y_buf`, the
-  assembled parent vector (`extract_parent_result()`, min-reduced
-  host-side from the full `parent_local_buf` rectangle), and the number of
-  rounds actually run are all identical between the two, plus a sanity
-  invariant that the masked `x_buf` is genuinely all-zero when the device
-  stops. Logs each run to `results/iterative_results.jsonl`.
-- `run_bfs.py` — the main, user-facing driver: a *single-source* BFS, one
-  compile + one `f_spmv_iter` launch, reporting three things from that one
-  run (each independently toggleable, all on by default): a tree
+- `scripts/run_bfs.py` — the main, user-facing driver: a *single-source*
+  BFS, one compile + one `f_spmv_iter` launch, reporting three things from
+  that one run (each independently toggleable, all on by default): a tree
   comparison plot against `scipy.sparse.csgraph.breadth_first_order`
   (`--notree` to skip), the same scipy cross-check printed as numbers
   (`--nocorrectness` to skip), and per-round phase timing + a Graph500-style
-  GTEPS estimate appended to `results/bfs_timing.csv` plus its own bar-chart
-  plot (`--notimings` to skip, which also skips the tsc instrumentation
-  itself and its real transfer-time cost). See "`run_bfs.py` vs. the two
-  test scripts" below for why this is a separate thing from
-  `run_host_driven_bfs.py`, and `docs/GRAPH500_BENCHMARK.md` for the GTEPS
-  methodology. `--dump-pe-timing` (off by default) additionally saves the
-  full per-PE-per-round-per-phase cycle grid to a `.npz` file, inside
-  `plots/heatmap/<matrix>_<grid>_src<N>/` -- the same per-run folder
-  `plots/plot_pe_heatmap.py` renders its PNGs into, so the raw data and its
-  plots stay together as one self-contained bundle. A deeper diagnostic
-  than the aggregate min/max/avg the CSV logs, for seeing exactly which
-  PEs are the straggler(s) for a given phase.
+  GTEPS estimate appended to `results/sim/bfs_timing.csv` plus its own
+  bar-chart plot (`--notimings` to skip, which also skips the tsc
+  instrumentation itself and its real transfer-time cost). See
+  `docs/GRAPH500_BENCHMARK.md` for the GTEPS methodology. `--dump-pe-timing`
+  (off by default) additionally saves the full per-PE-per-round-per-phase
+  cycle grid to a `.npz` file, inside
+  `results/<hw|sim>/heatmap/<matrix>_<grid>_src<N>/` -- the same per-run
+  folder `plots/plot_pe_heatmap.py` renders its PNGs into, so the raw data
+  and its plots stay together as one self-contained bundle. A deeper
+  diagnostic than the aggregate min/max/avg the CSV logs, for seeing
+  exactly which PEs are the straggler(s) for a given phase.
 - `plots/plot_bfs_timing.py` — the per-round stacked-bar timing chart
   `run_bfs.py` calls automatically; also runnable standalone
-  (`plot_timing_row()`) to re-plot an existing `results/bfs_timing.csv` row
-  without re-running the device.
+  (`plot_timing_row()`) to re-plot an existing `results/sim/bfs_timing.csv`
+  row without re-running the device.
 - `plots/plot_pe_heatmap.py` — reads a `--dump-pe-timing` `.npz` and renders
   per-PE cycle-cost heatmaps into their own subfolder,
-  `plots/heatmap/<matrix>_<grid>_src<N>/`: one `round_<r>.png` per
-  profiled round (the round number is always in the title), plus one
+  `results/<hw|sim>/heatmap/<matrix>_<grid>_src<N>/`: one `round_<r>.png`
+  per profiled round (the round number is always in the title), plus one
   `summary_avg.png` overview (mean over all rounds -- typical cost, not
   one worst round). Rounds are kept separate rather than aggregated by
   default because which PEs are active in a given round is itself a
@@ -114,50 +107,32 @@ what's genuinely done versus what's still a stub.
   Standalone only -- never touches the device, purely a re-plot of
   already-saved data. See `docs/GRAPH500_BENCHMARK.md` section 8 for what this
   revealed about the termination relay's cost.
-- `run_graph500.py` — the full Graph500-shaped benchmark: one compile, one
-  matrix upload (timed once as construction, excluded from every search),
-  then `--num-searches` (default 64, per the spec) single-source BFS
-  searches from distinct random roots (`--seed` for reproducible sampling,
-  `--sources` for an explicit list), each timed individually. Per-search
-  rows go to `results/graph500_searches.csv`; one summary row per benchmark
-  run (`harmonic_mean_gteps`, `min`/`median`/`max_gteps`, `construction_time_seconds`)
-  goes to `results/graph500_summary.csv`. Each search re-uploads only its seed
+- `scripts/run_graph500.py` — the full Graph500-shaped benchmark: one
+  compile, one matrix upload (timed once as construction, excluded from
+  every search), then `--num-searches` (default 64, per the spec)
+  single-source BFS searches from distinct random roots (`--seed` for
+  reproducible sampling, `--sources` for an explicit list), each timed
+  individually. Per-search rows go to `results/sim/graph500_searches.csv`;
+  one summary row per benchmark run (`harmonic_mean_gteps`,
+  `min`/`median`/`max_gteps`, `construction_time_seconds`) goes to
+  `results/sim/graph500_summary.csv`. Each search re-uploads only its seed
   `x_buf` — `bool_pe.csl`'s `start_spmv()` already resets
   `visited_buf`/`rounds_completed`/`parent_local_buf`/`ts_round` on every
   fresh `f_spmv_iter()` call, so no other host-side reset is needed. Per-
   search scipy correctness checking is on by default (`--nocorrectness` to
   skip). See `docs/GRAPH500_BENCHMARK.md` for the full methodology and current
   status.
-- `commands_wse2.sh` / `commands_wse3.sh` — one-shot compile+run smoke test on
-  `../../data/rmat4.4x4.lb.mtx` at a 4x4 grid, for WSE-2 and WSE-3 respectively.
-  Unlike `sdk-hypersparse-spmv`/`sdk-hypersparse-spmv-bfs`, both scripts compile the *same* `src/` —
-  `<collectives_2d>` abstracts the fabric-routing differences between the two
-  architectures, so there's no separate `src_wse3/` tree here.
-- `commands_wse3_iterative.sh` — same compile as `commands_wse3.sh`, but runs
-  `run_host_driven_bfs.py` instead of `run_single_spmv.py`.
-- `commands_wse3_graph500.sh` — same compile as `commands_wse3.sh`, but runs
-  `run_graph500.py` (16 searches over the same tiny 4x4 fixture, kept small
-  purely so this stays a fast smoke test — see `docs/GRAPH500_BENCHMARK.md` for a
-  real-scale run).
+- `scripts/commands_wse3_graph500.sh` — one-shot compile+run smoke test:
+  compiles `implementation/src/` for WSE-3 against a tiny 4x4 fixture, then
+  runs `run_graph500.py` (16 searches, kept small purely so this stays a
+  fast smoke test — see `docs/GRAPH500_BENCHMARK.md` for a real-scale run).
 
-### `run_bfs.py` vs. the two test scripts
-
-`run_single_spmv.py` and `run_host_driven_bfs.py` are correctness tests for
-two different *layers*, not redundant with each other or with `run_bfs.py`:
-`run_single_spmv.py` validates the base one-shot `f_spmv` primitive
-(broadcast + local multiply + reduce, no BFS semantics at all);
-`run_host_driven_bfs.py` validates the iterative machinery built on top of
-it (masking, termination, parent tracking) under a deliberately adversarial
-multi-source stress frontier, and depends on `f_spmv` already being known
-correct. Neither does a real single-source BFS run. `run_bfs.py` is the
-separate, user-facing "run an actual BFS and show me the result" tool —
-its own `--nocorrectness` check is a single-source scipy cross-check, not
-`run_host_driven_bfs.py`'s stress test, which stays its own script rather
-than being folded in. `run_graph500.py` reuses that same per-search scipy
-check across many roots in one compiled session, rather than adding a
-fourth, separate correctness mechanism — see `docs/GRAPH500_BENCHMARK.md` for
-why it's the right tool once you want an actual GTEPS number instead of
-one root's tree.
+`run_bfs.py`'s own `--nocorrectness` check is a single-source scipy
+cross-check against `scipy.sparse.csgraph.breadth_first_order`.
+`run_graph500.py` reuses that same per-search scipy check across many roots
+in one compiled session, rather than adding a separate correctness
+mechanism — see `docs/GRAPH500_BENCHMARK.md` for why it's the right tool
+once you want an actual GTEPS number instead of one root's tree.
 
 ## Design: why the diagonal, and why `<collectives_2d>`
 
@@ -268,7 +243,7 @@ the reduce runs, at the only point column identity is still visible:
   with `min` instead of `sum`. `<collectives_2d>` has no min-reduce
   primitive, so this step is done host-side instead: `parent_local_buf` is
   exported from *every* PE (not just the diagonal, unlike `x_buf`/`y_buf`/
-  `visited_buf`), and `run_host_driven_bfs.py`'s `extract_parent_result()` reads
+  `visited_buf`), and `device_io.py`'s `extract_parent_result()` reads
   back the full rectangle and takes `.min(axis=...)` across the row's `P`
   column-PEs after `memcpy_d2h`.
 - TODO: that final cross-PE min could in principle be done on-device with a
@@ -284,9 +259,9 @@ already-discovered row would silently overwrite its parent whenever that
 later member's global index happened to be lower, producing an invalid
 (same-level, or even more-hops-away) "parent" that plainly wasn't one BFS
 level closer, however plausible it looked as *a* valid predecessor. The
-device-side fix (`visited_buf` gate above) plus the matching host-side fix
-in `run_host_driven_bfs.py`'s `update_parent_reference()` (gated on the host's
-own `visited` array the same way) now give a parent that matches
+device-side fix (`visited_buf` gate above) plus the matching host-side
+reference-implementation fix (gated on the host's own `visited` array the
+same way) now give a parent that matches
 `sdk-hypersparse-spmv-bfs/run_bfs.py`'s stricter `find_parents()` definition (exactly one
 BFS level closer), not merely `verify_bfs()`'s looser one (visited + a real
 edge, no level check) — confirmed by `run_bfs.py`, whose
@@ -323,43 +298,35 @@ design" rather than a pure implementation bake-off.
 
 ## Requirements
 
+- **WSE-3 only.** `--arch` is locked to `wse3` in every driver script
+  (`choices=["wse3"]`) — this kernel is no longer tested/supported on WSE-2.
 - **Square PE grid** (`pcols == prows`) — asserted at compile time. The
   diagonal-target design has no meaning otherwise.
-- **Square matrix** (`nrows == ncols`) — asserted by `run_single_spmv.py`.
+- **Square matrix** (`nrows == ncols`) — asserted by `run_bfs.py`.
 
 ## Running with a different matrix / grid size
 
-`commands_wse2.sh`/`commands_wse3.sh`/`commands_wse3_iterative.sh` are a
-fixed smoke test (`../../data/rmat4.4x4.lb.mtx` on a 4x4 grid) split into two
-steps — an explicit `cslc` call with hand-computed `--params` (`blk`,
-`max_local_nnz*`), then `run_single_spmv.py`/`run_host_driven_bfs.py --run-only` reusing
-that ELF. That split only exists to avoid recompiling on repeat smoke-test
-runs; the `--params` values in it are specific to that one matrix+grid
-combination and won't work for any other.
+`scripts/commands_wse3_graph500.sh` is a fixed smoke test
+(`../../data/rmat4.4x4.lb.mtx` on a 4x4 grid) split into two steps — an
+explicit `cslc` call with hand-computed `--params` (`blk`,
+`max_local_nnz*`), then its driver script `--run-only` reusing that ELF.
+That split only exists to avoid recompiling on repeat smoke-test runs; the
+`--params` values in it are specific to that one matrix+grid combination
+and won't work for any other.
 
-For a different matrix or grid size, skip the split and call `run_single_spmv.py`
-(or `run_host_driven_bfs.py`) directly, **without `--run-only`**. Both scripts run
-`preprocess_bool.preprocess()` themselves before invoking `cslc`, so `blk`
-and the `max_local_nnz*` sizes are computed from the actual matrix and grid
-you pass — you never need to work those out by hand:
-
-```sh
-cd spmv-hypersparse   # repo-root-relative paths, same as the commands_* scripts
-
-cs_python bool_diag_spmv/run_single_spmv.py --arch=wse3 \
-    --num_pe_cols=8 --num_pe_rows=8 --channels=1 \
-    --infile_mtx=data/rmat_s6_e4.mtx \
-    --latestlink bool_diag_spmv/out/s6_8x8
-```
-
-The same flags work for `run_host_driven_bfs.py` (it shares `cmd_parser.py` with
-`run_single_spmv.py`):
+For a different matrix or grid size, skip the split and call `run_bfs.py`
+directly, **without `--run-only`**. It runs `preprocess_bool.preprocess()`
+itself before invoking `cslc`, so `blk` and the `max_local_nnz*` sizes are
+computed from the actual matrix and grid you pass — you never need to work
+those out by hand:
 
 ```sh
-cs_python bool_diag_spmv/run_host_driven_bfs.py --arch=wse3 \
+cd CereGraphs   # repo-root-relative paths, same as the commands_* scripts
+
+cs_python bfs/scripts/run_bfs.py --arch=wse3 \
     --num_pe_cols=8 --num_pe_rows=8 --channels=1 \
-    --infile_mtx=data/rmat_s6_e4.mtx \
-    --latestlink bool_diag_spmv/out/s6_8x8_iter
+    --infile_mtx=data/rmat_s6_e4.mtx --source=0 \
+    --latestlink bfs/out/s6_8x8
 ```
 
 Notes:
@@ -372,7 +339,7 @@ Notes:
   `rmat_s6_e4.mtx` (64x64), `rmat_s7_e4.mtx` (128x128), `rmat_s8_e4.mtx`
   (256x256), up to `rmat_s14_e16.mtx` (16384x16384) — see `../../datasets/`
   for how these were generated (`gen_rmat.py`) and load-balanced.
-- `--fabric-dims`/`--fabric-offsets` are optional — both scripts compute a
+- `--fabric-dims`/`--fabric-offsets` are optional — `run_bfs.py` computes a
   large-enough fabric from the grid size and `--width-west-buf`/
   `--width-east-buf` (default 0) if you omit them.
 - Drop `--latestlink` to just use the default `out/latest/` output dir; pass
@@ -385,29 +352,20 @@ Notes:
 
 ## Status
 
-Two entrypoints, both exported from the same compiled kernel:
-
-- `f_spmv` — the original one-shot SpMV: bootstrap `x` at the diagonal via
-  host memcpy, broadcast, local boolean multiply, reduce back to the
-  diagonal, read back and verify (`run_single_spmv.py`).
-- `f_spmv_iter` — on-device iterative version: at the diagonal PEs, each
-  round's raw result is masked against a cumulative `visited_buf` before
-  being fed back as the next round's `x` (`reduce_done()` in `bool_pe.csl`)
-  — only genuinely new discoveries propagate. After masking, a 4-phase
-  relay (see "The termination relay" above) checks whether *any* row found
-  something new; if not, the whole grid stops. No round-count cap anywhere
-  — the loop runs for as many rounds as real BFS convergence takes (bounded
-  by the node count, since visited-masking is monotonic) and no host round
-  trip anywhere in between. Every PE also tracks a candidate parent
-  pre-reduce (see "Parent tracking" above), min-reduced across each row's
-  PEs host-side into the final parent vector. Verified against a host-side
-  loop of sequential `f_spmv` launches that applies the identical mask, the
-  identical stop rule, and an independent host-side parent reference
-  (`run_host_driven_bfs.py`) — `visited_buf`, the terminating round's raw
-  (unmasked) `y_buf`, the assembled parent vector, *and* the number of
-  rounds actually run are all bit-identical, 0 mismatches, on a 4x4 grid, an
-  odd 5x5 grid, and an 8x8/64-node case (with the masked `x_buf`'s
-  all-zero-at-stop invariant separately confirmed too).
+One entrypoint, `f_spmv_iter`, exported from the compiled kernel: at the
+diagonal PEs, each round's raw result is masked against a cumulative
+`visited_buf` before being fed back as the next round's `x`
+(`reduce_done()` in `bool_pe.csl`) — only genuinely new discoveries
+propagate. After masking, a 4-phase relay (see "The termination relay"
+above) checks whether *any* row found something new; if not, the whole grid
+stops. No round-count cap anywhere — the loop runs for as many rounds as
+real BFS convergence takes (bounded by the node count, since
+visited-masking is monotonic) and no host round trip anywhere in between.
+Every PE also tracks a candidate parent pre-reduce (see "Parent tracking"
+above). Verified via `run_bfs.py`'s single-source scipy cross-check against
+`scipy.sparse.csgraph.breadth_first_order` (visited-set mismatches, invalid
+parents, and tie-break differences from scipy's own pick, all reported as
+part of that check) across a range of matrix sizes and grid shapes.
 
 What's still missing (see the `TODO`s in `bool_pe.csl`):
 

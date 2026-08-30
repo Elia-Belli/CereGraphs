@@ -47,7 +47,10 @@ both groups.
 - **`util/`** — `analyze.cpp`, a load-balancing tool: given a matrix and a
   PE grid shape, searches for a row/column permutation minimizing the
   variance of nonzeros per PE block. Version-agnostic (operates purely on
-  the matrix file); build with the commands in its header comment.
+  the matrix file); a native binary, not committed to git -- run `make -C
+  util` after every fresh clone (every script that calls `util/analyze`
+  does this itself already, so this is only needed for a standalone
+  `./util/analyze` invocation).
 - **`datasets/`** — matrix generation and acquisition only: `gen_rmat.py`
   (synthetic RMAT/GRAPH500-style matrices), `download_snap_graphs.sh` +
   `snap_to_mtx.py` + `prep_snap.sh` (real-world SNAP graphs, downloaded
