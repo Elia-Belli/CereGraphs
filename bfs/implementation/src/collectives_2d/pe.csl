@@ -608,6 +608,102 @@ fn reduce_select_any_indexed(root: u16, send_buf: [*]u32, recv_buf: [*]u32,
   start_data_transfer();
 }
 
+// build_bitmap_from_indices(): companion to compress_dense_to_indexed() for
+// a caller that ALREADY maintains its own (indices, values) pair
+// incrementally (e.g. bool_pe.csl's parent_compact_indices/values, appended
+// to in discovery order across many rounds) instead of starting from a
+// fully dense array -- such a caller has no bitmap to hand
+// reduce_select_any_indexed_precompacted() below, only the compacted pair
+// itself, so this derives one. O(cnt), same cost class as
+// compress_dense_to_indexed()'s own bitmap pass.
+fn build_bitmap_from_indices(indices: [*]u16, cnt: u16, bitmap_words: u16, out_bitmap: [*]u32) void {
+  var w: u16 = 0;
+  while (w < bitmap_words) : (w += 1) {
+    out_bitmap[w] = 0;
+  }
+  var i: u16 = 0;
+  while (i < cnt) : (i += 1) {
+    const row = indices[i];
+    out_bitmap[row >> 5] |= (@as(u32, 1) << (row & 31));
+  }
+}
+
+// reduce_select_any_indexed_precompacted(): identical caller-visible
+// contract and wire protocol to reduce_select_any_indexed() above (see its
+// own comment for the full design), except this caller has ALREADY
+// compacted its own side -- my_indices/my_values/my_count/my_bitmap are
+// handed in directly instead of a dense [count]u32 array + sentinel for
+// this function to scan via compress_dense_to_indexed(). Skips straight to
+// stashing that data into the same module-scope scratch
+// (indexed_my_count/indexed_send_bitmap/indexed_send_indices/fsm_state.send_buf)
+// reduce_select_any_indexed() itself would have produced, then reuses
+// transfer_data_reduce_select_any_indexed()/append_merge_indexed()/
+// decompress_indexed_to_dense() and the whole FSM/teardown path completely
+// unmodified -- no new Ftype, no new FSM state; `cur_network_cfg.type` is
+// still Ftype.reduce_select_any_indexed, since the on-wire protocol and
+// every downstream state transition are identical either way.
+//
+// `count` here is still the FULL dense width (e.g. bool_pe.csl's `blk`),
+// NOT my_count -- it sizes recv_buf's dense decompression target and the
+// bitmap's own bit-width (which row VALUES are representable), same as
+// reduce_select_any_indexed()'s `count` parameter. my_count is just how
+// many of those `count` possible rows THIS PE is contributing.
+//
+// Safe to alias my_indices/my_values directly into indexed_send_indices/
+// fsm_state.send_buf (a long-lived, persistent caller buffer, unlike every
+// existing caller today which passes a fresh, call-scoped array via
+// compress_dense_to_indexed() first): append_merge_indexed()'s contract
+// already treats the whole "send"/incoming side as read-only for the
+// entire relay (see its own comment) -- the only mutation this relay ever
+// makes to a *_send_* buffer is overwriting send_bitmap's memory as a
+// middle root's landing zone for the second incoming side (see
+// transfer_data_reduce_select_any_indexed()'s pass-5/counter==4 root
+// branch), which is exactly why my_bitmap must be caller-provided SCRATCH
+// (rebuilt fresh via build_bitmap_from_indices() every call), never the
+// caller's own persistent bitmap of record -- my_indices/my_values
+// themselves are never written.
+fn reduce_select_any_indexed_precompacted(root: u16, my_indices: [*]u16, my_values: [*]u32,
+                                          my_count: u16, my_bitmap: [*]u32,
+                                          recv_buf: [*]u32, recv_bitmap: [*]u32,
+                                          recv_indices: [*]u16, recv_values: [*]u32,
+                                          sentinel: u32, count: u16, callback: local_task_id) void {
+
+  // WARNING: block LOCK in the beginning and only
+  // unblock LOCK when the operation finishes
+  @block(C_LOCK);
+
+  @assert(lib_initialized);
+
+  indexed_my_count = my_count;
+  indexed_dense_recv_buf = recv_buf;
+  indexed_send_bitmap = my_bitmap;
+  indexed_recv_bitmap = recv_bitmap;
+  indexed_send_indices = my_indices;
+  indexed_recv_indices = recv_indices;
+
+  cur_network_cfg = Network_Config {
+    .root = root,
+    .count = count,
+    .type = Ftype.reduce_select_any_indexed,
+    .sentinel = sentinel
+  };
+  fsm_state = FSM_State {
+    .send_buf = my_values,
+    .recv_buf = recv_values,
+    .state = StateEnum.Configure_network,
+    .callback = callback,
+    .counter = 0
+  };
+  // all ops must clear filter and switch first
+  clear_filter_and_switch();
+  // reconfigure the routing and switch on C0 and C1, then start the FSM --
+  // configure_reduce_network() is pure routing/color config, no arithmetic
+  // dependence, reused unchanged from reduce_fadds/reduce_or/reduce_select_any.
+  configure_reduce_network(DATA_COLOR_0);
+  configure_reduce_network(DATA_COLOR_1);
+  start_data_transfer();
+}
+
 
 // initiate_teardowns() is called when the operation {broadcast,
 // reduce_adds} finishes the data transfer.

@@ -650,6 +650,116 @@ only, see #8's updated occurrence note) — real progress, but not itself
 sufficient to lift the blk=1024 ceiling. A genuine, safe, permanent
 code-size reduction regardless.
 
+### 19. Sparse (compacted) parent-candidate storage for `reduce_select_any_indexed` — real `.bss` reduction, but caught a real intra-round duplicate-append bug during development
+
+**Where**: `bool_pe.csl`'s `parent_local_buf` (the per-PE dense `[blk]u32`
+send-side buffer `compute_topdown()`/`compute_bottomup()` write into and
+`term_col_bcast_done()` feeds to the parent-resolution relay) and, for
+`parent_resolve_variant == 2` only, the matching `[blk]u16`/`[blk]u32`
+`parent_send_indices`/`parent_send_values` scratch #17's indexed collective
+needed to compress it into wire format.
+
+**Root cause of the cost (not a bug, a sizing choice)**: a PE can only ever
+record a parent candidate for a local row it has a real incoming structural
+edge to — bounded by `max_local_nnz_rows` (already computed by
+`preprocess_bool.py`, already threaded as a compile param), not `blk`. At
+real scale (RMAT s21 750x750: `blk=2797`, `max_local_nnz_rows=152`) that
+bound is a small fraction of `blk` (~5.4% in that config), so the dense
+send-side buffers were paying for far more slots than could ever be used —
+a real, quantifiable, directly A/B-compiled (`cslc` + `cs_readelf -m`)
+contributor to the "ran out of PE memory" failures in #8/#17, on top of the
+FSM code-size driver #17 already identified there.
+
+**Important scope limit, checked directly against source before building
+anything**: this only applies to `parent_resolve_variant == 2` (indexed).
+Dense's own reduce protocol (`reduce_select_any`/
+`transfer_data_reduce_select_any`, the production default and what
+actually failed on the real scale-21 hardware run referenced in #1/#8) has
+no index-array concept anywhere — every hop moves a fixed-size positional
+block via DMA and merges it with a plain positional compare
+(`select_merge_u32`). It cannot be pointed at a compacted array at any size
+without ceasing to be dense. So this does **not** fix the original
+scale-21 dense-variant failure — only extends indexed's own reach (e.g.
+grids like the documented `blk=1024` case in #8/#17 that indexed currently
+can't compile at).
+
+**What was built**: `parent_compact_indices`/`parent_compact_values`
+(`bool_pe.csl`), an incrementally-appended, discovery-order compacted pair
+sized by `max_local_nnz_rows` instead of `blk`, replacing
+`parent_local_buf`/`parent_send_indices`/`parent_send_values` for
+`variant == 2` (comptime-zero-sized there instead; dense's own buffers
+untouched). Two pure additions to `collectives_2d/pe.csl`:
+`build_bitmap_from_indices()` (derives the membership bitmap
+`reduce_select_any_indexed`'s wire protocol needs, since an incrementally
+built pair has no bitmap for free the way a dense-array compress pass
+does) and `reduce_select_any_indexed_precompacted()` (identical contract
+and wire protocol to #17's `reduce_select_any_indexed()`, just skipping its
+internal `compress_dense_to_indexed()` call and aliasing the caller's
+already-compacted arrays straight into the FSM's scratch — reuses the
+entire FSM/teardown path unmodified, no new `Ftype`).
+
+**A real correctness bug found and fixed during development, before this
+ever reached hardware**: the first version reused
+`visited_bitmap`'s existing "not yet discovered" gate as the *only*
+duplicate check on `compute_topdown()`'s append site, reasoning that a row
+already visited can never be re-appended. True across rounds, but **not**
+within one round: `compute_topdown()`'s nested loop (every frontier
+column, then every row it touches) can hit the *same* not-yet-visited row
+from two different local columns inside one call — harmless for the old
+dense scheme (repeated writes to the same `parent_local_buf[k]` slot, last
+write wins, no growth) but silently double-appended that row into the
+compacted pair, inflating `parent_compact_count` past its true
+`max_local_nnz_rows` bound and eventually tripping the bounds guard,
+silently dropping later genuine discoveries. Caught immediately by this
+repo's own scipy cross-check at the smallest smoke-test scale (RMAT s8,
+4x4 grid, source 0): `10/256` visited-set mismatches, `2` invalid parents,
+device `visited_count=179` vs scipy's `189` — with the *dense* variant
+passing cleanly (`0` mismatches) on the identical matrix/grid/source,
+isolating the regression to this change rather than something
+pre-existing. Root-caused to the missing within-round dedup described
+above (not a relay/collective bug — `reduce_select_any_indexed_
+precompacted()`'s cross-PE merge was never reached with corrupted input
+until this was fixed). Fixed by adding `parent_round_seen_bitmap`, a
+per-round (not per-run) dedup bitmap reset every round alongside
+`y_bitmap`/`y_bitmap_reduced`, gating the append so only the first hit on a
+given row within a round is recorded (`compute_bottomup()` needs no
+equivalent gate — `mat_row_idx_buf` already lists each distinct local row
+at most once by construction). Re-verified clean after the fix: RMAT s8
+4x4, sources {0, 5, 50}, both plain and `--directional` (confirming
+`compute_bottomup()`'s own path, unaffected by the bug, still correct) —
+**0 mismatches, 0 invalid parents, scipy cross-check OK** in every case.
+**Status of correctness verification**: confirmed only at this small
+smoke-test scale (RMAT s8, 4x4 grid) so far, per this session's own
+scope — larger-grid A/B (matching #16/#17's own real-hardware scales) and
+a real appliance re-attempt at a previously-blocked config (e.g. #8/#17's
+`blk=1024` case) are follow-up work, not yet run.
+
+**Memory measured** (direct `cslc` + `cs_readelf -m` A/B, this session's
+own smoke-test scale — RMAT s8, 4x4 grid, `blk=64`, `max_local_nnz_rows=55`;
+note this config's `max_local_nnz_rows`/`blk` ratio (~86%) is far denser
+than #17's real-scale s21 config (~5.4%), so the *absolute* saving below is
+correspondingly small — it's a directional confirmation, not the
+real-scale number, which needs the larger-grid A/B noted above to measure
+directly):
+```
+                         dense (variant=0)   indexed (variant=2)
+before this change:      24,704 B             27,088 B
+after this change:       24,704 B (unchanged) 26,320 B  (-768 B, -2.8%)
+```
+Dense's byte count is bit-for-bit identical before/after (confirmed via
+the same A/B) — zero regression there, as expected from the scope limit
+above.
+
+**Status**: landed for `parent_resolve_variant == 2` only. Does **not**
+supersede #8's residual code-size-driven ceiling at very large `blk` (see
+#17's own follow-up investigation — FSM code size, not caller-side
+buffers, is the larger remaining driver there), and does **not** fix the
+original scale-21 dense-variant failure referenced in #1/#8 — only shrinks
+indexed's own per-PE data footprint. Larger-grid measurement (to see the
+saving at a `max_local_nnz_rows`/`blk` ratio closer to #17's real-scale
+numbers) and a real appliance re-attempt at a previously-blocked config are
+the concrete next steps.
+
 ## Summary table
 
 | # | Error | Where confirmed | Cause | Status |
@@ -673,3 +783,4 @@ code-size reduction regardless.
 | 16 | `reduce_select_any_sparse` ~7.6-8x slower, not a bug | RMAT s17 (750x750) + s19 (512x512), real hardware | manual O(`blk`) scalar bit-scan every hop, ~10x more cycles/word than dense's `@mov32` DMA transfer, dwarfing the bytes saved by low occupancy | **Not adopted, fully removed** (no regime where it won; deleted entirely from `collectives_2d/pe.csl` and `bool_pe.csl`, not just unwired) |
 | 17 | `reduce_select_any_indexed` 4.5-8.9x FASTER than dense, real win | RMAT s17 (750x750, blk=175) + s19 (750x750, blk=700), real hardware; s19 (512x512, blk=1024) blocked by #8 | explicit `(row_index,value)` pairs give O(popcount) merge vs sparse's O(`blk`) scan; ceiling at blk=1024 traced to indexed's own code size, not caller-side buffers (comptime-sizing + removing sparse AND scatter/gather narrowed but didn't clear it) | **Kept as opt-in** (`parent_resolve_variant=2`; default remains dense since the code/data cost blocks the largest-`blk` grids, see #8) |
 | 18 | Dead `scatter`/`gather` collectives, zero call sites | `collectives_2d/pe.csl` (bool_diag_spmv's private fork) | vestigial from the original library; 10 functions, never called by this kernel or any of its test harnesses | **Removed** (regression-tested clean; shrank but didn't clear #8's blk=1024 ceiling) |
+| 19 | Indexed's dense send-side parent buffers cost more than needed; also a real intra-round duplicate-append bug found+fixed during this change's own development | RMAT s8 4x4 (smoke-test scale; larger-grid A/B not yet run) | `parent_local_buf`/`parent_send_indices`/`parent_send_values` sized by `blk` when only `max_local_nnz_rows` slots can ever be used; dev bug: `visited_bitmap` alone doesn't dedup two hits on the same row within one round's `compute_topdown()` | **Fixed** (compacted `parent_compact_indices/values` + `reduce_select_any_indexed_precompacted`, `variant==2` only; dev bug fixed via new per-round `parent_round_seen_bitmap`; -768B/-2.8% measured at smoke-test scale, dense unaffected; does not clear #8's blk=1024 ceiling) |

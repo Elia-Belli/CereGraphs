@@ -519,7 +519,14 @@ const PARENT_NONE: u32 = 4294967295;
 // back every column's independent copy (see device_io.py's
 // extract_parent_result(), now much simpler since the per-row combine
 // happens here instead of host-side).
-var parent_local_buf = @zeros([blk]u32);
+//
+// Comptime-zero-sized for parent_resolve_variant == 2 -- every write/read
+// site below is gated on parent_resolve_variant, so a variant==2 compile
+// never touches this buffer at all; it's dead weight there, replaced by
+// the much smaller parent_compact_indices/values pair (see their own
+// declaration comment, further below).
+const PARENT_LOCAL_BUF_LEN: u16 = if (parent_resolve_variant == 2) 0 else blk;
+var parent_local_buf = @zeros([PARENT_LOCAL_BUF_LEN]u32);
 // recv_buf for the parent-resolution reduce -- meaningful ONLY at PE-column
 // MID after f_spmv_iter converges (every other column's copy is a
 // non-root reduce participant, same "only the aggregation point's copy is
@@ -547,14 +554,82 @@ var parent_relay_result = @zeros([blk]u32);
 // measured ~7.6-8x SLOWER on real hardware (docs/ERRORS.md #16) with no
 // regime where it's the better choice, so unlike indexed there was no
 // reason to keep any of it around, caller-side or in collectives_2d/pe.csl.
+// INDEXED_ARRAY_LEN now covers the RECV side only (parent_recv_indices/
+// values) -- worst case, the union several PEs' candidates merge into
+// mid-relay can span the full blk row-space even though no single PE's own
+// candidates ever exceed max_local_nnz_rows (see PARENT_COMPACT_LEN below,
+// and the sparse parent-storage plan's "what cannot shrink" section for the
+// full argument). The send side no longer needs a dedicated blk-sized
+// buffer at all -- see parent_compact_indices/values below.
 const INDEXED_BITMAP_LEN: u16 = if (parent_resolve_variant == 2) BITMAP_WORDS else 0;
 const INDEXED_ARRAY_LEN: u16 = if (parent_resolve_variant == 2) blk else 0;
 var parent_send_bitmap = @zeros([INDEXED_BITMAP_LEN]u32);
 var parent_recv_bitmap = @zeros([INDEXED_BITMAP_LEN]u32);
-var parent_send_indices = @zeros([INDEXED_ARRAY_LEN]u16);
 var parent_recv_indices = @zeros([INDEXED_ARRAY_LEN]u16);
-var parent_send_values = @zeros([INDEXED_ARRAY_LEN]u32);
 var parent_recv_values = @zeros([INDEXED_ARRAY_LEN]u32);
+
+// parent_compact_{indices,values,count}: sparse (compacted) counterpart of
+// parent_local_buf, used ONLY for parent_resolve_variant == 2 -- see the
+// sparse parent-storage plan. Unlike parent_local_buf (dense over the full
+// [blk] row-block, one slot per possible local row), this is sized by
+// max_local_nnz_rows -- the true bound on how many rows THIS PE can ever
+// record a parent for (a PE can only ever discover a parent candidate for a
+// row it has a real incoming structural edge to), which at real scale is a
+// small fraction of blk. Built incrementally, in DISCOVERY ORDER, across
+// however many rounds BFS takes -- parent_compact_count itself resets to 0
+// only once per f_spmv_iter call, in start_spmv() (see there). Across
+// DIFFERENT rounds, visited_bitmap's existing gate in compute_topdown()/
+// compute_bottomup() already guarantees at most one append per row --
+// once a row is recorded, it's marked visited by the end of that same
+// round (via the row-reduce every PE shares), so no later round's hit on
+// it can ever pass the gate again. WITHIN one round's own compute_topdown()
+// call, however, that gate is NOT enough by itself: the nested loop there
+// (every frontier column, every row it touches) can hit the SAME
+// not-yet-visited row from two DIFFERENT local columns in that one call --
+// harmless for the old dense scheme (repeated writes to the same
+// parent_local_buf[k] slot, last write wins), but would silently double-
+// append the same row here without parent_round_seen_bitmap below providing
+// the missing WITHIN-round dedup (see its own declaration comment).
+//
+// indices[] MUST hold REAL LOCAL ROW NUMBERS (0..blk-1), not a remapped
+// slot of any kind (e.g. NOT row_to_bucket's own bucket-index numbering,
+// even though that would also be a valid <=max_local_nnz_rows-sized
+// compaction of this PE's own rows) -- the cross-PE relay
+// (reduce_select_any_indexed_precompacted(), collectives_2d/pe.csl) compares
+// candidates from P different PEs for the SAME row, and a PE-specific
+// remapping would mean "slot 5" refers to a different row on different
+// PEs, silently breaking that cross-PE correspondence.
+// reduce_select_any_indexed's own existing wire format already gets this
+// right (compress_dense_to_indexed() stores the true dense row index, not
+// a compacted position, in its own indices[] -- collectives_2d/pe.csl); this
+// follows that same convention, just built up incrementally instead of
+// compressed from a complete dense array in one pass.
+const PARENT_COMPACT_LEN: u16 = if (parent_resolve_variant == 2) max_local_nnz_rows else 0;
+var parent_compact_indices = @zeros([PARENT_COMPACT_LEN]u16); // real local row numbers, discovery order
+var parent_compact_values = @zeros([PARENT_COMPACT_LEN]u32);  // matching global parent vertex ids
+var parent_compact_count: u16 = 0;
+
+// parent_round_seen_bitmap: THIS ROUND's own "already appended" set for
+// compute_topdown()'s append site -- the piece visited_bitmap alone can't
+// provide (see parent_compact_indices' own declaration comment for the
+// full reasoning: visited_bitmap only rules out a row already discovered
+// on a PRIOR round, not two hits on the same still-undiscovered row
+// within the SAME compute_topdown() call). Sized/indexed exactly like
+// visited_bitmap/x_bitmap/y_bitmap (BITMAP_WORDS, one bit per local row);
+// reset every round in compute() (see there), before compute_topdown()/
+// compute_bottomup() dispatch -- compute_bottomup() itself needs no gate
+// (mat_row_idx_buf lists each distinct local row at most once, see
+// compute_bottomup()'s own comment), but the reset runs unconditionally
+// every round regardless of direction, same as y_bitmap/y_bitmap_reduced's
+// own resets just below it.
+var parent_round_seen_bitmap = @zeros([INDEXED_BITMAP_LEN]u32);
+// Fast-reset DSD for parent_round_seen_bitmap, same trick as
+// y_bitmap_dsd/y_bitmap_reduced_dsd just below -- extent is BITMAP_WORDS
+// (not INDEXED_BITMAP_LEN) so this lines up with fill_bitmap_u32's own
+// fixed BITMAP_WORDS extent; only ever @mov32'd through when
+// parent_resolve_variant == 2, the same compile-time branch that makes
+// INDEXED_BITMAP_LEN equal BITMAP_WORDS (see compute()).
+const parent_round_seen_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &parent_round_seen_bitmap, .extent = BITMAP_WORDS });
 
 // Read-only instrumentation for the sparse-reduce_select_any investigation
 // (Phase 1 of the plan): measures how many of this PE's blk local rows
@@ -688,7 +763,7 @@ fn start_spmv() void {
 
     // At the start of new BFS:
     // - Reset the visited as the new x
-    // - Reset the parent_local_buf to PARENT_NONE
+    // - Reset the parent candidate storage
     if (pcol_id == prow_id) {
 
         var w: u16 = 0;
@@ -697,10 +772,22 @@ fn start_spmv() void {
             visited_bitmap[w] = x_bitmap[w];
         }
     }
-    var p: u16 = 0;
-    while (p < blk) : (p += 1)
-    {
-        parent_local_buf[p] = PARENT_NONE;
+    if (parent_resolve_variant == 2) {
+        // O(1): parent_compact_indices/values need no reset -- only the
+        // [0, parent_compact_count) prefix is ever read (by the end-of-run
+        // relay in term_col_bcast_done()), and every write site
+        // (compute_topdown()/compute_bottomup()) only ever appends at the
+        // current count, so stale entries past a fresh run's own count are
+        // simply never looked at -- same convention ts_buf/nf_history/
+        // direction_history already use (see their own declaration
+        // comments) for a from-scratch scalar reset.
+        parent_compact_count = 0;
+    } else {
+        var p: u16 = 0;
+        while (p < blk) : (p += 1)
+        {
+            parent_local_buf[p] = PARENT_NONE;
+        }
     }
 
     // Every fresh BFS must start top-down: nf at the root is always far
@@ -849,10 +936,15 @@ fn transpose_structure() void {
 // for this round, so visited_bitmap is guaranteed stable for the whole
 // loop below. Any candidate gated by visited_bitmap is an acceptable
 // one-hop-closer parent regardless of which local column supplies it (see
-// the module docstring above), so there's no ordering requirement across
-// multiple hits on the same row -- whichever column is walked last for a
-// given row wins, folded in immediately per-hit rather than via a deferred
-// compact-scratch merge.
+// the module docstring above), so there's no CORRECTNESS ordering
+// requirement across multiple hits on the same row -- dense
+// (parent_resolve_variant != 2) folds every hit straight into
+// parent_local_buf[k], so whichever column is walked last for a given row
+// wins that slot. parent_resolve_variant == 2's compacted append instead
+// only takes the FIRST hit per row per round and skips the rest (see
+// parent_round_seen_bitmap's own comment) -- a different but equally legal
+// tie-break, needed there because a compacted append (unlike an ordinary
+// dense overwrite) has no free idempotency for repeat hits on the same row.
 //
 // A two-pass split (boolean multiply, then a separate parent-tracking
 // pass) was tried to measure each half independently -- it showed the two
@@ -879,7 +971,35 @@ fn compute_topdown() void {
                 // to avoid silently truncating for any pcol_id*blk >= 65536.
                 if ((visited_bitmap[k >> 5] >> (k & 31)) & 1 == 0) {
                     const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
-                    parent_local_buf[k] = global_c;
+                    if (parent_resolve_variant == 2) {
+                        // visited_bitmap alone only rules out a row already
+                        // discovered on a PRIOR round -- it says nothing
+                        // about a SECOND local column hitting the same
+                        // not-yet-visited row k later in THIS SAME call
+                        // (this loop nest walks every frontier column, so
+                        // that genuinely happens). parent_round_seen_bitmap
+                        // (see its own declaration comment) is what makes
+                        // this append-once-per-row-per-round instead of
+                        // append-once-per-hit -- first hit on k this round
+                        // wins (an arbitrary but still legal tie-break, same
+                        // as dense's own "no correctness requirement on
+                        // which hit wins", just first instead of last). The
+                        // bound guard below IS load-bearing with this gate
+                        // in place (fails safe if it somehow still tripped),
+                        // but should never actually trip: this gate caps
+                        // real appends at one per distinct row, and
+                        // max_local_nnz_rows is exactly that per-PE bound.
+                        if (((parent_round_seen_bitmap[k >> 5] >> (k & 31)) & 1) == 0) {
+                            parent_round_seen_bitmap[k >> 5] |= (@as(u32, 1) << (k & 31));
+                            if (parent_compact_count < max_local_nnz_rows) {
+                                parent_compact_indices[parent_compact_count] = k;
+                                parent_compact_values[parent_compact_count] = global_c;
+                                parent_compact_count += 1;
+                            }
+                        }
+                    } else {
+                        parent_local_buf[k] = global_c;
+                    }
                 }
             }
         }
@@ -913,7 +1033,17 @@ fn compute_bottomup() void {
                 // See compute_topdown()'s matching comment -- same global-id
                 // computation, u32 arithmetic required.
                 const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
-                parent_local_buf[r] = global_c;
+                if (parent_resolve_variant == 2) {
+                    // Same append convention as compute_topdown() -- see
+                    // parent_compact_indices' own declaration comment.
+                    if (parent_compact_count < max_local_nnz_rows) {
+                        parent_compact_indices[parent_compact_count] = r;
+                        parent_compact_values[parent_compact_count] = global_c;
+                        parent_compact_count += 1;
+                    }
+                } else {
+                    parent_local_buf[r] = global_c;
+                }
                 break; // first hit wins -- no need to look at r's other columns
             }
         }
@@ -926,6 +1056,15 @@ task compute() void {
     // Reset y_bitmap and y_bitmap_reduced
     @mov32(y_bitmap_dsd, fill_bitmap_u32);
     @mov32(y_bitmap_reduced_dsd, fill_bitmap_u32);
+
+    // Reset this round's parent-append dedup set (see
+    // parent_round_seen_bitmap's own declaration comment) -- needed before
+    // every compute_topdown() call, so simplest to reset unconditionally
+    // every round regardless of direction, same as y_bitmap/y_bitmap_reduced
+    // just above (compute_bottomup() itself never reads this bitmap).
+    if (parent_resolve_variant == 2) {
+        @mov32(parent_round_seen_dsd, fill_bitmap_u32);
+    }
 
     // Phase 3: dispatch to whichever traversal strategy this round is
     // using -- only the LOCAL computation differs (see the plan); the
@@ -1117,38 +1256,54 @@ task term_col_bcast_done() void {
         // sides in parallel, same latency-minimizing reasoning already used
         // for reduce_fadds/broadcast above (see the P/MID comment near their
         // declaration).
-        // Phase 1 instrumentation (see occ_bitmap's own declaration
-        // comment): build "row k has a real parent candidate" as a
-        // bitmap (same bit-set idiom compute_topdown() uses), then
-        // popcount it via the existing 16-bit-granularity @popcnt +
-        // u16-view trick reduce_done() already uses for nz_local. Purely
-        // local compute, zero fabric traffic, runs once -- does not
-        // change reduce_select_any's own behavior below at all.
-        var occ_w: u16 = 0;
-        while (occ_w < BITMAP_WORDS) : (occ_w += 1) {
-            occ_bitmap[occ_w] = 0;
-        }
-        var occ_k: u16 = 0;
-        while (occ_k < blk) : (occ_k += 1) {
-            if (parent_local_buf[occ_k] != PARENT_NONE) {
-                occ_bitmap[occ_k >> 5] |= (@as(u32, 1) << (occ_k & 31));
-            }
-        }
-        @popcnt(occ_popcnt_dst_dsd, occ_popcnt_src_dsd);
-        parent_occupancy[0] = 0;
-        var occ_pw: u16 = 0;
-        while (occ_pw < 2 * BITMAP_WORDS) : (occ_pw += 1) {
-            parent_occupancy[0] += @as(u32, occ_popcnt_scratch[occ_pw]);
-        }
-
         timestamp.get_timestamp(&parent_resolve_tic_buffer);
         if (parent_resolve_variant == 2) {
-            mpi_x.reduce_select_any_indexed(MID, &parent_local_buf, &parent_relay_result,
-                                             &parent_send_bitmap, &parent_recv_bitmap,
-                                             &parent_send_indices, &parent_recv_indices,
-                                             &parent_send_values, &parent_recv_values,
-                                             PARENT_NONE, blk, parent_resolve_done_task_id);
+            // parent_occupancy: exact and O(1) for the compacted
+            // representation -- parent_compact_count already IS this PE's
+            // count of rows with a real recorded candidate (every append is
+            // gated by visited_bitmap, see parent_compact_indices' own
+            // declaration comment), so there is nothing left to scan or
+            // popcount, unlike dense's own occ_bitmap-based O(blk)
+            // approximation below.
+            parent_occupancy[0] = @as(u32, parent_compact_count);
+
+            // Build the membership bitmap reduce_select_any_indexed_precompacted()
+            // needs as its O(1) "is this row already covered" test -- the
+            // one piece parent_compact_indices/values don't already carry
+            // (unlike compress_dense_to_indexed()'s dense-array callers,
+            // there's no dense pass here to derive it from for free).
+            mpi_x.build_bitmap_from_indices(&parent_compact_indices, parent_compact_count,
+                                             BITMAP_WORDS, &parent_send_bitmap);
+            mpi_x.reduce_select_any_indexed_precompacted(MID, &parent_compact_indices, &parent_compact_values,
+                                                          parent_compact_count, &parent_send_bitmap,
+                                                          &parent_relay_result, &parent_recv_bitmap,
+                                                          &parent_recv_indices, &parent_recv_values,
+                                                          PARENT_NONE, blk, parent_resolve_done_task_id);
         } else {
+            // Phase 1 instrumentation (see occ_bitmap's own declaration
+            // comment): build "row k has a real parent candidate" as a
+            // bitmap (same bit-set idiom compute_topdown() uses), then
+            // popcount it via the existing 16-bit-granularity @popcnt +
+            // u16-view trick reduce_done() already uses for nz_local. Purely
+            // local compute, zero fabric traffic, runs once -- does not
+            // change reduce_select_any's own behavior below at all.
+            var occ_w: u16 = 0;
+            while (occ_w < BITMAP_WORDS) : (occ_w += 1) {
+                occ_bitmap[occ_w] = 0;
+            }
+            var occ_k: u16 = 0;
+            while (occ_k < blk) : (occ_k += 1) {
+                if (parent_local_buf[occ_k] != PARENT_NONE) {
+                    occ_bitmap[occ_k >> 5] |= (@as(u32, 1) << (occ_k & 31));
+                }
+            }
+            @popcnt(occ_popcnt_dst_dsd, occ_popcnt_src_dsd);
+            parent_occupancy[0] = 0;
+            var occ_pw: u16 = 0;
+            while (occ_pw < 2 * BITMAP_WORDS) : (occ_pw += 1) {
+                parent_occupancy[0] += @as(u32, occ_popcnt_scratch[occ_pw]);
+            }
+
             mpi_x.reduce_select_any(MID, &parent_local_buf, &parent_relay_result,
                                      PARENT_NONE, blk, parent_resolve_done_task_id);
         }
