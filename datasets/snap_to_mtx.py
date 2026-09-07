@@ -3,7 +3,7 @@ download_snap_graphs.sh) into Matrix Market format -- util/analyze (the
 same balancing step gen_rmat.py's own outputs go through before running on
 device) only reads .mtx, it has no edge-list support, so this is the SNAP
 counterpart to gen_rmat.py's own mmwrite() call. Loading itself reuses
-bfs/bool_diag_spmv/graph_loader.py's SNAP-edge-list auto-detection --
+bfs/implementation/graph_loader.py's SNAP-edge-list auto-detection --
 duplicated here as a sys.path import rather than converted to a package,
 matching how run_bfs.appliance.py already borrows pieces of run_bfs.py by
 copy instead of import (see that file's own module docstring).

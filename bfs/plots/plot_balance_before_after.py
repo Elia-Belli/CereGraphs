@@ -31,9 +31,9 @@ Uses the same SURFACE/TEXT_PRIMARY/GRIDLINE/BASELINE palette and
 plot_grid_scale_heatmap.py's sequential single-hue (blue) ramp convention
 for the heatmap panels.
 
-Usage: cs_python plots/plot_balance_before_after.py
-         --raw=../../data/rmat_s10_e16.mtx
-         --balanced=../../data/rmat_s10_e16.balanced8x8.mtx
+Usage (from the repo root): cs_python bfs/plots/plot_balance_before_after.py
+         --raw=data/rmat_s10_e16.mtx
+         --balanced=data/rmat_s10_e16.balanced8x8.mtx
          --grid=8
 
 Writes into results/balancing/<dataset>/ (one subfolder per --raw input,

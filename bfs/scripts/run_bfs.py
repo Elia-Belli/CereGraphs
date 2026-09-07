@@ -137,12 +137,11 @@ def parse_args():
 
   parser.add_argument("--dump-pe-timing", action="store_true",
                        help="save the full per-PE-per-round-per-phase cycle grid to a .npz file "
-                            "(default off -- diagnostic only, for plot_pe_heatmap.py; not part "
-                            "of the default tree/timing/correctness reports)")
+                            "(default off -- diagnostic only, for offline per-PE analysis; not "
+                            "part of the default tree/timing/correctness reports)")
   parser.add_argument("--pe-timing-out", default=None,
                        help="path for --dump-pe-timing's .npz output (default: results/<hw|sim>/"
-                            "heatmap/<matrix>_<grid>_src<N>/<matrix>_<grid>_src<N>.npz -- the same "
-                            "per-run folder plot_pe_heatmap.py renders its PNGs into; hw vs sim "
+                            "heatmap/<matrix>_<grid>_src<N>/<matrix>_<grid>_src<N>.npz; hw vs sim "
                             "matching --csv)")
   parser.add_argument("--parent-resolve-variant", choices=["dense", "indexed"],
                        default="dense",

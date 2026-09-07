@@ -1,8 +1,9 @@
 # bool_diag_spmv — boolean-semiring SpMV, diagonal-reduce, iterative
 
-A from-scratch redesign of `../../spmv/sdk-hypersparse-spmv` for a different target
-workload: boolean-semiring SpMV (`y = OR_j (A[i,j] AND x[j])`) on a *square*
-adjacency matrix, as the building block for an on-device BFS. `f_spmv_iter`
+A from-scratch redesign of the SDK's `hypersparse_spmv` example for a
+different target workload: boolean-semiring SpMV (`y = OR_j (A[i,j] AND
+x[j])`) on a *square* adjacency matrix, as the building block for an
+on-device BFS. `f_spmv_iter`
 now runs the full loop entirely on-device — frontier propagation, a
 cumulative visited set, real termination detection, and parent tracking,
 with no host round trip and no fixed iteration cap — see "Status" below for
@@ -21,17 +22,18 @@ what's genuinely done versus what's still a stub.
   `run_bfs.appliance.py`, `run_graph500.py`) and the shell orchestration
   scripts around them (smoke tests, sweeps, slurm submission).
 - `plots/` — the plotting *code* only (`plot_bfs_timing.py`,
-  `plot_pe_heatmap.py`, `bfs_tree_plot.py`, and the poster/report figure
-  generators) — no rendered output lives here.
-- `results/` — every output artifact, both data and images: the CSV/JSONL
-  logs (`hw/bfs_timing.csv`, `sim/bfs_timing.csv`, `graph500_searches.csv`,
+  `plot_bfs_timing_poster.py`, `plot_grid_scale_heatmap.py`,
+  `plot_balance_before_after.py`, `bfs_tree_plot.py`) — no rendered output
+  lives here.
+- `results/` — every output artifact, both data and images: the CSV logs
+  (`hw/bfs_timing.csv`, `sim/bfs_timing.csv`, `graph500_searches.csv`,
   `graph500_summary.csv`) and the rendered PNG/SVG trees, timing charts, and
   heatmaps the scripts above save (`results/<hw|sim>/tree/`,
   `results/<hw|sim>/timing/`, `results/hw/heatmap/`, `results/balancing/`).
+  Gitignored and fully regenerable.
 - `out/` — compiled kernel ELFs, one subfolder per `--latestlink` target
-  (`out/wse3`, `out/latest` for anything run without an explicit
-  `--latestlink`) — freely regenerable in seconds via `cslc`,
-  unlike `results/`.
+  (`out/latest` for anything run without an explicit `--latestlink`) —
+  freely regenerable in seconds via `cslc`, unlike `results/`.
 
 ## Files
 
@@ -39,11 +41,11 @@ what's genuinely done versus what's still a stub.
   and `<collectives_2d>` params, asserts a square PE grid, exports buffers
   and the `f_spmv_iter`/timing functions.
 - `implementation/src/bool_pe.csl` — the whole per-PE kernel in one flat
-  file (no nested module-import layer like
-  `sdk-hypersparse-spmv/src/hypersparse_spmv/`) — modeled on the SDK's
+  file (no nested module-import layer like the SDK's own
+  `hypersparse_spmv` example uses) — modeled on the SDK's
   `gemv-collectives_2d/pe.csl` example.
-- `implementation/preprocess_bool.py` — structural fork of
-  `../../spmv/sdk-hypersparse-spmv/preprocess.py`: identical hypersparse
+- `implementation/preprocess_bool.py` — structural fork of the SDK
+  `hypersparse_spmv` example's own `preprocess.py`: identical hypersparse
   compressed-column partitioning (`mat_col_idx/loc/len_buf`,
   `mat_rows_buf`, `y_rows_init_buf`), minus `mat_vals_buf` (boolean
   semiring never uses edge weights).
@@ -71,42 +73,15 @@ what's genuinely done versus what's still a stub.
   `docs/GRAPH500_BENCHMARK.md` for the GTEPS methodology. `--dump-pe-timing`
   (off by default) additionally saves the full per-PE-per-round-per-phase
   cycle grid to a `.npz` file, inside
-  `results/<hw|sim>/heatmap/<matrix>_<grid>_src<N>/` -- the same per-run
-  folder `plots/plot_pe_heatmap.py` renders its PNGs into, so the raw data
-  and its plots stay together as one self-contained bundle. A deeper
+  `results/<hw|sim>/heatmap/<matrix>_<grid>_src<N>/` -- a deeper
   diagnostic than the aggregate min/max/avg the CSV logs, for seeing
-  exactly which PEs are the straggler(s) for a given phase.
+  exactly which PEs are the straggler(s) for a given phase (see
+  `docs/GRAPH500_BENCHMARK.md` for the per-PE heatmap tooling this was
+  built for, since removed from this repo).
 - `plots/plot_bfs_timing.py` — the per-round stacked-bar timing chart
   `run_bfs.py` calls automatically; also runnable standalone
   (`plot_timing_row()`) to re-plot an existing `results/sim/bfs_timing.csv`
   row without re-running the device.
-- `plots/plot_pe_heatmap.py` — reads a `--dump-pe-timing` `.npz` and renders
-  per-PE cycle-cost heatmaps into their own subfolder,
-  `results/<hw|sim>/heatmap/<matrix>_<grid>_src<N>/`: one `round_<r>.png`
-  per profiled round (the round number is always in the title), plus one
-  `summary_avg.png` overview (mean over all rounds -- typical cost, not
-  one worst round). Rounds are kept separate rather than aggregated by
-  default because which PEs are active in a given round is itself a
-  function of the graph's structure and the chosen `--source`, not just
-  the communication protocol -- comparing rounds directly is how you tell
-  those two effects apart. Default phase selection is
-  `bfs_timing.LEAF_PHASES`, each with its own independent color scale
-  (`local_compute` and `local_term_cond` differ by an order of magnitude);
-  `--phase name1,name2,...` or `--relay` (shorthand for the 4-phase
-  termination relay's sub-phases) instead select a specific subset and
-  share ONE color scale across them, for direct magnitude comparison.
-  Also renders `sparsity.png` -- the matrix's own per-PE partition counts
-  (`local_nnz`/`local_nnz_cols`/`local_nnz_rows`, fixed for the whole run,
-  no round axis) -- next to the timing heatmaps, to check by eye whether a
-  phase's imbalance actually tracks the matrix's own sparsity distribution
-  (it does for `local_compute`: its worst PE matches `local_nnz`'s worst
-  PE exactly) or comes from somewhere else (the termination relay's cost
-  does not correlate with sparsity at all -- see section 8). Diagonal PEs
-  are outlined and the relay's aggregation point (`(MID, MID)`) is
-  starred; `--cmap` picks any matplotlib colormap (default `magma`).
-  Standalone only -- never touches the device, purely a re-plot of
-  already-saved data. See `docs/GRAPH500_BENCHMARK.md` section 8 for what this
-  revealed about the termination relay's cost.
 - `scripts/run_graph500.py` — the full Graph500-shaped benchmark: one
   compile, one matrix upload (timed once as construction, excluded from
   every search), then `--num-searches` (default 64, per the spec)
@@ -137,7 +112,8 @@ once you want an actual GTEPS number instead of one root's tree.
 ## Design: why the diagonal, and why `<collectives_2d>`
 
 Communication is targeted at the grid diagonal (`pcol_id == prow_id`) instead
-of a fixed corner or a full `P^2` scatter (contrast with `sdk-hypersparse-spmv`):
+of a fixed corner or a full `P^2` scatter (contrast with a fully
+`P^2`-distributed design, see "Trade-offs" below):
 
 - **Phase 1 (broadcast)**: only the diagonal PE of a column starts with real
   `x` data (seeded by the host via memcpy); it's broadcast to the rest of the
@@ -261,40 +237,43 @@ later member's global index happened to be lower, producing an invalid
 level closer, however plausible it looked as *a* valid predecessor. The
 device-side fix (`visited_buf` gate above) plus the matching host-side
 reference-implementation fix (gated on the host's own `visited` array the
-same way) now give a parent that matches
-`sdk-hypersparse-spmv-bfs/run_bfs.py`'s stricter `find_parents()` definition (exactly one
-BFS level closer), not merely `verify_bfs()`'s looser one (visited + a real
-edge, no level check) — confirmed by `run_bfs.py`, whose
+same way) now give a parent that matches a strict `find_parents()`
+definition (exactly one BFS level closer), not merely a looser
+`verify_bfs()` one (visited + a real edge, no level check) — confirmed by
+`run_bfs.py`, whose
 `--show-parent-mismatch` tie-break-difference count against scipy's own
 `breadth_first_order` dropped to the residual cases where multiple
 one-hop-closer predecessors are equally valid and scipy's FIFO-order
 tie-break picks a different one than our lowest-index rule.
 
-## Trade-offs versus `sdk-hypersparse-spmv` (see `../../spmv/sdk-hypersparse-spmv/README.md` first)
+## Trade-offs versus `sdk-hypersparse-spmv`
 
-This design deliberately gives up the properties `sdk-hypersparse-spmv` is built
-for:
+Measured against the SDK's own `hypersparse_spmv` example (a host-driven,
+fully `P^2`-distributed real-valued SpMV kernel this design started from —
+no longer present in this repo, so treat the numbers below as a recorded
+baseline, not a live comparison). This design deliberately gives up the
+properties that kernel is built for:
 
 - **No composability with dense-vector solver ops.** `x`/`y` are
   concentrated (redundant copies within a column / everything funneled to
   one diagonal PE per row), not a unique fragment per PE. That's fine for a
   pure boolean OR-collapse, but would leave most of the grid idle for a
-  dot-product or AXPY-style update, unlike `sdk-hypersparse-spmv`'s full `P^2`
-  distribution.
-- **`P` times more vector memory per PE** (`blk ~= n/P` vs `sdk-hypersparse-spmv`'s
-  `local_vec_sz ~= n/P^2`) — a direct consequence of concentrating instead of
-  fully partitioning the vector.
+  dot-product or AXPY-style update, unlike a fully `P^2`-distributed vector.
+- **`P` times more vector memory per PE** (`blk ~= n/P` vs. that baseline's
+  `local_vec_sz ~= n/P^2`) — a direct consequence of concentrating instead
+  of fully partitioning the vector.
 - **No weights.** Only structural nonzero-ness is tracked (`mat_vals_buf` is
-  gone entirely) — this also roughly halves the per-nonzero memory footprint
-  versus `sdk-hypersparse-spmv`, which matters for surviving a poorly load-balanced
-  matrix (this kernel compiled and ran on an unbalanced GRAPH500-style matrix
-  that made `sdk-hypersparse-spmv`'s linker run out of PE memory).
+  gone entirely) — this also roughly halves the per-nonzero memory
+  footprint versus that baseline, which matters for surviving a poorly
+  load-balanced matrix (this kernel compiled and ran on an unbalanced
+  GRAPH500-style matrix that made the baseline's linker run out of PE
+  memory).
 
-In exchange: measured ~4-8x faster than `sdk-hypersparse-spmv` on every matrix/grid
-combination tried so far (uniform-random, GRAPH500-style RMAT at varying
-sparsity, varying grid size, balanced and unbalanced) -- the two kernels
-solve related but not identical problems, so treat this as "cost of this
-design" rather than a pure implementation bake-off.
+In exchange: measured ~4-8x faster than that baseline on every matrix/grid
+combination tried (uniform-random, GRAPH500-style RMAT at varying sparsity,
+varying grid size, balanced and unbalanced) -- the two kernels solve
+related but not identical problems, so treat this as "cost of this design"
+rather than a pure implementation bake-off.
 
 ## Requirements
 
@@ -307,7 +286,7 @@ design" rather than a pure implementation bake-off.
 ## Running with a different matrix / grid size
 
 `scripts/commands_wse3_graph500.sh` is a fixed smoke test
-(`../../data/rmat4.4x4.lb.mtx` on a 4x4 grid) split into two steps — an
+(`../data/rmat4.4x4.lb.mtx` on a 4x4 grid) split into two steps — an
 explicit `cslc` call with hand-computed `--params` (`blk`,
 `max_local_nnz*`), then its driver script `--run-only` reusing that ELF.
 That split only exists to avoid recompiling on repeat smoke-test runs; the
@@ -334,10 +313,10 @@ Notes:
 - `--num_pe_cols` **must equal** `--num_pe_rows` (square grid requirement
   above) — any square size works, it isn't required to be a power of 2 or to
   evenly divide the matrix size (`preprocess_bool.py` pads).
-- `--infile_mtx` just needs to point at a square `.mtx` file. `../../data/`
+- `--infile_mtx` just needs to point at a square `.mtx` file. `../data/`
   already has a range of RMAT sizes to try: `rmat_s5_e4.mtx` (32x32),
   `rmat_s6_e4.mtx` (64x64), `rmat_s7_e4.mtx` (128x128), `rmat_s8_e4.mtx`
-  (256x256), up to `rmat_s14_e16.mtx` (16384x16384) — see `../../datasets/`
+  (256x256), up to `rmat_s14_e16.mtx` (16384x16384) — see `../datasets/`
   for how these were generated (`gen_rmat.py`) and load-balanced.
 - `--fabric-dims`/`--fabric-offsets` are optional — `run_bfs.py` computes a
   large-enough fabric from the grid size and `--width-west-buf`/
@@ -378,7 +357,8 @@ What's still missing (see the `TODO`s in `bool_pe.csl`):
   unbuilt here too — see "Parent tracking" above.
 
 Also worth reconsidering before going further: whether the hypersparse
-compressed-column format (inherited unchanged from `sdk-hypersparse-spmv`) is even
-warranted for GRAPH500-scale sparsity — early measurements suggested local
-blocks touch 28-57% of their own column range even after load-balancing,
-nowhere near what that format is optimized for.
+compressed-column format (inherited unchanged from the SDK's
+`hypersparse_spmv` example) is even warranted for GRAPH500-scale sparsity —
+early measurements suggested local blocks touch 28-57% of their own column
+range even after load-balancing, nowhere near what that format is
+optimized for.

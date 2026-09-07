@@ -361,16 +361,17 @@ def save_pe_phase_cycles(path, phase_cycles, metadata, structural_grids=None):
   format that has to be pivoted back into a grid every time it's read,
   neither of which numpy's own binary round-trip needs. `metadata` is a
   dict of small scalars/strings (infile_mtx, pe_grid, source,
-  rounds_completed, ...) saved alongside the arrays in the same file --
-  read back via load_pe_phase_cycles() in plot_pe_heatmap.py.
+  rounds_completed, ...) saved alongside the arrays in the same file, for
+  offline per-PE heatmap analysis (no in-repo renderer currently reads
+  this back).
 
   `structural_grids`: optional dict of additional (height, width) 2D
   arrays that aren't per-round timing at all -- e.g. run_bfs.py passes the
   matrix's own per-PE partition counts (local_nnz/local_nnz_cols/
-  local_nnz_rows from preprocess_bool.py) here, so plot_pe_heatmap.py's
-  sparsity.png can be checked by eye against the timing heatmaps for
-  correlation (e.g. does local_compute's imbalance actually track
-  local_nnz's imbalance, or is it something else)."""
+  local_nnz_rows from preprocess_bool.py) here, so a per-PE heatmap can be
+  checked by eye against sparsity for correlation (e.g. does
+  local_compute's imbalance actually track local_nnz's imbalance, or is
+  it something else)."""
   os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
   np.savez_compressed(path, **phase_cycles, **(structural_grids or {}), **metadata)
 

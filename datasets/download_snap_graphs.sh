@@ -4,7 +4,7 @@
 # soc-pokec, wiki-topcats, soc-LiveJournal1, as-Skitter, cit-Patents) into
 # data/snap/ as raw .txt.gz edge lists -- unlike gen_rmat.py's synthetic
 # graphs, these are fetched, not generated. Immediately usable via
-# --infile_mtx as-is: no MTX conversion needed, bool_diag_spmv/graph_loader.py's
+# --infile_mtx as-is: no MTX conversion needed, bfs/implementation/graph_loader.py's
 # edge-list support reads a SNAP .txt.gz file directly.
 #
 # Usage: datasets/download_snap_graphs.sh [name ...]
