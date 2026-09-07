@@ -1,46 +1,33 @@
 #!/usr/bin/env python3
 """RMAT scale x PE-grid-size sweep, as two heatmaps side by side: GTEPS
-(excl. host transfer AND parent_resolve, see gteps_excl_parent_resolve) and
-the % of on-device time spent in communication vs. compute. Companion to
-plot_bfs_scaling.py, which plots GTEPS vs. n at a single fixed grid; this
-script plots the other axis of the 2-D sweep
-(bfs/bool_diag_spmv/rmat_grid_sweep.sh) -- same input graph across every
-reachable PE grid size, for every RMAT scale.
+(excl. host transfer and parent_resolve, see gteps_excl_parent_resolve)
+and the % of on-device time spent in communication vs. compute. Plots one
+axis of the 2-D sweep run by rmat_grid_sweep.sh -- same input graph across
+every reachable PE grid size, for every RMAT scale.
 
-Reuses plot_bfs_scaling.py's exact SURFACE/TEXT_PRIMARY/GRIDLINE/BASELINE
-styling and its "last CSV occurrence per key wins" dedup convention (the CSV
-is append-only; a matrix file can be rebalanced and rerun under the same
-(infile_mtx, pe_grid) key).
+Shares its styling constants and figure-sizing conventions with
+plot_bfs_timing_poster.py and plot_balance_before_after.py so the three
+figure families read as one visual system.
 
 Usage: cs_python plots/plot_grid_scale_heatmap.py
          [--csv=results/hw/timings_heatmap.csv] [--out=results/hw/heatmap/rmat_grid_scale.svg]
 
-SVG only, no PNG -- this is a poster/report figure meant to be embedded and
-rescaled as vector output, not viewed as a standalone raster image (same
-convention as plot_bfs_timing_poster.py and plot_balance_before_after.py).
+SVG only -- a poster/report figure meant to be embedded and rescaled as
+vector output, not viewed as a standalone raster image.
 
 A missing (scale, grid) cell -- not yet run, or run and never landed a CSV
 row (compile/link failure) -- is drawn hatched, not colored zero; GTEPS=0
 and "never run" are different facts and must not look the same.
 
-results/hw/timings_heatmap.csv is a separate file from results/hw/
-bfs_timing.csv (the ongoing, per-run log run_bfs.appliance.py appends to)
--- restored from the real-hardware sweep at commit 2880cd0 (the last one
-before the skew-adjustment-removal refactor deleted it), then stripped down
-to exactly the columns this script reads: local_compute*/local_term_cond*/
-parent_resolve*/transpose*/search_time_cycles_no_transfer/gteps_no_transfer
-never depended on the skew-adjustment machinery that refactor removed (only
-the individual communication-phase columns did, e.g. visited_bcast_*/
-relay_*), so these numbers are still correct under the current methodology
--- confirmed by an independent real-hardware re-run of one cell
-(rmat_s17_e16.balanced750x750, 750x750) landing on the exact same GTEPS/%
-communication this sweep's own already-published heatmap shows (13, 89%).
-Host-transfer columns (h2d_matrix/h2d_seed/d2h, and the full
-search_time_cycles/gteps/search_time_seconds built from them) are dropped
-entirely, not carried forward under some "_legacy" name -- they used the
-per-PE-max method later found to understate the true cross-PE span (see
-docs/GRAPH500_BENCHMARK.md section 15), and the raw per-PE data needed to
-retroactively recompute the sync-corrected span no longer exists.
+results/hw/timings_heatmap.csv is a separate, hand-trimmed file from the
+ongoing results/hw/bfs_timing.csv log -- restored from an older
+real-hardware sweep and stripped to just the columns this script reads
+(these never depended on the skew-adjustment machinery a later refactor
+removed, so the numbers are still correct under the current methodology).
+Host-transfer columns (h2d/d2h and the GTEPS built from them) are dropped
+entirely: they used a per-PE-max method later found to understate the
+true cross-PE span (see docs/GRAPH500_BENCHMARK.md section 15), and the
+raw data needed to recompute it no longer exists.
 """
 
 import argparse
@@ -62,66 +49,50 @@ BLUE = "#2a78d6"  # same accent used for "RMAT" throughout this repo's plots
 ORANGE = "#eb6834"  # communication-bound pole of the comm/compute diverging panel
 AQUA = "#1baf7a"  # compute-bound pole of the comm/compute diverging panel
 NEUTRAL_MID = "#f0efec"  # this repo's documented diverging-pair midpoint
-# best-per-row cell callout -- a single dark violet, distinct from every hue
-# used in either panel's own colormap (blue, orange, aqua, gray). Carried only
-# by the underline mark below the cell's number, never by the number's own
-# ink: at mid-to-dark BLUE/ORANGE cells this violet sits too close in hue and
-# luminance to the fill (measured contrast ~2.2:1, well under the ~4.5:1 a
-# glyph needs), so text stays in the same adaptive TEXT_PRIMARY/white ink the
-# ordinary (non-highlighted) cell text below uses -- legible against every
-# cell regardless of darkness -- and this violet marks "best" via the
-# underline (a thin mark reads fine at lower contrast than a filled glyph).
+# Best-per-row callout color. Carried only by the underline below a cell's
+# number, never by the number's own ink -- against mid-to-dark BLUE/ORANGE
+# fills this violet's contrast is too low for a glyph, so text stays in the
+# same adaptive TEXT_PRIMARY/white every other cell uses; a thin underline
+# reads fine at that lower contrast.
 BEST_HIGHLIGHT = "#5b2a86"
 
-# Title/label font sizes and suptitle/title/plot spacing, shared verbatim
-# (same names, same values) with plot_bfs_timing_poster.py and
-# plot_balance_before_after.py -- the "hw/heatmap", "timing poster", and
-# "balancing" figure families are meant to read as one visual system, not
-# three scripts each with their own ad hoc sizing.
+# Shared verbatim with plot_bfs_timing_poster.py/plot_balance_before_after.py
+# so all three figure families read as one visual system.
 SUPTITLE_FONTSIZE = 14
 PANEL_TITLE_FONTSIZE = 12
 AXIS_LABEL_FONTSIZE = 10
 TICK_LABEL_FONTSIZE = 8
 SUPTITLE_Y = 0.98  # fraction of figure height; matplotlib's own suptitle default
 TITLE_PAD = 10  # points between a panel's title and its own plot area
-# tight_layout rect top -- headroom reserved for the suptitle. NOT the same
-# value as plot_balance_before_after.py/plot_bfs_timing_poster.py's own
-# TOP_MARGIN=0.88 despite the "shared convention" above: this figure's
-# panels aren't aspect-locked, so tight_layout actually sizes them (no
-# silent-no-op like the aspect-locked panels elsewhere) and reserves its
-# own internal padding below whatever rect top you give it -- 0.88 left a
-# large dead band between the panel titles and the suptitle above them.
+# tight_layout rect top: NOT the siblings' TOP_MARGIN=0.88 -- these panels
+# aren't aspect-locked, so tight_layout actually resizes them here (unlike
+# the aspect-locked siblings) and 0.88 left a large dead band above the
+# panel titles.
 TOP_MARGIN = 0.965
 
 RMAT_RE = re.compile(r"^rmat_s(\d+)_e16\.balanced(\d+)x(\d+)\.mtx$")
 
 GRID_LADDER = [4, 8, 16, 32, 64, 128, 256, 512, 750]
 
-# (scale, grid) keys with a stale CSV row from an earlier, separate session --
-# see git history for the (18, 750)/(20, 750) incident this set was
-# originally added for (2026-07-28 leftover rows the 2026-07-29 sweep's
-# idempotency check skipped re-running). Both have since been re-run with
-# fresh, trend-consistent rows (2026-07-29T13:03/13:23) and removed from
-# this set. Add an entry here (and note why) if a similar stale-row
-# situation shows up again; remove it once that cell has a fresh row.
+# (scale, grid) keys to skip because their CSV row is stale (a leftover row
+# from an earlier session that an idempotency check failed to re-run). Add
+# an entry here if that happens again; remove it once the cell has a fresh
+# row. See git history for past incidents.
 STALE_KEYS = set()
 
-# the two REAL local-work phases (bfs_timing.py's PHASES -- each bracketed
-# by a PE's own entry/exit timestamps, nothing to adjust) make up "compute";
-# the rest of search_time_cycles_no_transfer (minus parent_resolve_max_cycles,
-# see pct_communication) is "communication" (bcast/reduce/relay, computed as
-# a remainder, not individually measured -- see docs/GRAPH500_BENCHMARK.md for why
-# a per-phase skew-adjusted breakdown was tried and abandoned as unreliable).
+# "Compute" is the two real local-work phases (bfs_timing.py's PHASES,
+# each bracketed by a PE's own entry/exit timestamps); "communication" is
+# the rest of search_time_cycles_no_transfer (minus parent_resolve, see
+# pct_communication) -- bcast/reduce/relay, computed as a remainder rather
+# than measured directly (a per-phase breakdown was tried and abandoned as
+# unreliable, see docs/GRAPH500_BENCHMARK.md).
 COMPUTE_COLS = ["local_compute_max_cycles", "local_term_cond_max_cycles"]
 
-# parent_resolve_max_cycles (the end-of-run parent-array resolve/readback,
-# see run_bfs.py's comment on parent_resolve_cycles) is treated as host
-# transfer overhead here, not on-device communication -- excluded from both
-# the numerator and denominator below, same as h2d_seed/d2h are already
-# excluded by using search_time_cycles_no_transfer as the starting total.
-# It can otherwise dominate search_time_cycles_no_transfer at large
-# scale/grid (e.g. ~99% of it for s20/750x750), swamping the per-round
-# bcast/reduce/relay signal this panel is meant to show.
+# parent_resolve_max_cycles (the end-of-run parent-array resolve/readback)
+# is treated as host-transfer overhead here, not on-device communication --
+# excluded from both panels' totals, same as h2d/d2h. It can otherwise
+# dominate the total at large scale/grid (~99% of it for s20/750x750),
+# swamping the bcast/reduce/relay signal this panel is meant to show.
 PARENT_RESOLVE_COL = "parent_resolve_max_cycles"
 
 
@@ -131,8 +102,8 @@ def _hex_to_rgb(h):
 
 
 def sequential_ramp(base_hex, n):
-  """One hue, light -> dark (dataviz convention for a magnitude fill) --
-  lighten toward white, never toward a second hue."""
+  """One hue, light -> dark, lightening toward white -- convention for a
+  magnitude fill."""
   base = np.array(_hex_to_rgb(base_hex))
   white = np.array([1.0, 1.0, 1.0])
   fracs = np.linspace(0.92, 0.0, n)
@@ -140,9 +111,8 @@ def sequential_ramp(base_hex, n):
 
 
 def diverging_ramp(low_hex, high_hex, n):
-  """Two hues + a neutral gray midpoint (dataviz convention for polarity) --
-  low_hex at 0, NEUTRAL_MID at the center, high_hex at 1, equal step count
-  per arm."""
+  """Two hues + a neutral gray midpoint (convention for polarity):
+  low_hex at 0, NEUTRAL_MID at the center, high_hex at 1."""
   low = np.array(_hex_to_rgb(low_hex))
   mid = np.array(_hex_to_rgb(NEUTRAL_MID))
   high = np.array(_hex_to_rgb(high_hex))
@@ -153,18 +123,14 @@ def diverging_ramp(low_hex, high_hex, n):
 
 
 def sum_semicolon_cycles(s):
-  """Sum a semicolon-joined per-round cycle-count string (decode_phase_row's
-  CSV convention, e.g. "27683;26588;26481") into a single total. Raises
-  ValueError on a blank/malformed field -- caller decides how to treat a
-  missing cell."""
+  """Sum a semicolon-joined per-round cycle-count string, e.g.
+  "27683;26588;26481". Raises ValueError on a blank/malformed field."""
   return sum(int(v) for v in s.split(";") if v)
 
 
 def total_on_device_cycles(row):
-  """search_time_cycles_no_transfer with parent_resolve_max_cycles subtracted
-  out -- the shared 'total' denominator for both the GTEPS panel and the %
-  communication panel, so both treat parent_resolve as host-transfer
-  overhead consistently (see PARENT_RESOLVE_COL), not on-device work.
+  """search_time_cycles_no_transfer minus parent_resolve_max_cycles -- the
+  shared 'total' denominator for both panels (see PARENT_RESOLVE_COL).
   Returns None if unparseable or the result is <= 0."""
   try:
     total = float(row["search_time_cycles_no_transfer"]) - float(row[PARENT_RESOLVE_COL])
@@ -174,13 +140,12 @@ def total_on_device_cycles(row):
 
 
 def gteps_excl_parent_resolve(row):
-  """m_edges_traversed / (total_on_device_cycles / clock_freq_hz) / 1e9 --
-  same formula bfs_timing.py's compute_m_and_gteps uses for the CSV's own
-  gteps_no_transfer column, except that column's own denominator
-  (search_time_cycles_no_transfer) still includes parent_resolve_max_cycles;
-  recomputed here so this panel is consistent with pct_communication's
-  parent-resolve-excluded total. Returns None if any required field is
-  missing, unparseable, or the total is <= 0."""
+  """m_edges_traversed / (total_on_device_cycles / clock_freq_hz) / 1e9.
+  Recomputed rather than read from the CSV's own gteps_no_transfer column,
+  since that column's denominator still includes parent_resolve_max_cycles
+  -- this keeps the panel consistent with pct_communication's excluded
+  total. Returns None if any required field is missing, unparseable, or
+  the total is <= 0."""
   total_cycles = total_on_device_cycles(row)
   if total_cycles is None:
     return None
@@ -195,11 +160,9 @@ def gteps_excl_parent_resolve(row):
 
 def pct_communication(row):
   """(total - compute) / total * 100, where total is
-  total_on_device_cycles (search_time_cycles_no_transfer with
-  parent_resolve_max_cycles subtracted out, treated as host transfer, not
-  on-device communication -- see PARENT_RESOLVE_COL) -- 0% fully
-  compute-bound, 100% fully communication-bound. Returns None if any
-  required field is missing, unparseable, or the row's total is <= 0."""
+  total_on_device_cycles -- 0% fully compute-bound, 100% fully
+  communication-bound. Returns None if any required field is missing,
+  unparseable, or the row's total is <= 0."""
   total_cycles = total_on_device_cycles(row)
   if total_cycles is None:
     return None
@@ -262,14 +225,10 @@ def main():
           grid_mat[i, j] = val
     return grid_mat
 
-  # Each panel is its own unit/scale (GTEPS vs. % communication), so each
-  # gets its own vmin/vmax and colorbar rather than one shared scale.
-  # GTEPS is log-scaled: parent_resolve's share of on-device time grows from
-  # ~8% at s10/4x4 to ~99% at s20/750x750, so excluding it (see
-  # gteps_excl_parent_resolve) makes the remaining denominator shrink toward
-  # zero at large scale/grid -- GTEPS spans ~0.04 to ~100+ across the sweep,
-  # a range a linear color scale can't show without crushing the small end
-  # to white.
+  # Each panel is its own unit/scale, so each gets its own vmin/vmax and
+  # colorbar. GTEPS is log-scaled: it spans ~0.04 to ~100+ across the
+  # sweep, a range a linear color scale would crush toward white at the
+  # small end.
   panels = [
       # (matrix-fill function, label, cmap, vmin, vmax, cell text formatter,
       #  colorbar label, log-scale color+values)
@@ -281,9 +240,9 @@ def main():
        lambda v, _vmax: f"{v:.0f}%", "% communication", False),
   ]
 
-  # The best-GTEPS PE grid for each RMAT scale, computed once from the GTEPS
-  # panel's own values -- outlined on BOTH panels below so the % communication
-  # panel shows what that same best-GTEPS choice costs in communication share.
+  # Best-GTEPS PE grid per RMAT scale, computed once from the GTEPS panel
+  # and marked on both panels, so the % communication panel shows what
+  # that same choice costs in communication share.
   gteps_grid = build_grid(panels[0][0])
   best_j_per_row = []
   for i in range(len(scales)):
@@ -298,7 +257,7 @@ def main():
       panel_vmin = finite[finite > 0].min() if np.any(finite > 0) else 1e-3
       panel_vmax = finite.max() if finite.size else 1.0
       norm = matplotlib.colors.LogNorm(vmin=panel_vmin, vmax=panel_vmax)
-      contrast_fn = lambda v: norm(v)  # noqa: E731 -- position in [0, 1] along the log color scale
+      contrast_fn = lambda v: norm(v)  # noqa: E731
     else:
       panel_vmax = vmax
       if panel_vmax is None:
@@ -306,12 +265,10 @@ def main():
       norm = None
       contrast_fn = lambda v: v / panel_vmax  # noqa: E731
 
-    # pcolormesh instead of imshow, rasterized=False -- imshow always embeds
-    # a bitmap in SVG output with no vector option; pcolormesh draws each
-    # cell as a real vector quad. Edges offset by -0.5 so cell (i, j)'s
-    # center lands on integer (j, i), matching imshow's own pixel-center
-    # convention (and this function's existing tick/text placement at
-    # integer coordinates).
+    # pcolormesh, not imshow: imshow always embeds a bitmap in SVG output,
+    # pcolormesh draws each cell as a real vector quad. Edges offset by
+    # -0.5 so cell (i, j)'s center lands on integer (j, i), matching this
+    # function's tick/text placement.
     masked = np.ma.masked_invalid(grid_mat)
     x_edges = np.arange(len(grids) + 1) - 0.5
     y_edges = np.arange(len(scales) + 1) - 0.5
@@ -324,13 +281,8 @@ def main():
     ax.set_ylim(y_edges[0], y_edges[-1])
 
     # Hatch every missing cell so "not run / failed" is never confused with
-    # a real, low value. The best-GTEPS PE grid for each RMAT scale (picked
-    # once from the GTEPS panel, see best_j_per_row above) is called out on
-    # BOTH panels as bold text underlined in BEST_HIGHLIGHT, so it reads at a
-    # glance instead of requiring the reader to spot a thin box outline. The
-    # number's own ink stays the same adaptive white/TEXT_PRIMARY every other
-    # cell uses -- BEST_HIGHLIGHT only colors the underline (see BEST_HIGHLIGHT
-    # comment above for why the glyph itself can't carry that color).
+    # a real, low value. The best-GTEPS cell (best_j_per_row) is called out
+    # as bold text with a BEST_HIGHLIGHT underline (see comment above).
     for i in range(len(scales)):
       for j in range(len(grids)):
         if np.isnan(grid_mat[i, j]):
@@ -349,10 +301,9 @@ def main():
 
     # Dark staircase border between the run region and the never-run (OOM)
     # region -- every missing cell here is a small-grid/large-scale
-    # combination that ran out of memory (each PE holds a bigger local
-    # matrix chunk the fewer PEs the grid has), never a scattered
-    # compile/link failure, so the whole region reads as one boundary rather
-    # than per-cell hatching alone.
+    # combination that ran out of memory, never a scattered compile/link
+    # failure, so the region reads as one boundary rather than per-cell
+    # hatching alone.
     boundary_xs, boundary_ys = [], []
     for i in range(len(scales)):
       finite_js = np.where(~np.isnan(grid_mat[i, :]))[0]
@@ -383,8 +334,7 @@ def main():
       ax.set_yticklabels([f"s{s}" for s in scales], fontsize=TICK_LABEL_FONTSIZE,
                           color=TEXT_MUTED)
     else:
-      # Same RMAT-scale rows as the left panel (shared y-axis convention) --
-      # the tick labels (and the ticks themselves) would just duplicate it.
+      # Same RMAT-scale rows as the left panel -- ticks would just duplicate it.
       ax.tick_params(left=False, labelleft=False)
     ax.set_xlabel("PE grid", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
     ax.set_title(label, color=TEXT_PRIMARY, fontsize=PANEL_TITLE_FONTSIZE, pad=TITLE_PAD)
@@ -395,9 +345,8 @@ def main():
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label(cbar_label, color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
     cbar.ax.tick_params(colors=TEXT_MUTED, labelsize=TICK_LABEL_FONTSIZE)
-    # Colorbar.solids defaults to rasterized=True regardless of the
-    # mappable's own type -- force it vector too, so the SVG has no
-    # embedded bitmaps left.
+    # Colorbar.solids defaults to rasterized=True -- force vector too, so
+    # the SVG has no embedded bitmaps left.
     cbar.solids.set_rasterized(False)
 
   axes[0].set_ylabel("RMAT scale", color=TEXT_PRIMARY, fontsize=AXIS_LABEL_FONTSIZE)
@@ -405,10 +354,7 @@ def main():
   fig.suptitle("Performance and Communication Share across Scales and PE Grids",
                color=TEXT_PRIMARY, fontsize=SUPTITLE_FONTSIZE, y=SUPTITLE_Y)
   fig.patch.set_facecolor(SURFACE)
-  # Reserve headroom for the suptitle above both panel titles -- same
-  # TOP_MARGIN convention as plot_bfs_timing_poster.py/
-  # plot_balance_before_after.py, so the gap between suptitle and panel
-  # titles reads the same across all three figure families.
+  # Reserve headroom for the suptitle above both panel titles.
   fig.tight_layout(rect=[0, 0, 1, TOP_MARGIN])
 
   os.makedirs(os.path.dirname(args.out), exist_ok=True)

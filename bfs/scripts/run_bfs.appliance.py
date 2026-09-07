@@ -11,60 +11,34 @@
     1. python run_bfs.appliance.py --compile-only ...   # writes artifact_path.json
     2. python run_bfs.appliance.py ...                  # reads artifact_path.json, runs
 
-  Plain `python`, NOT `cs_python` -- cs_python is this repo's LOCAL
-  simulator-container wrapper; on the real ALCF cluster, cerebras.sdk.client
-  talks to the cluster job scheduler directly over the network from a plain
-  Python process (confirmed from ALCF's own docs.alcf.anl.gov/ai-testbed/
-  cerebras/csl/ sample output: "Initiating a new SDK compile job against the
-  cluster server", "Job id: wsjob-..." -- the CLIENT submits the job, no
-  separate bash/qsub/csrun wrapper is shown or needed). sweep_bfs.sh's own
-  appliance branch invokes this with plain `python` accordingly.
+  Plain `python`, NOT `cs_python` (this repo's local simulator-container
+  wrapper) -- on the real ALCF cluster, cerebras.sdk.client talks to the
+  job scheduler directly over the network from a plain Python process.
+  sweep_bfs.sh's appliance branch invokes this with plain `python` accordingly.
 
   Everything host-side that ISN'T runner interaction (preprocess_bool,
   bfs_timing decode, scipy cross-check, tree plot, CSV row, plot_bfs_timing
   call) is UNCHANGED from run_bfs.py -- copied here rather than imported
   only because the runner-interaction section they're interleaved with in
-  run_bfs.py's main() had to be rewritten, not because the logic itself
-  differs. Keep the two files' non-runner sections in sync by hand if
-  bfs_timing.py's schema or preprocess_bool.py's output ever changes.
+  run_bfs.py's main() had to be rewritten. Keep the two files' non-runner
+  sections in sync by hand if bfs_timing.py's schema or preprocess_bool.py's
+  output ever changes.
 
   NOTE: cerebras.sdk.client / cerebras.appliance are only importable when
   actually connected to a Cerebras appliance -- this script cannot be
-  exercised in a simulator-only environment (confirmed: both imports fail
-  there).
+  exercised in a simulator-only environment.
 
-  VALIDATED against a real ALCF appliance run (appliance-sim, small RMAT
-  case, from cer-usn-01) on 2026-07-27: full compile -> artifact_path.json
-  -> SdkRuntime round trip succeeds, scipy cross-check passes. Two real
-  issues were found and fixed in that pass, both cluster/environment
-  quirks rather than logic bugs:
-
-  1. elf_dir's default ("out/latest", meaningful only for the local
-     simulator's own checkout) fails the appliance compile job with
-     "<remote path>/out does not exist" -- the compile job runs in a
-     fresh remote sandbox with no pre-existing directory tree, so cslc's
-     -o flag needs a FLAT single-level name there. Fixed in main() by
-     passing os.path.basename(dirname) instead of dirname to
-     csl_compile_core_appliance -- matches both ALCF's own tutorial's
-     "-o out" and the SDK-bundled single-tile-matvec example's "-o
-     latest".
+  Two cluster/environment gotchas to watch for, both fixed here or in
+  sweep_bfs.sh rather than being logic bugs:
+  1. elf_dir's default ("out/latest") fails the appliance compile job
+     because the remote sandbox has no pre-existing directory tree --
+     cslc's -o flag needs a FLAT single-level name there, so main() passes
+     os.path.basename(dirname) instead of dirname.
   2. SdkRuntime's memcpy_d2h streaming call can get its gRPC connection
-     reset ("recvmsg:Connection reset by peer") if the shell's
-     https_proxy/HTTPS_PROXY (needed for e.g. pip installs through
-     ALCF's proxy) also ends up routing this internal cluster traffic --
-     the reset traced back to proxy.alcf.anl.gov's own IP. Fix is
-     environmental, not code: export no_proxy/NO_PROXY covering the
-     cluster's internal network (10.125.8.2, .cerebras.internal) before
-     invoking this script. sweep_bfs.sh's appliance/appliance-sim
-     branches do this automatically now; if invoking this script
-     directly, do it yourself.
-
-  The 4th positional argument to SdkCompiler.compile() (see
-  device_io.csl_compile_core_appliance's own comment) was separately
-  confirmed correct by introspecting the actually-installed
-  cerebras.sdk.client package (inspect.signature + docstring): out_path
-  is genuinely where the compiled artifact tar.gz is placed locally, not
-  redundant with app_path.
+     reset if the shell's https_proxy/HTTPS_PROXY also routes internal
+     cluster traffic -- export no_proxy/NO_PROXY covering the cluster's
+     internal network before invoking this script directly (sweep_bfs.sh's
+     appliance branches already do this).
 
   How to compile and run (simulator, i.e. --simulator; drop it for real
   WSE-3 hardware -- see the fabric-dims branch in main() for why that also
@@ -89,7 +63,7 @@ import numpy as np
 
 # This script lives in scripts/; device_io.py/graph_loader.py/preprocess_bool.py/
 # bfs_timing.py live in ../implementation/, plot_bfs_timing.py/bfs_tree_plot.py
-# in ../plots/ -- see run_bfs.py's matching comment.
+# in ../plots/.
 BFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BFS_ROOT, "implementation"))
 sys.path.insert(0, os.path.join(BFS_ROOT, "plots"))
@@ -120,10 +94,9 @@ def make_u48(words):
 
 def read_tic_toc_delta_appliance(runner, sym_tsc_start, sym_tsc_end, height, width):
   """Same as bfs_timing.read_tic_toc_delta, but against the appliance
-  MemcpyDataType/MemcpyOrder enums (a different pb2-backed type than the
-  simulator pybind module's, even though the values mean the same thing --
-  bfs_timing.py's own version imports the pybind one internally, so it
-  can't be reused as-is here)."""
+  MemcpyDataType/MemcpyOrder enums -- a different pb2-backed type than the
+  simulator pybind module's that bfs_timing.py's version imports, so it
+  can't be reused as-is here."""
   from bfs_timing import TSC_WORDS  # local: avoid importing the simulator pybind module at file scope
 
   def _read(sym):
@@ -145,8 +118,7 @@ def read_tic_toc_delta_appliance(runner, sym_tsc_start, sym_tsc_end, height, wid
 def read_sync_corrected_span_appliance(runner, sym_tsc_start, sym_tsc_end, sym_tsc_ref,
                                         height, width):
   """Same as bfs_timing.read_sync_corrected_span, but against the appliance
-  MemcpyDataType/MemcpyOrder enums -- see read_tic_toc_delta_appliance's own
-  comment for why this can't just reuse the simulator-pybind-backed version."""
+  MemcpyDataType/MemcpyOrder enums -- see read_tic_toc_delta_appliance."""
   from bfs_timing import TSC_WORDS  # local: avoid importing the simulator pybind module at file scope
 
   def _read(sym):
@@ -224,11 +196,8 @@ def parse_args():
                        help="which reduce_select_any variant to use for the end-of-run "
                             "parent-resolution collective -- dense is production; indexed is "
                             "experimental, ~4.5-8.9x faster where it fits (see docs/ERRORS.md "
-                            "#17), blocked at very large blk by #8. (sparse, #16, was removed "
-                            "from this flag -- measured 7.6-8x slower, no regime where it wins; "
-                            "the collective itself remains in collectives_2d/pe.csl as "
-                            "reference.) Compares directly against the parent_resolve timing "
-                            "column this same script already reports.")
+                            "#17), blocked at very large blk by #8. Compares directly against "
+                            "the parent_resolve timing column this same script already reports.")
   return parser.parse_args()
 
 
@@ -330,12 +299,8 @@ def main():
       fabric_width = min_fabric_width
       fabric_height = min_fabric_height
     else:
-      # Real WSE-3 hardware: ALCF's own docs are explicit that this should be
-      # the fabric's full physical size, NOT a minimally-computed rectangle
-      # (docs.alcf.anl.gov/ai-testbed/cerebras/csl/: "--arch=wse3
-      # --fabric-dims=762,1172 --fabric-offsets=4,1" -- "The only difference
-      # between CS-3 and simulator run is the fabric_dims. It should be set
-      # to minimum required for simulated runs" -- i.e. NOT for real ones).
+      # Real WSE-3 hardware: ALCF's docs are explicit this should be the
+      # fabric's full physical size, not a minimally-computed rectangle.
       fabric_width, fabric_height = 762, 1172
       core_fabric_offset_x, core_fabric_offset_y = 4, 1
   if args.simulator:
@@ -352,13 +317,7 @@ def main():
     print("WARNING: compile only -- the appliance's compile server is torn down once this "
           "returns, so SdkRuntime can't be used in this same invocation")
     start = time.time()
-    # The compile job runs in a fresh remote sandbox with no pre-existing
-    # directory tree, so a nested -o path (dirname's default is "out/latest",
-    # meaningful only for the local simulator's own checkout) fails with
-    # "<path>/out does not exist" -- only a flat, single-level name works
-    # remotely (confirmed against a real ALCF compile job; matches both
-    # ALCF's own tutorial's "-o out" and the bundled single-tile-matvec
-    # example's "-o latest").
+    # os.path.basename(dirname), not dirname -- see module docstring gotcha #1.
     artifact_path = csl_compile_core_appliance(
         csl_dir, csl_file, os.path.basename(dirname), fabric_width, fabric_height,
         core_fabric_offset_x, core_fabric_offset_y, args.arch,
@@ -368,9 +327,7 @@ def main():
         parent_resolve_variant={"dense": 0, "indexed": 2}[args.parent_resolve_variant],
     )
     print(f"Compilation done in {time.time()-start}s", flush=True)
-    # {"artifact_path": ...} dict, matching ALCF's own documented format
-    # exactly (NOT sdk-hypersparse-spmv/run.appliance.py's bare-string
-    # json.dump(hashstr, f), which appears to be an older convention).
+    # {"artifact_path": ...} dict, matching ALCF's own documented format.
     with open(ARTIFACT_PATH_FILENAME, "w", encoding="utf-8") as f:
       json.dump({"artifact_path": artifact_path}, f)
     print(f"dumped artifact_path to {ARTIFACT_PATH_FILENAME}")
@@ -382,9 +339,8 @@ def main():
     artifact_path = json.load(f)["artifact_path"]
 
   start = time.time()
-  # disable_version_check: see csl_compile_core_appliance's own comment --
-  # ALCF's tutorial scripts pass this unconditionally on both Compiler and
-  # Runtime.
+  # disable_version_check: ALCF's tutorial scripts pass this unconditionally
+  # on both Compiler and Runtime -- see csl_compile_core_appliance.
   with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
     sym_x_bitmap = runner.get_id("x_bitmap")
     sym_parent_local_buf = runner.get_id("parent_local_buf")
@@ -416,12 +372,8 @@ def main():
     # load()/run() are called by SdkRuntime's own __enter__ in appliance mode.
 
     # All host-side marshaling for the matrix-structure upload happens here,
-    # BEFORE the timed bracket below -- see bfs_timing.timed_transfer's
-    # docstring for why this split (marshal fully, then transfer-only
-    # inside the tic/toc window) is load-bearing, not stylistic:
-    # hwl_to_oned_colmajor used to run interleaved between the memcpy_h2d
-    # calls, inside the window, contaminating h2d_matrix_span_cycles with
-    # host reshape time.
+    # BEFORE the timed bracket below -- keeping reshape work out of the
+    # tic/toc window is load-bearing, not stylistic (see bfs_timing.timed_transfer).
     mat_rows_prepared = prepare_h2d_chunked(mat_rows_buf, height, width, max_local_nnz, np.uint32)
     mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
                                               np.uint32)
@@ -490,15 +442,12 @@ def main():
     if need_timing:
       print("timing d2h readback (parent_local_buf -- the real BFS output)...")
 
-    # Phase B of the on-device parent resolution plan: bool_pe.csl already
-    # resolved each row's P per-PE candidates down to a single winner at
-    # PE-column MID, so only that one narrow column needs to leave the
-    # device -- the fix for the real d2h gRPC ~2GiB message-size ceiling
-    # this exact appliance path hit at RMAT s20 (see project memory).
-    # width=1 here, not width -- do not widen this back out. Root moved
-    # from column 0 to MID to halve reduce_select_any's serial relay
-    # critical path (see its own comment in bool_pe.csl/pe.csl).
-    # (Allocation moved out of the timed bracket below -- see timed_transfer.)
+    # bool_pe.csl already resolved each row's P per-PE candidates down to a
+    # single winner at PE-column MID, so only that one narrow column needs
+    # to leave the device -- keeps d2h well under the gRPC message-size
+    # ceiling. width=1 here, not width -- do not widen this back out. Root
+    # is at MID rather than column 0 to halve reduce_select_any's serial
+    # relay critical path (see bool_pe.csl/pe.csl).
     parent_mid_col = width // 2
     parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
 
@@ -534,12 +483,11 @@ def main():
           f"is_bottom_up={final_is_bottom_up}"
           + (f", tau_switch_count={tau_switch_count}" if tau_switch_count is not None else "") + " ]]")
 
-    # Phase 1 instrumentation for the sparse-reduce_select_any investigation
-    # (see the plan): how many of each PE's blk local rows already have a
-    # real parent candidate right before the one-time end-of-run
-    # reduce_select_any call. Read back grid-wide (not just PE(0,0)) since
-    # occupancy is genuinely per-PE, unlike nz_total/direction_history/
-    # nf_history which are identical everywhere by construction.
+    # How many of each PE's blk local rows already have a real parent
+    # candidate right before the one-time end-of-run reduce_select_any call.
+    # Read back grid-wide (not just PE(0,0)) since occupancy is genuinely
+    # per-PE, unlike nz_total/direction_history/nf_history which are
+    # identical everywhere by construction.
     parent_occupancy_buf = np.zeros(height * width, np.uint32)
     runner.memcpy_d2h(parent_occupancy_buf, sym_parent_occupancy, 0, 0, width, height, 1,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
@@ -578,19 +526,18 @@ def main():
       transpose_cycles = read_tic_toc_delta_appliance(
           runner, sym_transpose_tic_buffer, sym_transpose_toc_buffer, height, width)
 
-      # mpi_x.reduce_select_any()'s one-time end-of-run cost (Phase B of the
-      # on-device parent resolution plan) -- always fires once per run,
-      # unlike transpose_cycles' conditional switch.
+      # mpi_x.reduce_select_any()'s one-time end-of-run cost -- always fires
+      # once per run, unlike transpose_cycles' conditional switch.
       parent_resolve_cycles = read_tic_toc_delta_appliance(
           runner, sym_parent_resolve_tic_buffer, sym_parent_resolve_toc_buffer, height, width)
-      # Spatial (row, col) view -- see run_bfs.py's matching comment for why
-      # this needs the default C-order reshape, not "F" (read_tic_toc_delta_
-      # appliance's own final `.reshape(-1)` uses numpy's default order).
+      # Spatial (row, col) view -- needs the default C-order reshape, not
+      # "F" (read_tic_toc_delta_appliance's own `.reshape(-1)` already uses
+      # numpy's default order).
       parent_resolve_grid = parent_resolve_cycles.reshape((height, width))
 
       # Always-correct round-trip span, independent of max_rounds/ts_buf
       # truncation -- see round_trip_start_buffer/round_trip_done_buffer's
-      # own declaration comment in bool_pe.csl.
+      # declaration in bool_pe.csl.
       round_trip_cycles = read_tic_toc_delta_appliance(
           runner, sym_round_trip_start_buffer, sym_round_trip_done_buffer, height, width)
 
@@ -668,10 +615,10 @@ def main():
         "matrix_symmetric": is_symmetric,
     }
 
-    # parent_resolve has no sync bracket (it's an on-device-only reduce, not
-    # a host-device transfer) -- still the per-PE-max-of-self-delta approach,
-    # which is exactly right there (no cross-PE clock sync needed for a
-    # quantity that never leaves the fabric).
+    # parent_resolve has no sync bracket (on-device-only reduce, not a
+    # host-device transfer) -- per-PE-max-of-self-delta is exactly right
+    # there since no cross-PE clock sync is needed for a quantity that
+    # never leaves the fabric.
     for name, cycles in (("parent_resolve", parent_resolve_cycles),):
       row[f"{name}_min_cycles"] = int(cycles.min())
       row[f"{name}_max_cycles"] = int(cycles.max())
@@ -679,13 +626,10 @@ def main():
       print(f"  {name:>18s}: min={int(cycles.min())} max={int(cycles.max())} "
             f"avg={cycles.mean():.1f}")
 
-    # Sync-corrected cross-PE span (see
-    # read_sync_corrected_span_appliance/bfs_timing.read_sync_corrected_span) --
-    # the true max(toc)-min(tic) across all PEs. This is now the ONLY h2d/d2h
-    # timing this project records: the per-PE-max-of-self-delta approach it
-    # replaced was a structural lower bound on this span (proved and measured
-    # -- understated d2h by ~51% at a 750x750 grid), never more accurate, so
-    # there was nothing worth keeping it alongside for.
+    # Sync-corrected cross-PE span (see read_sync_corrected_span_appliance) --
+    # the true max(toc)-min(tic) across all PEs. The only h2d/d2h timing this
+    # project records: the per-PE-max-of-self-delta approach it replaced is
+    # only a structural lower bound on this span, never more accurate.
     for name, span in (("h2d_matrix", h2d_matrix_span_cycles),
                         ("h2d_seed", h2d_seed_span_cycles), ("d2h", d2h_span_cycles)):
       row[f"{name}_span_cycles"] = span
@@ -725,10 +669,8 @@ def main():
       phase_cycles, round_start, round_end, _ = decode_pe_phase_cycles(
           ts_hwl_u32, height, width, max_rounds, rounds_completed)
       # Raw per-PE local_compute/local_term_cond grids, plus the two raw
-      # round-boundary grids (round_start/round_end) round_time is built
-      # from -- everything decode_pe_phase_cycles can still produce now
-      # that the per-communication-phase skew-adjustment machinery (which
-      # used to also live here) has been removed as unreliable (see
+      # round-boundary grids round_time is built from -- per-communication-
+      # phase skew adjustment was tried here and dropped as unreliable (see
       # docs/GRAPH500_BENCHMARK.md).
       phase_cycles.update({"raw_round_start": round_start, "raw_round_end": round_end})
 
@@ -753,14 +695,11 @@ def main():
       })
       print(f"saved per-PE timing grid to {pe_timing_out}")
 
-    # device_time_cycles (from decode_phase_row) is now total_runtime_cycles:
-    # the whole-run round_trip_start_buffer -> round_trip_done_buffer span,
-    # which already includes transpose_structure()'s cost (it runs inside
-    # that same span) and already EXCLUDES parent_resolve (round_trip_done_
-    # buffer is captured before parent_resolve starts -- see bool_pe.csl).
-    # So the on-device total INCLUDING parent_resolve just needs it added
-    # back in; the full search_time_cycles then adds the host transfer
-    # brackets on top.
+    # device_time_cycles (from decode_phase_row) is the whole-run round_trip_
+    # start_buffer -> round_trip_done_buffer span: includes transpose_structure()
+    # but excludes parent_resolve (round_trip_done_buffer is captured before
+    # parent_resolve starts -- see bool_pe.csl), so it's added back in here;
+    # the full search_time_cycles then adds the host transfer brackets on top.
     search_time_cycles_no_transfer = device_time_cycles + int(parent_resolve_cycles.max())
     search_time_cycles = (h2d_seed_span_cycles + search_time_cycles_no_transfer
                            + d2h_span_cycles)
@@ -797,11 +736,8 @@ def main():
           f"{search_time_seconds_no_transfer * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
           f"{gteps_no_transfer:.6f} GTEPS ]]")
 
-    # Console-only, NOT a CSV column -- see run_bfs.py's own comment on this
-    # same print for the full rationale (device_time_cycles itself already
-    # excludes parent_resolve; parent_resolve's growing share of on-device
-    # time at large scale/grid is why this further-excluded figure is worth
-    # printing separately).
+    # Console-only, not a CSV column -- worth printing separately since
+    # parent_resolve's share of on-device time grows at large scale/grid.
     _, _, search_time_seconds_excl_resolve, gteps_excl_resolve = compute_m_and_gteps(
         coo, device_visited, is_symmetric, device_time_cycles)
     print(f"[[ GTEPS w/o h2d_seed/d2h/parent_resolve = {m} edges ({m_convention}) / "

@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
 # Runs each of the balanced SNAP graphs (see datasets/prep_snap.sh) through
-# real-appliance BFS (run_bfs.appliance.py, no --simulator) on the same
-# 750x750 grid the RMAT growth sweep (grow_sweep.sh) used. Unlike
-# grow_sweep.sh this does NOT stop at the first failure -- these are five
-# independent real-world graphs, not one growing series, so a failure on one
-# (e.g. the same d2h gRPC 2GiB message-size ceiling grow_sweep.sh hit at
-# RMAT s20, n=1,049,250 -- see grow_sweep.log) shouldn't skip the others.
-# Each graph's outcome (OK / FAILED + why) is logged independently.
+# real-appliance BFS (run_bfs.appliance.py, no --simulator) on a 750x750
+# grid. Does NOT stop at the first failure -- these are independent
+# real-world graphs, so a failure on one shouldn't skip the others. Each
+# graph's outcome (OK / FAILED + why) is logged independently.
 #
 # Usage: ./bfs/scripts/run_snap_sweep.sh
 #
-# Order below is smallest-predicted-d2h-transfer first (d2h total size for
-# this kernel's parent_local_buf readback is ~ grid_width * n * 4 bytes,
-# independent of nnz -- so vertex count n, not edge count, is what predicts
-# whether the same 2GiB ceiling gets hit): berkstan (n=685231, ~2.06GB,
-# expected to just barely fit under the ~2.1475GB gRPC max) before
-# pokec/topcats/orkut/livejournal (n from 1.6M to 4.8M, all predicted over
-# the ceiling at this grid size).
+# Order below is smallest-predicted-d2h-transfer first: d2h size for this
+# kernel's parent_local_buf readback is ~ grid_width * n * 4 bytes,
+# independent of nnz, so vertex count n predicts whether the ~2.15GB gRPC
+# message-size ceiling gets hit -- berkstan (n=685231, ~2.06GB) fits just
+# under it; pokec/topcats/orkut/livejournal (n 1.6M-4.8M) are predicted over.
 
 set -uo pipefail
 
@@ -34,9 +29,8 @@ export NO_PROXY="$no_proxy"
 
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
 
-# Optional name args (matches download_snap_graphs.sh/prep_snap.sh's own
-# convention) -- e.g. `run_snap_sweep.sh skitter patents` to run just the
-# new two without re-running the other five.
+# Optional name args, e.g. `run_snap_sweep.sh skitter patents` to run just
+# those two without re-running the rest.
 NAMES=("$@")
 if [ ${#NAMES[@]} -eq 0 ]; then
   NAMES=(berkstan pokec topcats orkut livejournal skitter patents)

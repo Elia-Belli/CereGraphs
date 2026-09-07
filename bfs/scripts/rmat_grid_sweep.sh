@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
 # Two-dimensional RMAT sweep: scale s10..s20 (e16) x grid size, growing grid
 # from the smallest that survives compile (PE-memory ceiling) up through
-# 512 (doubling), plus 750 (WSE-3's practical max -- see grow_sweep.sh's own
-# header comment). Continues past individual (scale,grid) failures -- never
-# aborts the whole sweep on one bad combo, matching run_snap_sweep.sh's
-# philosophy (independent data points, not a fail-fast chain).
+# 512 (doubling), plus 750 (WSE-3's practical max). Continues past
+# individual (scale,grid) failures -- never aborts the whole sweep on one
+# bad combo (independent data points, not a fail-fast chain).
 #
-# Balancing uses the v3-corrected method (`--symmetric --operm`, matching
-# this session's rebalance of s18/s20/s21) rather than sweep_bfs.sh's older
-# `--rand 0`-only invocation -- a balanced<PxP>.mtx without a matching
-# .operm sitting next to it is treated as pre-fix and regenerated.
+# Balancing uses `--symmetric --operm` -- a balanced<PxP>.mtx without a
+# matching .operm sitting next to it is treated as stale and regenerated.
 #
-# RMAT source vertex is always 0, untranslated -- confirmed this session
-# that vertex 0 maps to itself under --symmetric --operm rebalancing, and
-# documented independently in rerun_correct_roots.sh's header comment
-# (unlike SNAP graphs, which do need a translated source).
+# RMAT source vertex is always 0, untranslated -- vertex 0 maps to itself
+# under --symmetric --operm rebalancing (unlike SNAP graphs, which do need
+# a translated source).
 #
 # Idempotent: before running a (scale,grid) combo, checks
 # results/hw/bfs_timing.csv for an existing row with the same infile_mtx
@@ -61,8 +57,7 @@ free_kb() { df --output=avail -k . | tail -1; }
 already_ran() {
   local matrix_base="$1" grid="$2"
   [ -f "$CSV" ] || return 1
-  # CSV columns: timestamp,infile_mtx,n,nnz,pe_grid,... -- match on basename
-  # of infile_mtx (column 2) + pe_grid (column 5).
+  # Match on basename of infile_mtx (column 2) + pe_grid (column 5).
   awk -F, -v mb="${matrix_base}.mtx" -v g="${grid}x${grid}" \
     'NR>1 { n=split($2,parts,"/"); base=parts[n]; if (base==mb && $5==g) { found=1 } }
      END { exit !found }' "$CSV"

@@ -1,41 +1,28 @@
 #!/usr/bin/env bash
 # BFS scale sweep for the poster's main benchmark: runs run_bfs.py (simulator)
-# or run_bfs.appliance.py (real hardware, two-phase compile-then-run -- see
-# that script's own module docstring) across a list of (RMAT scale,
-# edgefactor, PE grid) test cases, generating + balancing any matrix that
-# doesn't already exist in data/. Each run appends its own row to
-# bfs/results/sim/bfs_timing.csv or bfs/results/hw/bfs_timing.csv
-# (run_bfs.py/run_bfs.appliance.py's own default) and renders its own
-# per-run timing plot (plot_bfs_timing.py) -- this script doesn't touch
-# either, it only drives the sweep.
+# or run_bfs.appliance.py (real hardware, two-phase compile-then-run) across
+# a list of (RMAT scale, edgefactor, PE grid) test cases, generating +
+# balancing any matrix that doesn't already exist in data/. Each run appends
+# its own row to bfs/results/sim|hw/bfs_timing.csv and renders its own
+# per-run timing plot -- this script only drives the sweep.
 #
-# Edit CASES below to whatever (scale, edgefactor, grid) triples you actually
-# want -- this is a small smoke-test default. One row per case: "scale
-# edgefactor grid" (grid is a single int -- the design requires a square
-# PxP grid).
+# Edit CASES below to whatever (scale, edgefactor, grid) triples you want --
+# this is a small smoke-test default. One row per case: "scale edgefactor
+# grid" (grid is a single int -- the design requires a square PxP grid).
 #
-# Usage (wse3 only -- this kernel is no longer tested/supported on wse2):
+# Usage (wse3 only -- no longer tested/supported on wse2):
 #   ./bfs/scripts/sweep_bfs.sh                    # simulator (local, cs_python), wse3
 #   ./bfs/scripts/sweep_bfs.sh appliance-sim      # appliance client, simulator backend, wse3
 #   ./bfs/scripts/sweep_bfs.sh appliance          # appliance client, REAL hardware, wse3
 #
-# `simulator` uses run_bfs.py through this repo's local cs_python container
-# wrapper -- what every other command_wse*.sh script in this repo already
-# does, no cluster access needed.
+# `appliance-sim`/`appliance` both use run_bfs.appliance.py via plain
+# `python`, not cs_python (the ALCF cluster's cerebras.sdk.client talks to
+# the job scheduler directly, no local container wrapper). Run
+# `appliance-sim` first on a real ALCF node before `appliance` -- it
+# validates the same code path against the cluster's software stack without
+# spending a real hardware allocation.
 #
-# `appliance-sim` and `appliance` both use run_bfs.appliance.py via plain
-# `python` (NOT cs_python -- see that script's own module docstring for why:
-# the ALCF cluster's cerebras.sdk.client talks to the job scheduler directly
-# over the network, no local container wrapper involved) with only their
-# `simulator=`/`--fabric-dims` handling differing. Run `appliance-sim` FIRST
-# on a real ALCF login/compute node before ever running `appliance` for
-# real -- it validates the exact same appliance-mode code path (SdkCompiler/
-# SdkRuntime, artifact_path.json handoff) against the actual cluster's
-# software stack, without spending a real hardware allocation, and is the
-# closest thing to a dry run this script can offer.
-#
-# Relocates to the repo root itself (same convention as commands_wse3_graph500.sh),
-# so it's safe to invoke from anywhere.
+# Relocates to the repo root, so it's safe to invoke from anywhere.
 
 set -e
 
@@ -58,11 +45,9 @@ case "$MODE" in
     RUN_SCRIPT="bfs/scripts/run_bfs.appliance.py"
     PYTHON=python
     SIM_FLAG=""
-    # SdkRuntime's memcpy gRPC streams can get reset if https_proxy/HTTPS_PROXY
-    # (needed for e.g. pip through ALCF's proxy) also routes this internal
-    # cluster traffic -- confirmed against a real run, reset traced back to
-    # proxy.alcf.anl.gov's own IP. Excluding the cluster's internal network
-    # fixes it; append to (not clobber) any no_proxy already set.
+    # SdkRuntime's memcpy gRPC streams get reset if https_proxy/HTTPS_PROXY
+    # (needed for pip through ALCF's proxy) also routes this internal cluster
+    # traffic -- exclude it; append to (not clobber) any no_proxy already set.
     export no_proxy="10.125.8.2,.cerebras.internal,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
     export NO_PROXY="$no_proxy"
     echo "=== appliance mode: REAL hardware, --arch=$ARCH ==="
@@ -93,12 +78,10 @@ for case in "${CASES[@]}"; do
   read -r scale edgefactor grid <<< "$case"
   matrix="data/rmat_s${scale}_e${edgefactor}.balanced${grid}x${grid}.mtx"
   raw="data/rmat_s${scale}_e${edgefactor}.mtx"
-  # Max I/O channels for this grid size: the SDK's only documented rule is a
-  # flat hardware cap of 16 (channels are physical host<->device streamer
-  # lanes, not grid-topology-dependent per any doc/source checked) -- but we
-  # additionally cap at the grid's own edge width/height on the assumption
-  # channels map to fabric-edge columns, since that combination was never
-  # exercised at grid sizes below 16 before now.
+  # Max I/O channels for this grid size: SDK's documented cap is 16, but we
+  # additionally cap at the grid's own edge width/height (channels are
+  # assumed to map to fabric-edge columns) since that combo is untested
+  # below grid=16.
   channels=$(( grid < 16 ? grid : 16 ))
 
   echo ""
@@ -113,10 +96,8 @@ for case in "${CASES[@]}"; do
     ./util/analyze --matrix "$raw" --symmetric --rand 0 --fabx "$grid" --faby "$grid" --omatrix "$matrix"
   fi
 
-  # Real hardware (appliance, no --simulator) gets its own csv/plot folder,
-  # kept separate from simulator/appliance-sim results -- same run_bfs.py/
-  # run_bfs.appliance.py --csv/--out-timing flags, just pointed elsewhere.
-  # Both scripts os.makedirs() the containing directory themselves.
+  # Real hardware gets its own csv/plot folder, kept separate from
+  # simulator/appliance-sim results.
   OUT_ARGS=()
   if [ "$MODE" = "appliance" ]; then
     matrix_base="$(basename "$matrix" .mtx)"

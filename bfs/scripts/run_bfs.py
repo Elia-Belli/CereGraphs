@@ -11,21 +11,17 @@
   2. **correctness** (default on, --nocorrectness to skip): prints the same
      scipy cross-check as (1) as numbers -- visited-set mismatches, invalid
      parents, tie-break differences from scipy's own pick -- without
-     needing the plot. This is a single-source, real-BFS-shaped check.
+     needing the plot.
   3. **timing** (default on, --notimings to skip): per-round phase cycle
-     counts (bfs_timing.py/record_ts()), h2d/d2h transfer cycles, and a
-     Graph500-style GTEPS estimate (see docs/GRAPH500_BENCHMARK.md) -- appended
-     as one row to bfs_timing.csv, plus the per-round stacked-bar plot
-     (plot_bfs_timing.py, h2d/rounds/d2h/local_compute-split panels side by
-     side in one PNG) saved to results/<hw|sim>/timing/ (hw vs sim matching
-     --csv, see plot_bfs_timing.results_variant).
+     counts, h2d/d2h transfer cycles, and a Graph500-style GTEPS estimate
+     (see docs/GRAPH500_BENCHMARK.md) -- appended as one row to
+     bfs_timing.csv, plus the per-round stacked-bar plot (plot_bfs_timing.py)
+     saved to results/<hw|sim>/timing/ (hw vs sim matching --csv, see
+     plot_bfs_timing.results_variant).
 
-  Replaces plot_bfs_tree.py and bench_timing.py (deleted -- this script
-  does both, without the double compile+launch cost of running them
-  separately). The reusable pieces those two scripts were built from now
-  live in their own modules: device_io.py (host<->device marshaling),
-  bfs_timing.py (timing constants/decoding), bfs_tree_plot.py (tree
-  rendering), plot_bfs_timing.py (timing bar chart, also still runnable
+  The reusable pieces live in their own modules: device_io.py (host<->device
+  marshaling), bfs_timing.py (timing constants/decoding), bfs_tree_plot.py
+  (tree rendering), plot_bfs_timing.py (timing bar chart, also runnable
   standalone against an existing CSV row).
 
   How to compile and run (from the repo root)
@@ -47,10 +43,9 @@ from datetime import datetime, timezone
 import networkx as nx
 import numpy as np
 
-# This script lives in scripts/; device_io.py/graph_loader.py/preprocess_bool.py/
-# bfs_timing.py live in ../implementation/, plot_bfs_timing.py/bfs_tree_plot.py
-# in ../plots/ -- add both to sys.path so the plain imports below resolve
-# regardless of them being sibling directories, not this same one.
+# device_io.py/graph_loader.py/preprocess_bool.py/bfs_timing.py live in
+# ../implementation/, plot_bfs_timing.py/bfs_tree_plot.py in ../plots/ --
+# add both to sys.path so the imports below resolve as siblings.
 BFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BFS_ROOT, "implementation"))
 sys.path.insert(0, os.path.join(BFS_ROOT, "plots"))
@@ -72,14 +67,12 @@ from cerebras.sdk.runtime.sdkruntimepybind import (  # pylint: disable=no-name-i
     MemcpyDataType, MemcpyOrder, SdkRuntime,
 )
 
-# direction-optimizing BFS (see the plan): --directional's forward-switch
-# fraction of n. Not literally Beamer et al.'s alpha (that's a divisor on an
-# edge-count ratio mf/mu; this kernel uses the simplified nf-vertex-count-only
-# heuristic instead -- see bool_pe.csl's tau_switch_count/is_bottom_up
-# comments), but 0.15 sits in the same ballpark the literature (Beamer SC2012,
-# GAP Benchmark Suite) reports for a pure vertex-count threshold, and the
-# paper's own finding that performance is insensitive to this choice across
-# an order of magnitude means it's not worth exposing as its own flag.
+# --directional's forward-switch fraction of n. Not Beamer et al.'s alpha
+# (an mf/mu edge-count ratio) -- this kernel uses a simplified vertex-count
+# -only heuristic instead (see bool_pe.csl's tau_switch_count/is_bottom_up).
+# 0.15 matches the literature's ballpark for that threshold, and since
+# performance is insensitive to it across an order of magnitude, it's not
+# worth its own flag.
 DEFAULT_TAU_SWITCH_FRAC = 0.15
 
 
@@ -158,10 +151,9 @@ def parse_args():
 
 
 def _default_csv_path():
-  """results/sim/bfs_timing.csv, a sibling of this script's own scripts/
-  directory -- a hw run always passes --csv explicitly (see
-  plot_bfs_timing_poster.py's default_out_path docstring), so this default
-  is sim-only."""
+  """results/sim/bfs_timing.csv, sibling of scripts/ -- a hw run always
+  passes --csv explicitly (see plot_bfs_timing_poster.py's
+  default_out_path), so this default is sim-only."""
   return os.path.join(BFS_ROOT, "results", "sim", "bfs_timing.csv")
 
 
@@ -210,13 +202,10 @@ def main():
 
   is_symmetric = None
   if need_timing:
-    # Graph500's own m formula (the undirected dedup rule, see
-    # docs/GRAPH500_BENCHMARK.md section 4) only makes sense for a symmetrized
-    # graph -- true for gen_rmat.py's output but NOT guaranteed for an
-    # arbitrary --infile_mtx. The BFS kernel itself has no such requirement
-    # (correct on any square boolean matrix, directed or not) -- only
-    # Graph500-style edge counting cares. Only needed for GTEPS's m, so
-    # only computed when timing is actually wanted.
+    # Graph500's m formula (docs/GRAPH500_BENCHMARK.md sec 4) assumes a
+    # symmetrized graph -- true for gen_rmat.py's output but not guaranteed
+    # for an arbitrary --infile_mtx; only GTEPS's m needs it, so only
+    # computed when timing is actually wanted.
     is_symmetric = (A_csr != A_csr.T).nnz == 0
     if not is_symmetric:
       print("[[ NOTE: A_csr is not symmetric (a directed graph, not gen_rmat.py's undirected "
@@ -254,12 +243,11 @@ def main():
     print(f"--directional: tau_switch_count = {tau_switch_count} "
           f"({DEFAULT_TAU_SWITCH_FRAC * 100:.0f}% of n={n})")
 
-  # single-source seed -- a real BFS workload, not a dense multi-source
-  # frontier (which would mask most rounds' costs behind one giant first
-  # round, and wouldn't be a single tree).
-  # Only the one diagonal PE owning `source` needs a real host write -- see
-  # single_source_seed_pe()'s own docstring for why every other PE's x_bitmap
-  # is already provably zero.
+  # Single-source seed, not a dense multi-source frontier (which would mask
+  # most rounds' cost behind one giant first round, and wouldn't be a single
+  # tree). Only the PE owning `source` needs a real host write -- see
+  # single_source_seed_pe()'s docstring for why every other PE's x_bitmap is
+  # already zero.
   seed_px, seed_py, seed_local_x = single_source_seed_pe(source, blk, P)
 
   fabric_offset_x = 1
@@ -330,12 +318,9 @@ def main():
   runner.load()
   runner.run()
 
-  # All host-side marshaling for the matrix-structure upload happens here,
-  # BEFORE the timed bracket below -- see bfs_timing.timed_transfer's
-  # docstring for why this split (marshal fully, then transfer-only inside
-  # the tic/toc window) is load-bearing, not stylistic: hwl_to_oned_colmajor
-  # used to run interleaved between the memcpy_h2d calls, inside the window,
-  # contaminating h2d_matrix_span_cycles with host reshape time.
+  # All host-side marshaling happens here, before the timed bracket below --
+  # see bfs_timing.timed_transfer's docstring: keeping marshaling out of the
+  # tic/toc window avoids counting host reshape time as transfer time.
   mat_rows_prepared = prepare_h2d_chunked(mat_rows_buf, height, width, max_local_nnz, np.uint32)
   mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
                                             np.uint32)
@@ -397,24 +382,19 @@ def main():
   runner.launch("f_spmv_iter", nonblock=False)
 
   if need_timing:
-    # Graph500's own output is exactly the predecessor/parent array (see
-    # docs/GRAPH500_BENCHMARK.md section 1 -- the reference implementation's
-    # run_bfs(root, pred) signature) -- no separate "visited" readback is
-    # part of the spec, and derive_visited_from_parent() below recovers it
-    # from parent_local_buf alone, so only that one transfer needs to be
-    # timed as the search's "output written to memory" cost.
+    # Graph500's spec output is exactly the predecessor/parent array (docs/
+    # GRAPH500_BENCHMARK.md sec 1) -- no separate "visited" readback needed,
+    # since derive_visited_from_parent() recovers it from parent_local_buf
+    # alone. So only this one transfer is timed as the output cost.
     print("timing d2h readback (parent_local_buf -- the real BFS output)...")
 
-  # Phase B of the on-device parent resolution plan: bool_pe.csl already
-  # resolved each row's P per-PE candidates down to a single winner at
-  # PE-column MID (see term_col_bcast_done()'s reduce_select_any call), so
-  # only that one narrow column needs to leave the device -- the fix for
-  # the real d2h gRPC ~2GiB message-size ceiling (see project memory /
-  # docs/GRAPH500_BENCHMARK.md). width=1 here, not width -- do not widen this
-  # back out, that's the whole point. Root moved from column 0 to MID
-  # (halves reduce_select_any's serial relay critical path -- see its own
-  # comment in bool_pe.csl/pe.csl), so the readback offset moves with it.
-  # (Allocation moved out of the timed bracket below -- see timed_transfer.)
+  # bool_pe.csl resolves each row's P per-PE candidates to a single winner
+  # at PE-column MID (term_col_bcast_done()'s reduce_select_any), so only
+  # that narrow column needs to leave the device -- works around the d2h
+  # gRPC ~2GiB message-size ceiling (docs/GRAPH500_BENCHMARK.md). width=1,
+  # not width -- do not widen this back out. Root sits at MID rather than
+  # column 0 to halve reduce_select_any's relay critical path, so the
+  # readback offset follows it.
   parent_mid_col = width // 2
   parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
 
@@ -429,19 +409,18 @@ def main():
       sym_tsc_end=sym_tsc_end_buffer if need_timing else None,
       sym_tsc_ref=sym_tsc_ref_buffer if need_timing else None)
 
-  # rounds_completed is needed regardless (tree plot's round-count label,
-  # timing's phase decoding) -- always read.
+  # Needed regardless of --notree/--notimings (tree plot's round-count
+  # label, timing's phase decoding) -- always read.
   rounds_buf = np.zeros(height * width, np.uint32)
   runner.memcpy_d2h(rounds_buf, sym_rounds_completed, 0, 0, width, height, 1,
                      streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
                      order=MemcpyOrder.COL_MAJOR, nonblock=False)
   rounds_completed = int(np.reshape(rounds_buf, (height, width, 1), order="F")[(0, 0, 0)])
 
-  # Phase A validation only (see the plan): nz_total is Beamer's nf as of the
-  # last completed round (only meaningful at (MID,MID), but every PE holds
-  # the same flooded value by the end of the relay -- see term_col_bcast_done()
-  # in bool_pe.csl), is_bottom_up_dbg mirrors whether the switch has fired.
-  # No bottom-up compute path exists yet, so this is purely diagnostic.
+  # Diagnostic only (no bottom-up compute path exists yet): nz_total is
+  # Beamer's nf as of the last completed round (flooded identically to
+  # every PE by term_col_bcast_done() in bool_pe.csl); is_bottom_up_dbg
+  # mirrors whether the switch fired.
   nz_total_buf = np.zeros(height * width, np.float32)
   runner.memcpy_d2h(nz_total_buf, sym_nz_total, 0, 0, width, height, 1,
                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
@@ -456,12 +435,11 @@ def main():
         f"is_bottom_up={final_is_bottom_up}"
         + (f", tau_switch_count={tau_switch_count}" if tau_switch_count is not None else "") + " ]]")
 
-  # Phase 1 instrumentation for the sparse-reduce_select_any investigation
-  # (see the plan): how many of each PE's blk local rows already have a real
-  # parent candidate right before the one-time end-of-run reduce_select_any
-  # call. Read back grid-wide (not just PE(0,0)) since occupancy is
-  # genuinely per-PE, unlike nz_total/direction_history/nf_history which are
-  # identical everywhere by construction.
+  # How many of each PE's blk local rows already have a real parent
+  # candidate right before the end-of-run reduce_select_any call. Read back
+  # grid-wide (not just PE(0,0)) since occupancy is genuinely per-PE,
+  # unlike nz_total/direction_history/nf_history which are identical
+  # everywhere.
   parent_occupancy_buf = np.zeros(height * width, np.uint32)
   runner.memcpy_d2h(parent_occupancy_buf, sym_parent_occupancy, 0, 0, width, height, 1,
                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
@@ -483,11 +461,10 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     ts_hwl_u32 = np.reshape(ts_buf_1d, (height, width, ts_len), order="F")
 
-    # direction_history/nf_history (Phase D telemetry, see the plan): the
-    # direction decision is identical on every PE by construction (every PE
-    # compares the SAME flooded nz_total against the SAME tau_switch_count
-    # -- see bool_pe.csl's term_col_bcast_done()), so reading PE(0,0)'s own
-    # copy is exactly as valid as any other PE's -- no aggregation needed.
+    # The direction decision is identical on every PE by construction (each
+    # compares the same flooded nz_total against the same tau_switch_count
+    # -- bool_pe.csl's term_col_bcast_done()), so reading PE(0,0)'s copy
+    # alone is enough -- no aggregation needed.
     nf_history_1d = np.zeros(height * width * max_rounds, np.uint32)
     runner.memcpy_d2h(nf_history_1d, sym_nf_history, 0, 0, width, height, max_rounds,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
@@ -501,34 +478,27 @@ def main():
     nf_history = nf_history_hwl[0, 0, :]
     direction_history = direction_history_hwl[0, 0, :]
 
-    # transpose_structure()'s one-time cost (see the plan's Phase B/D) --
-    # per-PE (real imbalance signal, not just an aggregate), zero on every
-    # PE if the switch never fired this run (both tic and toc stay at their
-    # zero-init value in that case).
+    # transpose_structure()'s one-time cost, per-PE (a real imbalance
+    # signal, not just an aggregate) -- zero on every PE if the switch
+    # never fired this run (tic/toc both stay at their zero-init value).
     transpose_cycles = read_tic_toc_delta(
         runner, sym_transpose_tic_buffer, sym_transpose_toc_buffer, height, width)
 
-    # mpi_x.reduce_select_any()'s one-time end-of-run cost (Phase B of the
-    # on-device parent resolution plan) -- unlike transpose_cycles this is
-    # NOT conditional (always fires once per run), so no
-    # "did it fire" zero-check is needed here.
+    # mpi_x.reduce_select_any()'s one-time end-of-run cost -- unlike
+    # transpose_cycles this always fires, so no "did it fire" check is
+    # needed here.
     parent_resolve_cycles = read_tic_toc_delta(
         runner, sym_parent_resolve_tic_buffer, sym_parent_resolve_toc_buffer, height, width)
-    # Spatial (row, col) view of the same data, for confirming the relay's
-    # critical path is genuinely root-relay-position-driven (deterministic,
-    # peaking at the root's own PE column) rather than random straggler/
-    # idle-wait skew -- read_tic_toc_delta's flat return is a plain C-order
-    # (row-major) flatten of a (height, width) grid (its own final
-    # `.reshape(-1)` call uses numpy's default order, not the "F" order used
-    # for the raw device-buffer reshape earlier in the same function), so
-    # inverting it needs the matching default (C) order here, not "F".
+    # Spatial (row, col) view, to check the relay's critical path is really
+    # root-relay-position-driven rather than random skew. read_tic_toc_delta
+    # flattens in C order (not the "F" order used for the raw device-buffer
+    # reshape earlier), so reshaping back here must use the default (C)
+    # order, not "F".
     parent_resolve_grid = parent_resolve_cycles.reshape((height, width))
 
-    # Always-correct round-trip span, independent of max_rounds/ts_buf
-    # truncation -- see round_trip_start_buffer/round_trip_done_buffer's
-    # own declaration comment in bool_pe.csl and decode_phase_row's own
-    # comment for how this fixes total_runtime_cycles/search_time_cycles
-    # for BFS runs with more rounds than max_rounds can profile in detail.
+    # Round-trip span that stays correct even when the run has more rounds
+    # than max_rounds can profile in detail (see round_trip_start/done_buffer
+    # in bool_pe.csl and decode_phase_row).
     round_trip_cycles = read_tic_toc_delta(
         runner, sym_round_trip_start_buffer, sym_round_trip_done_buffer, height, width)
 
@@ -542,10 +512,9 @@ def main():
   scipy_parent = scipy_visited = scipy_levels = None
   mismatch = n_mismatch = scipy_ok = scipy_diff_device = None
   if need_scipy:
-    # Fully independent reference: scipy's own BFS, with zero dependency on
-    # bool_pe.csl, preprocess_bool.py, or the CSL matrix partitioning -- a
-    # bug shared by the on-device pipeline's own building blocks would
-    # never show up as a self-comparison.
+    # Fully independent reference: scipy's own BFS, with no dependency on
+    # bool_pe.csl/preprocess_bool.py/the CSL matrix partitioning -- catches
+    # bugs shared by the on-device pipeline's own building blocks.
     print("scipy reference: breadth_first_order")
     # transpose because A_csr is row=dest/col=source but breadth_first_order
     # needs row=source/col=dest (csgraph[i,j] != 0 means edge i -> j).
@@ -609,10 +578,9 @@ def main():
         "matrix_symmetric": is_symmetric,
     }
 
-    # parent_resolve has no sync bracket (it's an on-device-only reduce, not
-    # a host-device transfer) -- still the per-PE-max-of-self-delta approach,
-    # which is exactly right there (no cross-PE clock sync needed for a
-    # quantity that never leaves the fabric).
+    # parent_resolve is on-device only (no host-device transfer), so the
+    # per-PE-max-of-self-delta approach is fine here -- no cross-PE clock
+    # sync needed for a quantity that never leaves the fabric.
     for name, cycles in (("parent_resolve", parent_resolve_cycles),):
       row[f"{name}_min_cycles"] = int(cycles.min())
       row[f"{name}_max_cycles"] = int(cycles.max())
@@ -620,12 +588,10 @@ def main():
       print(f"  {name:>18s}: min={int(cycles.min())} max={int(cycles.max())} "
             f"avg={cycles.mean():.1f}")
 
-    # Sync-corrected cross-PE span (see bfs_timing.read_sync_corrected_span) --
-    # the true max(toc)-min(tic) across all PEs. This is now the ONLY h2d/d2h
-    # timing this project records: the per-PE-max-of-self-delta approach it
-    # replaced was a structural lower bound on this span (proved and measured
-    # -- understated d2h by ~51% at a 750x750 grid), never more accurate, so
-    # there was nothing worth keeping it alongside for.
+    # Sync-corrected cross-PE span (bfs_timing.read_sync_corrected_span) --
+    # the true max(toc)-min(tic) across all PEs. The only h2d/d2h timing
+    # recorded: the per-PE-max-of-self-delta approach it replaced is a
+    # structural lower bound on this span, never more accurate.
     for name, span in (("h2d_matrix", h2d_matrix_span_cycles),
                         ("h2d_seed", h2d_seed_span_cycles), ("d2h", d2h_span_cycles)):
       row[f"{name}_span_cycles"] = span
@@ -637,10 +603,9 @@ def main():
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
     row.update(row_cols)
 
-    # direction-optimizing BFS Phase D: per-round frontier size + which
-    # traversal strategy each profiled round actually used, alongside the
-    # phase timing decoded above -- see bool_pe.csl's nf_history/
-    # direction_history and the plan's own Phase D writeup.
+    # Per-round frontier size and which traversal strategy each profiled
+    # round used, alongside the phase timing decoded above -- see
+    # bool_pe.csl's nf_history/direction_history.
     profiled_directions = [int(v) for v in direction_history[:profiled_rounds]]
     profiled_nf = [int(v) for v in nf_history[:profiled_rounds]]
     row["direction_history"] = ";".join(str(v) for v in profiled_directions)
@@ -649,11 +614,10 @@ def main():
     print(f"  direction per round (TD=top-down, BU=bottom-up): {dir_labels}")
     print(f"  nf per round (this round's own discovery count): {profiled_nf}")
 
-    # Logged per-round (zero everywhere except the one round the switch
-    # actually fires in), matching every other compute-split column's own
-    # format -- lets plot_bfs_timing.py render it as a bar in that round's
-    # group alongside local_compute's own reset/compact/expand split,
-    # instead of only reporting one aggregate number for the whole run.
+    # Logged per-round (zero except the round the switch fires in),
+    # matching the other compute-split columns' format, so
+    # plot_bfs_timing.py can render it as a bar in that round's group
+    # instead of one aggregate number.
     switch_round = next((i for i, d in enumerate(profiled_directions) if d), None)
     transpose_min_list = [0] * profiled_rounds
     transpose_max_list = [0] * profiled_rounds
@@ -675,22 +639,15 @@ def main():
           ts_hwl_u32, height, width, max_rounds, rounds_completed)
       # Raw per-PE local_compute/local_term_cond grids, plus the two raw
       # round-boundary grids (round_start/round_end) round_time is built
-      # from -- everything decode_pe_phase_cycles can still produce now
-      # that the per-communication-phase skew-adjustment machinery (which
-      # used to also live here) has been removed as unreliable (see
-      # docs/GRAPH500_BENCHMARK.md).
+      # from.
       phase_cycles.update({"raw_round_start": round_start, "raw_round_end": round_end})
 
       matrix_stem = os.path.splitext(os.path.basename(infile_mtx))[0]
       run_id = f"{matrix_stem}_{np_cols}x{np_rows}_src{source}"
-      # lives inside results/<hw|sim>/heatmap/<run_id>/ -- the same per-run
-      # folder plot_pe_heatmap.py renders its PNGs into (it derives that
-      # folder from wherever this .npz actually is, see its
-      # default_run_dir()), so the raw data and its plots stay together as
-      # one self-contained bundle rather than scattered across two
-      # top-level directories. hw vs sim mirrors --csv's own results/hw or
-      # results/sim (see plot_bfs_timing.results_variant), not a hardcoded
-      # guess -- so this stays consistent with out_timing's default below.
+      # Lives inside results/<hw|sim>/heatmap/<run_id>/. hw vs sim mirrors
+      # --csv's own results/hw or results/sim (see
+      # plot_bfs_timing.results_variant), matching out_timing's default
+      # below.
       pe_timing_out = args.pe_timing_out or os.path.join(
           BFS_ROOT, "results",
           plot_bfs_timing.results_variant(args.csv or _default_csv_path()),
@@ -703,30 +660,25 @@ def main():
           "max_rounds": max_rounds,
           "profiled_rounds": profiled_rounds,
       }, structural_grids={
-          # host-side partition structure, computed by preprocess_bool.py
-          # before any device interaction -- for checking by eye whether a
-          # phase's per-PE imbalance (e.g. local_compute) actually tracks
-          # the matrix's own sparsity distribution across PEs.
+          # Host-side partition structure (preprocess_bool.py) -- check by
+          # eye whether a phase's per-PE imbalance tracks the matrix's own
+          # sparsity distribution.
           "local_nnz": local_nnz[:, :, 0].astype(np.int64),
           "local_nnz_cols": local_nnz_cols[:, :, 0].astype(np.int64),
           "local_nnz_rows": local_nnz_rows[:, :, 0].astype(np.int64),
-          # parent_resolve's own per-PE spatial grid (no round axis -- fires
-          # once, at convergence, not per round) -- confirms whether its
-          # huge min/max spread (see docs/GRAPH500_BENCHMARK.md) is really
-          # root-relay-hop-distance-driven (grid should peak at the reduce's
-          # root PE column) rather than random idle-wait skew.
+          # parent_resolve's per-PE spatial grid (no round axis -- fires
+          # once, at convergence) -- confirms whether its min/max spread
+          # (docs/GRAPH500_BENCHMARK.md) is root-relay-hop-distance-driven
+          # rather than random idle-wait skew.
           "parent_resolve_cycles": parent_resolve_grid.astype(np.int64),
       })
       print(f"saved per-PE timing grid to {pe_timing_out}")
 
-    # device_time_cycles (from decode_phase_row) is now total_runtime_cycles:
-    # the whole-run round_trip_start_buffer -> round_trip_done_buffer span,
-    # which already includes transpose_structure()'s cost (it runs inside
-    # that same span) and already EXCLUDES parent_resolve (round_trip_done_
-    # buffer is captured before parent_resolve starts -- see bool_pe.csl).
-    # So the on-device total INCLUDING parent_resolve just needs it added
-    # back in; the full search_time_cycles then adds the host transfer
-    # brackets on top.
+    # device_time_cycles is the whole-run round_trip_start->done_buffer
+    # span: includes transpose_structure() (runs inside that span) but
+    # excludes parent_resolve (round_trip_done_buffer is captured before it
+    # starts -- see bool_pe.csl), so it's added back in below;
+    # search_time_cycles then adds the host transfer brackets on top.
     search_time_cycles_no_transfer = device_time_cycles + int(parent_resolve_cycles.max())
     search_time_cycles = (h2d_seed_span_cycles + search_time_cycles_no_transfer
                            + d2h_span_cycles)
@@ -751,10 +703,9 @@ def main():
           + ("" if is_symmetric else "  -- directed graph: not a Graph500-spec-comparable "
                                       "GTEPS, see m_convention"))
 
-    # search_time_cycles minus the two host-transfer brackets (h2d_seed,
-    # d2h) -- isolates on-device work (rounds + transpose + parent_resolve)
-    # from host<->device transfer overhead, since those transfers can
-    # otherwise dominate search_time_cycles for small/fast graphs.
+    # search_time_cycles minus the h2d_seed/d2h brackets -- isolates
+    # on-device work from transfer overhead, which can otherwise dominate
+    # for small/fast graphs.
     row["search_time_cycles_no_transfer"] = search_time_cycles_no_transfer
     _, _, search_time_seconds_no_transfer, gteps_no_transfer = compute_m_and_gteps(
         coo, device_visited, is_symmetric, search_time_cycles_no_transfer)
@@ -763,24 +714,20 @@ def main():
           f"{search_time_seconds_no_transfer * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
           f"{gteps_no_transfer:.6f} GTEPS ]]")
 
-    # Console-only, NOT a CSV column: device_time_cycles itself already
-    # excludes parent_resolve (mpi_x.reduce_select_any()'s one-time
-    # end-of-run reduce, real on-device work but a single end-of-run step
-    # rather than per-round communication, whose share of on-device time
-    # grows from a small fraction at small scale/grid to the large majority
-    # at large scale/grid) -- print the further-excluded figure too so a
-    # live run's own terminal output isn't misleadingly dominated by it.
+    # Console-only, not a CSV column: device_time_cycles already excludes
+    # parent_resolve (a single end-of-run step whose share of on-device
+    # time grows large at big scale/grid) -- print the further-excluded
+    # figure too so terminal output isn't misleadingly dominated by it.
     _, _, search_time_seconds_excl_resolve, gteps_excl_resolve = compute_m_and_gteps(
         coo, device_visited, is_symmetric, device_time_cycles)
     print(f"[[ GTEPS w/o h2d_seed/d2h/parent_resolve = {m} edges ({m_convention}) / "
           f"{search_time_seconds_excl_resolve * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
           f"{gteps_excl_resolve:.6f} GTEPS ]]")
 
-    # Consistency check (see check_round_vs_total_communication's own
-    # docstring): sum(round_time - round_compute) across rounds should be
-    # close to device_time - total_compute (compute = local_compute +
-    # local_term_cond, summed over rounds, + transpose) -- a large mismatch
-    # is a real signal, not just normal per-round straggler variance.
+    # Consistency check (see check_round_vs_total_communication):
+    # sum(round_time - round_compute) across rounds should be close to
+    # device_time - total_compute -- a large mismatch is a real signal, not
+    # normal straggler variance.
     check_round_vs_total_communication(
         round_duration_cycles, local_compute_max_cycles, local_term_cond_max_cycles,
         device_time_cycles, transpose_cycles.max())

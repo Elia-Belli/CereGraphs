@@ -1,38 +1,27 @@
 #!/usr/bin/env cs_python
 # pylint: disable=too-many-function-args,wrong-import-position
-""" Full Graph500-style BFS benchmark for bool_diag_spmv's on-device
-  f_spmv_iter kernel: one compile, one matrix upload, then --num-searches
-  (default 64, per the spec) single-source BFS searches from distinct
-  random roots, each timed individually as its own Kernel 2 search (see
-  docs/GRAPH500_BENCHMARK.md section 1) -- and the harmonic mean GTEPS across
-  all of them, the spec's own rule for combining per-search rates into one
-  number.
+""" Graph500-style BFS benchmark for bool_diag_spmv's on-device f_spmv_iter
+  kernel: one compile, one matrix upload, then --num-searches (default 64,
+  per spec) single-source BFS searches from distinct random roots, each
+  timed individually as its own Kernel 2 search (docs/GRAPH500_BENCHMARK.md
+  section 1), reporting the harmonic mean GTEPS across all of them -- the
+  spec's own rule for combining per-search rates into one number.
 
-  Kernel 1 / Kernel 2 split (docs/GRAPH500_BENCHMARK.md section 1-2):
-    - matrix structure (mat_rows_buf, mat_col_idx/loc/len_buf,
-      local_nnz*) is uploaded to the device exactly ONCE,
-      timed separately as "construction" -- never part of any search's own
-      time, same as Graph500's own Kernel 1.
-    - each search re-uploads only x_bitmap (the new root's one-hot seed) and
-      re-launches f_spmv_iter. bool_pe.csl's start_spmv() already resets
-      visited_bitmap/rounds_completed/parent_local_buf/ts_round itself on
-      EVERY fresh f_spmv_iter() call (see its own comments on why
-      overwriting, not OR-ing, is safe for repeated launches in the same
-      session) -- no separate host-side reset step is needed or sent.
-    - each search's own timed portion runs from seeding x_bitmap through
-      reading parent_local_buf back into host memory -- the reference
-      implementation's own run_bfs(root, pred) signature makes the
-      predecessor array the sole official output (no separate "visited"
-      readback exists in the spec at all), so that's the only d2h transfer
-      that needs to be part of search_time_cycles. visited is derived
-      host-side from parent alone (device_io.derive_visited_from_parent) --
-      provably equivalent to reading visited_bitmap separately, see its own
-      docstring -- so no other readback is needed or timed.
+  Kernel 1 / Kernel 2 split (docs/GRAPH500_BENCHMARK.md section 1-2): the
+  matrix structure is uploaded to the device exactly ONCE and timed
+  separately as "construction", never part of any search's own time. Each
+  search only re-uploads x_bitmap (the new root's seed) and re-launches
+  f_spmv_iter -- bool_pe.csl's start_spmv() already resets its own state on
+  every fresh launch, so no host-side reset step is needed. Each search's
+  timed portion runs from seeding x_bitmap through reading back
+  parent_local_buf, the reference implementation's sole official output;
+  visited is derived host-side from parent alone
+  (device_io.derive_visited_from_parent), so no other readback is needed.
 
   run_bfs.py remains the single-search deep-dive tool (tree plot, verbose
-  per-phase breakdown, --show-parent-mismatch); this script trades that
-  per-search detail for running the full 64-search sweep the Graph500 spec
-  actually asks for and reporting one aggregate number.
+  per-phase breakdown, --show-parent-mismatch); this script instead runs
+  the full 64-search sweep the Graph500 spec asks for and reports one
+  aggregate number.
 
   How to compile and run
      cs_python run_graph500.py --arch=wse3 --num_pe_cols=8 --num_pe_rows=8
@@ -49,9 +38,8 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-# This script lives in scripts/; device_io.py/graph_loader.py/preprocess_bool.py/
-# bfs_timing.py live in ../implementation/, bfs_tree_plot.py in ../plots/ --
-# see run_bfs.py's matching comment.
+# device_io.py/graph_loader.py/preprocess_bool.py/bfs_timing.py live in
+# ../implementation/, bfs_tree_plot.py in ../plots/ (see run_bfs.py).
 BFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BFS_ROOT, "implementation"))
 sys.path.insert(0, os.path.join(BFS_ROOT, "plots"))
@@ -123,14 +111,11 @@ def pick_sources(args, A_csc, n):
     return sources
 
   # Graph500's own rule (https://graph500.org/?page_id=12 section 5): sample
-  # roots with degree >= 1, NOT COUNTING SELF-LOOPS -- a source with only a
-  # self-loop (or no edges at all) can never discover anything new, so
-  # m/GTEPS for it would be a meaningless divide-by-(effectively)-zero.
-  # row=dest/col=source (this kernel's boolean semiring convention:
-  # y = OR_j (A[i,j] AND x[j])), so raw out-degree is the per-column nnz count;
-  # subtract 1 for any column that also has a diagonal (self-loop) entry.
-  # gen_rmat.py's own output never has self-loops, but an arbitrary
-  # --infile_mtx (e.g. data/rand600.mtx) can.
+  # roots with degree >= 1, excluding self-loops -- a source with only a
+  # self-loop can never discover anything new, making m/GTEPS meaningless.
+  # row=dest/col=source (this kernel's convention: y = OR_j (A[i,j] AND
+  # x[j])), so out-degree is per-column nnz minus 1 if the column also has
+  # a diagonal entry.
   outdeg = np.diff(A_csc.indptr) - (A_csc.diagonal() != 0).astype(np.int64)
   candidates = np.nonzero(outdeg > 0)[0]
   if len(candidates) < args.num_searches:
@@ -188,10 +173,9 @@ def main():
   nnz = A_csr.nnz
   print(f"Load matrix A, {nrows}-by-{ncols} with {nnz} nonzeros (structural, boolean)")
 
-  # Graph500's own m formula (the undirected dedup rule, see
-  # docs/GRAPH500_BENCHMARK.md section 4) only makes sense for a symmetrized
-  # graph -- true for gen_rmat.py's output but not guaranteed for an
-  # arbitrary --infile_mtx.
+  # Graph500's m formula (the undirected dedup rule, docs/GRAPH500_BENCHMARK.md
+  # section 4) only makes sense for a symmetrized graph -- true for
+  # gen_rmat.py's output but not guaranteed for an arbitrary --infile_mtx.
   is_symmetric = (A_csr != A_csr.T).nnz == 0
   if not is_symmetric:
     print("[[ NOTE: A_csr is not symmetric -- using the directed edges-traversed formula "
@@ -282,11 +266,8 @@ def main():
   runner.run()
 
   # All host-side marshaling for the matrix-structure upload happens here,
-  # BEFORE the timed bracket below -- see bfs_timing.timed_transfer's
-  # docstring for why this split (marshal fully, then transfer-only inside
-  # the tic/toc window) is load-bearing, not stylistic: hwl_to_oned_colmajor
-  # used to run interleaved between the memcpy_h2d calls, inside the window,
-  # contaminating h2d_matrix_span_cycles with host reshape time.
+  # before the timed bracket below -- host reshape time must not leak into
+  # h2d_matrix_span_cycles (see bfs_timing.timed_transfer's docstring).
   mat_rows_prepared = prepare_h2d_chunked(mat_rows_buf, height, width, max_local_nnz, np.uint32)
   mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
                                             np.uint32)
@@ -338,9 +319,9 @@ def main():
   search_rows = []
   n_correctness_fail = 0
   for i, source in enumerate(sources):
-    # single-source seed: only the ONE diagonal PE owning `source` ever
-    # needs a real host write -- see single_source_seed_pe()'s own
-    # docstring for why every other PE's x_bitmap is already provably zero.
+    # Only the one diagonal PE owning `source` needs a real host write --
+    # every other PE's x_bitmap is already provably zero (see
+    # single_source_seed_pe()'s docstring).
     px, py, local_x = single_source_seed_pe(source, blk, P)
 
     def _send_h2d_seed(local_x=local_x, px=px, py=py):
@@ -353,23 +334,16 @@ def main():
         sym_tsc_start=sym_tsc_start_buffer, sym_tsc_end=sym_tsc_end_buffer,
         sym_tsc_ref=sym_tsc_ref_buffer)
 
-    # the only per-search "reset": bool_pe.csl's start_spmv() reinitializes
-    # visited_bitmap/rounds_completed/parent_local_buf/ts_round itself on every
-    # fresh f_spmv_iter() call -- see the module docstring above.
+    # bool_pe.csl's start_spmv() resets its own state on every fresh launch
+    # (see module docstring), so this is the only per-search "reset".
     runner.launch("f_spmv_iter", nonblock=False)
 
-    # Graph500's own output is exactly the predecessor/parent array (see
-    # docs/GRAPH500_BENCHMARK.md section 1 -- the reference implementation's
-    # run_bfs(root, pred) signature) -- derive_visited_from_parent() below
-    # recovers visited from parent_local_buf alone, so only that one
-    # transfer needs to be timed as the search's "output written to memory"
-    # cost, and it's folded into search_time_cycles below.
-    # Phase B of the on-device parent resolution plan: bool_pe.csl already
-    # resolved each row's P per-PE candidates down to a single winner at
-    # PE-column MID, so only that one narrow column needs to leave the
-    # device. width=1 here, not width. Root moved from column 0 to MID to
-    # halve reduce_select_any's serial relay critical path.
-    # (Allocation moved out of the timed bracket below -- see timed_transfer.)
+    # Graph500's own output is exactly the parent array; visited is derived
+    # from it below, so only this one transfer is timed. bool_pe.csl already
+    # resolves each row's per-PE candidates down to a single winner at
+    # PE-column MID (root lives there too, halving reduce_select_any's relay
+    # critical path), so only that one column (width=1, not width) needs to
+    # leave the device.
     parent_mid_col = width // 2
     parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
 
@@ -395,9 +369,8 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     ts_hwl_u32 = np.reshape(ts_buf_1d, (height, width, ts_len), order="F")
 
-    # Always-correct round-trip span, independent of max_rounds/ts_buf
-    # truncation -- see round_trip_start_buffer/round_trip_done_buffer's
-    # own declaration comment in bool_pe.csl.
+    # Round-trip span independent of max_rounds/ts_buf truncation (see
+    # round_trip_start_buffer/round_trip_done_buffer in bool_pe.csl).
     round_trip_cycles = read_tic_toc_delta(runner, sym_round_trip_start_buffer,
                                             sym_round_trip_done_buffer, height, width)
 
@@ -428,9 +401,8 @@ def main():
     m, m_convention, search_time_seconds, gteps = compute_m_and_gteps(
         A_coo_static, device_visited, is_symmetric, search_time_cycles)
 
-    # Consistency check (see check_round_vs_total_communication's own
-    # docstring) -- transpose_max_cycles=0 since this script has no
-    # --directional support (the bottom-up switch never fires here).
+    # Consistency check (see check_round_vs_total_communication's docstring);
+    # transpose_max_cycles=0 since this script has no --directional support.
     check_round_vs_total_communication(
         round_duration_cycles, local_compute_max_cycles, local_term_cond_max_cycles,
         device_time_cycles, 0, verbose=False)
@@ -469,9 +441,8 @@ def main():
 
   runner.stop()
 
-  # --- Aggregate, per docs/GRAPH500_BENCHMARK.md section 1: harmonic mean of the
-  # per-search rates, plus min/max/median for context (the spec reports
-  # quartiles/min/max alongside the harmonic mean too). ---
+  # --- Aggregate: harmonic mean of per-search rates (docs/GRAPH500_BENCHMARK.md
+  # section 1), plus min/max/median for context. ---
   gteps_values = [r["gteps"] for r in search_rows]
   finite_gteps = [g for g in gteps_values if np.isfinite(g) and g > 0]
   hmean_gteps = harmonic_mean(gteps_values)

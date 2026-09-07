@@ -1,5 +1,6 @@
 **/out*/
 data/
+bfs/results/
 
 simfab_traces/
 wio_flows*
