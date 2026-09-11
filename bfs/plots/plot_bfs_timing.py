@@ -17,9 +17,7 @@ as unreliable (docs/GRAPH500_BENCHMARK.md sections 10-13). The segments
 are stacked in a fixed order for a stable legend, not a literal timeline.
 
 total_runtime_cycles is still in the CSV, just no longer compared
-against the round bars' own sum -- that comparison gets noisy once
-transpose_structure()'s high per-PE variance is involved (see
-run_gap_diagnostic.py).
+against the round bars' own sum (see run_gap_diagnostic.py).
 
 local_compute additionally gets min/avg tick marks across PEs on top of
 its max-height segment.
@@ -106,21 +104,6 @@ def hue_shades(base_hex, n):
 
 H2D_COLORS = dict(zip(H2D_PARTS, hue_shades(H2D_BASE_HEX, len(H2D_PARTS))))
 
-# transpose_structure()'s one-time direction-optimizing-BFS cost: not a
-# sub-part of local_compute (it runs in term_col_bcast_done(), not
-# compute()), so it gets its own distinct hue rather than a local_compute
-# shade. transpose_*_cycles is zero in every round except whichever one
-# the top-down -> bottom-up switch fires in, so this segment is empty
-# everywhere but that one round.
-TRANSPOSE_COLOR = "#2a9d8f"  # teal
-
-# Stacked onto the round bars (see plot_timing_row) so the switch round's
-# bar doesn't visibly sum to less than total_runtime_cycles -- without it,
-# transpose_structure()'s gap would be an unaccounted-for span the reader
-# has no way to attribute from the bars alone.
-ROUND_SEGMENT_COLORS["transpose"] = TRANSPOSE_COLOR
-ROUND_SEGMENT_LABELS["transpose"] = "transpose_structure() (one-time, switch round only)"
-
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_MUTED = "#898781"
 GRIDLINE = "#e1e0d9"
@@ -196,12 +179,6 @@ def plot_timing_row(row, out_path):
   # Remainder: everything else in the round (see module docstring).
   communication = np.clip(round_duration - local_compute - local_term_cond, 0.0, None)
 
-  # transpose_structure()'s one-time cost (zero except on the switch round).
-  transpose_heights = parse_cycle_list(row["transpose_max_cycles"]).astype(float)
-  assert len(transpose_heights) == profiled_rounds, (
-      f"transpose_max_cycles has {len(transpose_heights)} entries, expected "
-      f"profiled_rounds={profiled_rounds}")
-
   # h2d_matrix/h2d_seed/d2h: sync-corrected cross-PE span only (see
   # bfs_timing.read_sync_corrected_span) -- no per-PE min/avg to show.
   h2d_span = {p: int(row[f"{p}_span_cycles"]) for p in H2D_PARTS}
@@ -269,9 +246,6 @@ def plot_timing_row(row, out_path):
       "local_compute": local_compute,
       "local_term_cond": local_term_cond,
       "communication": communication,
-      # Stacked last (zero-height, invisible, except on the switch round --
-      # see ROUND_SEGMENT_COLORS["transpose"] above).
-      "transpose": transpose_heights,
   }
   for name, heights in segment_values.items():
     color = ROUND_SEGMENT_COLORS[name]
@@ -332,7 +306,7 @@ def plot_timing_row(row, out_path):
   fig.suptitle(f"Per-round phase timing -- {matrix}, {pe_grid} grid, source={source}, "
                f"channels={channels}\n"
                f"n={row['n']}, nnz={row['nnz']}, {rounds_suffix} "
-               "(bar height = round_duration_cycles, + transpose_structure() on the switch round)",
+               "(bar height = round_duration_cycles)",
                fontsize=10)
   for ax in (ax_h2d, ax_rounds, ax_d2h):
     ax.spines["top"].set_visible(False)

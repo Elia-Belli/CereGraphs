@@ -84,7 +84,6 @@ from device_io import (csl_compile_core_appliance, derive_visited_from_parent,
 from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder  # pylint: disable=import-error,no-name-in-module
 from cerebras.sdk.client import SdkRuntime  # pylint: disable=import-error,no-name-in-module
 
-DEFAULT_TAU_SWITCH_FRAC = 0.15  # see run_bfs.py's own comment on this constant
 ARTIFACT_PATH_FILENAME = "artifact_path.json"
 
 
@@ -175,9 +174,6 @@ def parse_args():
 
   parser.add_argument("--max-rounds", type=int, default=10,
                        help="on-device cap on rounds actually profiled (bool_pe.csl's ts_buf)")
-  parser.add_argument("--directional", action="store_true",
-                       help="enable the direction-optimizing BFS switch -- see run_bfs.py's own "
-                            "flag for the full explanation")
   parser.add_argument("--csv", default=None,
                        help="CSV file to append this run's timing row to "
                             "(default: results/sim/bfs_timing.csv or results/hw/bfs_timing.csv "
@@ -191,13 +187,6 @@ def parse_args():
   parser.add_argument("--dump-pe-timing", action="store_true",
                        help="save the full per-PE-per-round-per-phase cycle grid to a .npz file")
   parser.add_argument("--pe-timing-out", default=None, help="path for --dump-pe-timing's output")
-  parser.add_argument("--parent-resolve-variant", choices=["dense", "indexed"],
-                       default="dense",
-                       help="which reduce_select_any variant to use for the end-of-run "
-                            "parent-resolution collective -- dense is production; indexed is "
-                            "experimental, ~4.5-8.9x faster where it fits (see docs/ERRORS.md "
-                            "#17), blocked at very large blk by #8. Compares directly against "
-                            "the parent_resolve timing column this same script already reports.")
   return parser.parse_args()
 
 
@@ -252,30 +241,31 @@ def main():
   A_csc = A_csc.sorted_indices()
   assert A_csc.has_sorted_indices == 1, "Error: A is not sorted"
 
+  # Bottom-up is the only traversal strategy this kernel runs (see
+  # docs/ERRORS.md #21) -- the host uploads the matrix ALREADY in
+  # CSR-by-destination form, so preprocess()'s csr/csc argument PAIRS are
+  # swapped here relative to their parameter names -- see run_bfs.py's own
+  # comment on this same call for the full derivation.
   matrix_info = preprocess(
       nrows, ncols, nnz, np_cols, np_rows,
-      A_csr.indptr, A_csr.indices, A_csc.indptr, A_csc.indices,
+      A_csc.indptr, A_csc.indices, A_csr.indptr, A_csr.indices,
   )
 
   max_local_nnz = matrix_info["max_local_nnz"]
-  max_local_nnz_cols = matrix_info["max_local_nnz_cols"]
-  max_local_nnz_rows = matrix_info["max_local_nnz_rows"]
-  mat_rows_buf = matrix_info["mat_rows_buf"]
-  mat_col_idx_buf = matrix_info["mat_col_idx_buf"]
-  mat_col_loc_buf = matrix_info["mat_col_loc_buf"]
-  mat_col_len_buf = matrix_info["mat_col_len_buf"]
-  local_nnz = matrix_info["local_nnz"]
-  local_nnz_cols = matrix_info["local_nnz_cols"]
-  local_nnz_rows = matrix_info["local_nnz_rows"]
+  # Post-swap: see run_bfs.py's own comment on this same extraction (both
+  # the field renaming AND the (px,py)-axis transpose fix -- a real bug
+  # caught via a standalone test: without the transpose, every off-diagonal
+  # PE silently received its transpose partner's block).
+  max_local_nnz_rows = matrix_info["max_local_nnz_cols"]
+  mat_rows_buf = np.transpose(matrix_info["mat_rows_buf"], (1, 0, 2))
+  mat_row_idx_buf = np.transpose(matrix_info["mat_col_idx_buf"], (1, 0, 2))
+  mat_row_loc_buf = np.transpose(matrix_info["mat_col_loc_buf"], (1, 0, 2))
+  mat_row_len_buf = np.transpose(matrix_info["mat_col_len_buf"], (1, 0, 2))
+  local_nnz = np.transpose(matrix_info["local_nnz"], (1, 0, 2))
+  local_nnz_rows = np.transpose(matrix_info["local_nnz_cols"], (1, 0, 2))
 
   blk = math.ceil(n / P)
   bitmap_words = (blk + 31) // 32
-
-  tau_switch_count = None
-  if args.directional:
-    tau_switch_count = round(DEFAULT_TAU_SWITCH_FRAC * n)
-    print(f"--directional: tau_switch_count = {tau_switch_count} "
-          f"({DEFAULT_TAU_SWITCH_FRAC * 100:.0f}% of n={n})")
 
   seed_px, seed_py, seed_local_x = single_source_seed_pe(source, blk, P)
 
@@ -321,10 +311,8 @@ def main():
     artifact_path = csl_compile_core_appliance(
         csl_dir, csl_file, os.path.basename(dirname), fabric_width, fabric_height,
         core_fabric_offset_x, core_fabric_offset_y, args.arch,
-        np_cols, np_rows, blk, max_local_nnz, max_local_nnz_cols, max_local_nnz_rows,
+        np_cols, np_rows, blk, max_local_nnz, max_local_nnz_rows,
         channels, width_west_buf, width_east_buf, max_rounds=max_rounds,
-        tau_switch_count=tau_switch_count,
-        parent_resolve_variant={"dense": 0, "indexed": 2}[args.parent_resolve_variant],
     )
     print(f"Compilation done in {time.time()-start}s", flush=True)
     # {"artifact_path": ...} dict, matching ALCF's own documented format.
@@ -346,14 +334,11 @@ def main():
     sym_parent_local_buf = runner.get_id("parent_local_buf")
     sym_rounds_completed = runner.get_id("rounds_completed")
     sym_mat_rows_buf = runner.get_id("mat_rows_buf")
-    sym_mat_col_idx_buf = runner.get_id("mat_col_idx_buf")
-    sym_mat_col_loc_buf = runner.get_id("mat_col_loc_buf")
-    sym_mat_col_len_buf = runner.get_id("mat_col_len_buf")
+    sym_mat_row_idx_buf = runner.get_id("mat_row_idx_buf")
+    sym_mat_row_loc_buf = runner.get_id("mat_row_loc_buf")
+    sym_mat_row_len_buf = runner.get_id("mat_row_len_buf")
     sym_local_nnz = runner.get_id("local_nnz")
-    sym_local_nnz_cols = runner.get_id("local_nnz_cols")
     sym_local_nnz_rows = runner.get_id("local_nnz_rows")
-    sym_nz_total = runner.get_id("nz_total")
-    sym_is_bottom_up_dbg = runner.get_id("is_bottom_up_dbg")
     sym_parent_occupancy = runner.get_id("parent_occupancy")
     if need_timing:
       sym_ts_buf = runner.get_id("ts_buf")
@@ -361,9 +346,6 @@ def main():
       sym_tsc_end_buffer = runner.get_id("tsc_end_buffer")
       sym_tsc_ref_buffer = runner.get_id("tsc_ref_buffer")
       sym_nf_history = runner.get_id("nf_history")
-      sym_direction_history = runner.get_id("direction_history")
-      sym_transpose_tic_buffer = runner.get_id("transpose_tic_buffer")
-      sym_transpose_toc_buffer = runner.get_id("transpose_toc_buffer")
       sym_parent_resolve_tic_buffer = runner.get_id("parent_resolve_tic_buffer")
       sym_parent_resolve_toc_buffer = runner.get_id("parent_resolve_toc_buffer")
       sym_round_trip_start_buffer = runner.get_id("round_trip_start_buffer")
@@ -375,14 +357,13 @@ def main():
     # BEFORE the timed bracket below -- keeping reshape work out of the
     # tic/toc window is load-bearing, not stylistic (see bfs_timing.timed_transfer).
     mat_rows_prepared = prepare_h2d_chunked(mat_rows_buf, height, width, max_local_nnz, np.uint32)
-    mat_col_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_idx_buf,
+    mat_row_idx_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_rows, mat_row_idx_buf,
                                               np.uint32)
-    mat_col_loc_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_loc_buf,
+    mat_row_loc_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_rows, mat_row_loc_buf,
                                               np.uint32)
-    mat_col_len_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_cols, mat_col_len_buf,
+    mat_row_len_buf_1d = hwl_to_oned_colmajor(height, width, max_local_nnz_rows, mat_row_len_buf,
                                               np.uint32)
     local_nnz_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz, np.uint32)
-    local_nnz_cols_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz_cols, np.uint32)
     local_nnz_rows_1d = hwl_to_oned_colmajor(height, width, 1, local_nnz_rows, np.uint32)
 
     if need_timing:
@@ -392,22 +373,19 @@ def main():
     def _send_h2d_matrix():
       send_h2d_chunked(runner, sym_mat_rows_buf, mat_rows_prepared, width, max_local_nnz,
                        MemcpyDataType.MEMCPY_16BIT, MemcpyOrder.COL_MAJOR, nonblock=True)
-      runner.memcpy_h2d(sym_mat_col_idx_buf, mat_col_idx_buf_1d, 0, 0, width, height,
-                         max_local_nnz_cols, streaming=False,
+      runner.memcpy_h2d(sym_mat_row_idx_buf, mat_row_idx_buf_1d, 0, 0, width, height,
+                         max_local_nnz_rows, streaming=False,
                          data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.COL_MAJOR,
                          nonblock=True)
-      runner.memcpy_h2d(sym_mat_col_loc_buf, mat_col_loc_buf_1d, 0, 0, width, height,
-                         max_local_nnz_cols, streaming=False,
+      runner.memcpy_h2d(sym_mat_row_loc_buf, mat_row_loc_buf_1d, 0, 0, width, height,
+                         max_local_nnz_rows, streaming=False,
                          data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.COL_MAJOR,
                          nonblock=True)
-      runner.memcpy_h2d(sym_mat_col_len_buf, mat_col_len_buf_1d, 0, 0, width, height,
-                         max_local_nnz_cols, streaming=False,
+      runner.memcpy_h2d(sym_mat_row_len_buf, mat_row_len_buf_1d, 0, 0, width, height,
+                         max_local_nnz_rows, streaming=False,
                          data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.COL_MAJOR,
                          nonblock=True)
       runner.memcpy_h2d(sym_local_nnz, local_nnz_1d, 0, 0, width, height, 1,
-                         streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                         order=MemcpyOrder.COL_MAJOR, nonblock=True)
-      runner.memcpy_h2d(sym_local_nnz_cols, local_nnz_cols_1d, 0, 0, width, height, 1,
                          streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
                          order=MemcpyOrder.COL_MAJOR, nonblock=True)
       runner.memcpy_h2d(sym_local_nnz_rows, local_nnz_rows_1d, 0, 0, width, height, 1,
@@ -469,25 +447,11 @@ def main():
                        order=MemcpyOrder.COL_MAJOR, nonblock=False)
     rounds_completed = int(np.reshape(rounds_buf, (height, width, 1), order="F")[(0, 0, 0)])
 
-    nz_total_buf = np.zeros(height * width, np.float32)
-    runner.memcpy_d2h(nz_total_buf, sym_nz_total, 0, 0, width, height, 1,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
-    final_nz_total = float(np.reshape(nz_total_buf, (height, width, 1), order="F")[(0, 0, 0)])
-    is_bottom_up_buf = np.zeros(height * width, np.uint32)
-    runner.memcpy_d2h(is_bottom_up_buf, sym_is_bottom_up_dbg, 0, 0, width, height, 1,
-                       streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                       order=MemcpyOrder.COL_MAJOR, nonblock=False)
-    final_is_bottom_up = bool(np.reshape(is_bottom_up_buf, (height, width, 1), order="F")[(0, 0, 0)])
-    print(f"[[ direction-optimizing Phase A: final nz_total={final_nz_total}, "
-          f"is_bottom_up={final_is_bottom_up}"
-          + (f", tau_switch_count={tau_switch_count}" if tau_switch_count is not None else "") + " ]]")
-
     # How many of each PE's blk local rows already have a real parent
     # candidate right before the one-time end-of-run reduce_select_any call.
     # Read back grid-wide (not just PE(0,0)) since occupancy is genuinely
-    # per-PE, unlike nz_total/direction_history/nf_history which are
-    # identical everywhere by construction.
+    # per-PE, unlike nf_history which is identical everywhere by
+    # construction.
     parent_occupancy_buf = np.zeros(height * width, np.uint32)
     runner.memcpy_d2h(parent_occupancy_buf, sym_parent_occupancy, 0, 0, width, height, 1,
                        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
@@ -500,7 +464,6 @@ def main():
           f"real parent, per-PE, right before reduce_select_any) ]]")
 
     ts_hwl_u32 = None
-    direction_history = None
     if need_timing:
       ts_len = max_rounds * NUM_TS_SLOTS * 3
       ts_buf_1d = np.zeros(height * width * ts_len, np.uint32)
@@ -514,20 +477,9 @@ def main():
                          streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
                          order=MemcpyOrder.COL_MAJOR, nonblock=False)
       nf_history_hwl = np.reshape(nf_history_1d, (height, width, max_rounds), order="F")
-      direction_history_1d = np.zeros(height * width * max_rounds, np.uint32)
-      runner.memcpy_d2h(direction_history_1d, sym_direction_history, 0, 0, width, height,
-                         max_rounds, streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                         order=MemcpyOrder.COL_MAJOR, nonblock=False)
-      direction_history_hwl = np.reshape(direction_history_1d, (height, width, max_rounds),
-                                         order="F")
       nf_history = nf_history_hwl[0, 0, :]
-      direction_history = direction_history_hwl[0, 0, :]
 
-      transpose_cycles = read_tic_toc_delta_appliance(
-          runner, sym_transpose_tic_buffer, sym_transpose_toc_buffer, height, width)
-
-      # mpi_x.reduce_select_any()'s one-time end-of-run cost -- always fires
-      # once per run, unlike transpose_cycles' conditional switch.
+      # mpi_x.reduce_select_any()'s one-time end-of-run cost.
       parent_resolve_cycles = read_tic_toc_delta_appliance(
           runner, sym_parent_resolve_tic_buffer, sym_parent_resolve_toc_buffer, height, width)
       # Spatial (row, col) view -- needs the default C-order reshape, not
@@ -641,29 +593,9 @@ def main():
     print(f"rounds_completed = {rounds_completed} (profiled: {profiled_rounds})")
     row.update(row_cols)
 
-    profiled_directions = [int(v) for v in direction_history[:profiled_rounds]]
     profiled_nf = [int(v) for v in nf_history[:profiled_rounds]]
-    row["direction_history"] = ";".join(str(v) for v in profiled_directions)
     row["nf_history"] = ";".join(str(v) for v in profiled_nf)
-    dir_labels = ["BU" if d else "TD" for d in profiled_directions]
-    print(f"  direction per round (TD=top-down, BU=bottom-up): {dir_labels}")
     print(f"  nf per round (this round's own discovery count): {profiled_nf}")
-
-    switch_round = next((i for i, d in enumerate(profiled_directions) if d), None)
-    transpose_min_list = [0] * profiled_rounds
-    transpose_max_list = [0] * profiled_rounds
-    transpose_avg_list = [0.0] * profiled_rounds
-    if switch_round is not None:
-      transpose_min_list[switch_round] = int(transpose_cycles.min())
-      transpose_max_list[switch_round] = int(transpose_cycles.max())
-      transpose_avg_list[switch_round] = float(transpose_cycles.mean())
-    row["transpose_min_cycles"] = ";".join(str(v) for v in transpose_min_list)
-    row["transpose_max_cycles"] = ";".join(str(v) for v in transpose_max_list)
-    row["transpose_avg_cycles"] = ";".join(f"{v:.1f}" for v in transpose_avg_list)
-    print(f"  {'transpose':>18s}: min={int(transpose_cycles.min())} "
-          f"max={int(transpose_cycles.max())} avg={transpose_cycles.mean():.1f}"
-          + (f"  (round {switch_round})" if switch_round is not None
-             else "  (0 -- switch never fired)"))
 
     if args.dump_pe_timing:
       phase_cycles, round_start, round_end, _ = decode_pe_phase_cycles(
@@ -687,7 +619,6 @@ def main():
           "profiled_rounds": profiled_rounds,
       }, structural_grids={
           "local_nnz": local_nnz[:, :, 0].astype(np.int64),
-          "local_nnz_cols": local_nnz_cols[:, :, 0].astype(np.int64),
           "local_nnz_rows": local_nnz_rows[:, :, 0].astype(np.int64),
           # parent_resolve's own per-PE spatial grid (no round axis -- fires
           # once, at convergence) -- see run_bfs.py's matching comment.
@@ -696,15 +627,15 @@ def main():
       print(f"saved per-PE timing grid to {pe_timing_out}")
 
     # device_time_cycles (from decode_phase_row) is the whole-run round_trip_
-    # start_buffer -> round_trip_done_buffer span: includes transpose_structure()
-    # but excludes parent_resolve (round_trip_done_buffer is captured before
-    # parent_resolve starts -- see bool_pe.csl), so it's added back in here;
-    # the full search_time_cycles then adds the host transfer brackets on top.
+    # start_buffer -> round_trip_done_buffer span, excluding parent_resolve
+    # (round_trip_done_buffer is captured before parent_resolve starts --
+    # see bool_pe.csl), so it's added back in here; the full
+    # search_time_cycles then adds the host transfer brackets on top.
     search_time_cycles_no_transfer = device_time_cycles + int(parent_resolve_cycles.max())
     search_time_cycles = (h2d_seed_span_cycles + search_time_cycles_no_transfer
                            + d2h_span_cycles)
     row["search_time_cycles"] = search_time_cycles
-    print(f"[[ search_time_cycles (h2d_seed + device rounds [incl. transpose, parent_resolve] "
+    print(f"[[ search_time_cycles (h2d_seed + device rounds [incl. parent_resolve] "
           f"+ d2h parent readback, docs/GRAPH500_BENCHMARK.md section 3): {search_time_cycles} ]]")
 
     coo = A_csr.tocoo()
@@ -747,11 +678,11 @@ def main():
     # Consistency check (see check_round_vs_total_communication's own
     # docstring): sum(round_time - round_compute) across rounds should be
     # close to device_time - total_compute (compute = local_compute +
-    # local_term_cond, summed over rounds, + transpose) -- a large mismatch
-    # is a real signal, not just normal per-round straggler variance.
+    # local_term_cond, summed over rounds) -- a large mismatch is a real
+    # signal, not just normal per-round straggler variance.
     check_round_vs_total_communication(
         round_duration_cycles, local_compute_max_cycles, local_term_cond_max_cycles,
-        device_time_cycles, transpose_cycles.max())
+        device_time_cycles)
 
     csv_path = args.csv
     if csv_path is None:

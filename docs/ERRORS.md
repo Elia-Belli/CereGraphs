@@ -283,6 +283,44 @@ complexity (fewer sub-transfers or FSM states, which is what's now driving
 both the task-table and `.data.hi` overflow), not further dead-code
 removal, to lift.
 
+**Update (2026-09-07): this specific instance is now CLEARED.** After #19's
+compacted `parent_local_buf` replacement (`.bss` reduction) and #20's fix
+(which re-grew the send-side buffers, but only back to `blk`-sized — same
+as before #19, not larger), a fresh RMAT s19 512x512 (`blk=1024`) indexed
+compile **succeeded**: `Compilation done in 140.4s`, exit 0, real (non-stub)
+per-tile output confirmed via `cs_readelf -m` — peak per-tile static memory
+**46,032 bytes**, comfortably under the PE ceiling (real margin, not a
+razor's-edge pass). Net effect: #19's `.bss` saving (`parent_local_buf`,
+`blk`-sized, → ~0) plus #18's dead-code removal (scatter/gather, sparse)
+together made up enough headroom to absorb #20's fix growing the send-side
+buffers back to `blk`-sized. This does not mean the underlying code-size
+driver identified above (indexed's FSM being ~2x dense's sub-transfers/
+branch-states) is gone — it means the combined effect of #18+#19+#20 is
+currently enough margin at THIS specific (s19, 512x512) config, and the
+margin is thin: 46,032B against a ~49,152B ceiling is only ~3.1KB of slack
+(~6.3%). **Confirmed NOT universal, same day**: RMAT s20 750x750
+(`blk=1399`, `max_local_nnz_rows=92` — ~37% larger `blk` than the s19
+512x512 case above) hit the identical `.bss`/task-table/`.data.hi` overflow
+again, indexed-variant compile failed outright. So the ceiling moved, it
+didn't lift — a larger `blk` (whether from a bigger scale at the same grid,
+or the same scale at a smaller grid) can still exceed the thin margin
+#18+#19+#20 bought back. RMAT s21 750x750 (`blk≈2797`, #19's own real-scale
+reference config) not attempted after this negative result — predictably
+worse, not a useful data point. See #20 for the fix details and #19 for the
+(revised) memory numbers.
+
+**Update (2026-09-11): this specific s20 750x750 failure is now CLEARED
+too.** After #21's bottom-up-only redesign (CSC-by-source structure,
+on-device transpose scratch, and — #23 — the entire dense variant all
+removed), the identical `blk=1399` config compiles clean: `Compilation
+done in 289.2s`, exit 0, peak per-tile memory (`cs_readelf -m`) **47,120
+bytes** — real but thin margin against the ~49,152B ceiling, only ~2KB
+(~4.2%), tighter than #21's own s19 512x512 result (~8.4KB/17%) since
+`blk=1399` is substantially larger. Not yet re-verified for actual BFS
+correctness at this scale (compile-only so far) — see #21's own entry for
+the s19 512x512 case's full real-hardware verification, which this s20
+config hasn't been taken through yet.
+
 ### 9. `plot_bfs_timing.py` crash on `--max-rounds`-truncated runs
 ```
 AssertionError: round_duration_cycles has 2 entries, expected rounds_completed=10
@@ -757,8 +795,306 @@ buffers, is the larger remaining driver there), and does **not** fix the
 original scale-21 dense-variant failure referenced in #1/#8 — only shrinks
 indexed's own per-PE data footprint. Larger-grid measurement (to see the
 saving at a `max_local_nnz_rows`/`blk` ratio closer to #17's real-scale
-numbers) and a real appliance re-attempt at a previously-blocked config are
-the concrete next steps.
+numbers) and a real appliance re-attempt at a previously-blocked config were
+the concrete next steps — see #20, which found a second real bug during
+exactly that follow-up and revises the send-side memory picture above.
+
+### 20. `reduce_select_any_indexed_precompacted()` send-side aliasing overflow — real crash at the very first mid-scale test, caught before appliance time was spent
+
+**Where**: `reduce_select_any_indexed_precompacted()`'s `my_indices`/
+`my_values` parameters (`collectives_2d/pe.csl`), as called from
+`bool_pe.csl`'s `term_col_bcast_done()` with `&parent_compact_indices`/
+`&parent_compact_values` (#19's new compacted storage) passed straight
+through instead of a `blk`-sized scratch copy.
+
+**Symptom**: real crash, not a slow compile or a silent wrong-answer —
+confirmed on the very first test in #19's own "not yet run" follow-up list
+(RMAT s12, 8x8 grid, source 0, free simulator): a fatal `hcf` (halt and
+catch fire) fault at simulated cycle ~485,166, tile `P8.7`, stack trace
+through `vflag_set`/`e_process` (`hwtile.c:5647`) — i.e. a hardware-level
+fault from an out-of-bounds fabric-side write, not a Python or compile-step
+error (compile itself succeeded in ~5s, identical to dense). Bisecting on
+`--max-rounds` (1, 2, 3) showed the fault lands at essentially the same
+cycle (473,251 / 473,517) regardless of how many total rounds are
+configured — it fires within round 1's own execution, independent of
+occupancy buildup across rounds, ruling out the "grows until it exceeds
+`max_local_nnz_rows`" theory #19's own "what cannot shrink" scope note had
+flagged as the risk to watch for.
+
+**Root cause**: #19's `reduce_select_any_indexed_precompacted()` aliases the
+caller's `my_indices`/`my_values` directly as the relay's send-side scratch
+(`indexed_send_indices`/`fsm_state.send_buf`), sized only to this PE's own
+`max_local_nnz_rows`. But `transfer_data_reduce_select_any_indexed()`'s
+"middle root" branch (root not at an extreme PE — true here, and always
+true in this kernel, since `bool_pe.csl` deliberately roots at `MID`, see
+commit `852c838`) reuses that *same* send-side memory as the landing zone
+for side B's incoming data once this PE's own contribution has been merged
+away (pass 7/8, `fsm_state.counter == 6/7`). Side B is itself already the
+merged UNION of every PE further down that relay chain — bounded by
+`blk`/`count`, not by any single PE's `max_local_nnz_rows` (the recv-side
+buffers already account for exactly this, per #19's own `INDEXED_ARRAY_LEN`
+comment — the send-side aliasing just didn't carry the same reasoning
+over). Writing up to `blk`-many entries into a `max_local_nnz_rows`-sized
+buffer silently overflows into whatever memory follows it on that PE.
+
+**Confirms itself via the crash coordinates**: `MID = P/2 = 4` for this 8x8
+grid; with `--fabric-offsets=4,1`, tile `P8.7`'s core column is `8-4=4` —
+column `MID`, exactly the root, exactly where the overflowing branch runs.
+Not a coincidence.
+
+**Why #19's own smoke-test (RMAT s8, 4x4) didn't catch this**: at P=4,
+`MID=P/2=2` is still a genuine middle position, so this isn't a topology
+difference — more likely occupancy at that tiny scale/those sources never
+pushed a side-B union past `max_local_nnz_rows=55`'s slack before the run
+ended, whereas the RMAT s12/8x8 config's higher absolute occupancy did.
+Underlines that this class of bug needs a real mid-scale run to surface,
+exactly as #19's own follow-up list anticipated in spirit (if not in the
+specific mechanism predicted).
+
+**Fix**: restored a dedicated `blk`-sized send-side scratch pair
+(`parent_send_indices`/`parent_send_values`, `bool_pe.csl`) — the same
+buffers #19 had removed — and copy `parent_compact_indices`/`values`'
+`[0, parent_compact_count)` prefix into them (`O(parent_compact_count)`,
+still far cheaper than a full `O(blk)` `compress_dense_to_indexed()` pass)
+before calling the relay. `parent_compact_indices`/`values` themselves stay
+`max_local_nnz_rows`-sized — this PE's own storage footprint keeps #19's
+saving — only the buffer actually handed to the collective grew back.
+Corrected `reduce_select_any_indexed_precompacted()`'s own doc comment in
+`pe.csl`, which had asserted the now-disproven "safe to alias directly"
+claim (it only reasoned about `my_bitmap`'s landing-zone reuse, missing
+that indices/values get the same treatment).
+
+**Re-verified after the fix**: RMAT s12 8x8, sources {0, 1}, free
+simulator — `0` FATAL in `sim.log`, `0/4096` visited-set mismatches, `0`
+invalid parents, scipy cross-check OK in both cases (dense-variant parity
+confirmed, same visited/parent counts as before this bug existed).
+
+**Revises #19's memory numbers**: #19's projected saving assumed the
+send-side buffers could shrink to `max_local_nnz_rows` too. They can't, per
+this bug — the send side must stay `blk`-sized for the relay's landing-zone
+trick to be safe, same size as #17's original (pre-#19) design. The real
+net saving from #19+#20 together is narrower than #19's own writeup
+implied: `parent_local_buf` (`blk`, `u32`) → 0, replaced by
+`parent_compact_indices`/`values` (`max_local_nnz_rows`-sized) plus one new
+`parent_round_seen_bitmap` (`BITMAP_WORDS`) — a real saving whenever
+`max_local_nnz_rows < blk`, but smaller than #19's own before/after byte
+counts suggested, since those numbers were taken before this bug (and its
+fix) existed. A fresh `cslc`+`cs_readelf -m` A/B at real scale (plan item 2,
+still not run) is needed for an accurate updated number.
+
+**Status**: **Fixed**, re-verified on free simulator at RMAT s12 8x8 (2
+sources). The blk=1024 compile-ceiling re-attempt (#8/#17) this fix put in
+doubt was tried immediately after and **succeeded** — RMAT s19 512x512
+compiled clean (140.4s, peak per-tile 46,032B, real margin) for the first
+time; see #8's own updated occurrence note for the full number. Not yet
+re-verified at #19's own real-scale correctness target (RMAT s21 750x750,
+full run not just compile) or against a skewed-degree (non-RMAT) graph.
+
+### 21. Bottom-up-only BFS: top-down and the on-device CSC→CSR transpose removed entirely; `parent_resolve_variant==2`'s local storage redefined to `parent_values` (position-aligned to `mat_row_idx_buf`)
+
+**Motivation**: memory capacity, not performance, was made the explicit
+priority for this change. #19/#20's discovery-order compacted scheme
+(`parent_compact_indices`/`values`/`count` + `parent_round_seen_bitmap`)
+exists specifically because `compute_topdown()`'s nested loop can hit the
+same undiscovered row twice within one round — remove top-down entirely
+and that whole dedup problem disappears, since `compute_bottomup()`'s
+single linear pass over its resident row list (`mat_row_idx_buf`) never
+revisits a row twice per round. And since bottom-up no longer needs to be
+switched into mid-run (Beamer et al.'s adaptive direction-optimizing switch
+is gone — accepted, deliberate tradeoff, not an oversight: bottom-up's
+per-round cost floor is `local_nnz_rows[0]`, independent of actual frontier
+size, so tiny-frontier rounds now pay what only big "frontier" rounds used
+to pay; not measured numerically as part of this change), the host can
+upload the matrix already transposed (CSR-by-destination), removing the
+on-device transpose and its scratch (`row_to_bucket`/`cursor_buf`/
+`visited_pos`) and the CSC-by-source structure (`mat_col_idx/loc/len_buf`,
+`max_local_nnz_cols`) entirely — nothing reads them anymore.
+
+**Where**: `bool_pe.csl` (removed `compute_topdown()`, `transpose_structure()`,
+`col_of()`, `is_bottom_up`/`tau_switch_count`/`direction_history` and their
+buffers; `task compute()` now unconditionally calls `compute_bottomup()`;
+`term_col_bcast_done()`'s parent-resolve branch rewritten, see below),
+`layout_bool.csl` (dropped params/exports to match), `device_io.py`
+(`csl_compile_core`/`csl_compile_core_appliance` signatures), `run_bfs.py`/
+`run_bfs.appliance.py` (`preprocess()` call-site CSR/CSC argument-pair
+swap, symbol renames, dropped `--directional` flag and transpose/direction
+readback+CSV columns), `bfs_timing.py` (`check_round_vs_total_communication`
+signature), `plot_bfs_timing.py` (dropped the transpose segment/color).
+`preprocess_bool.py` itself needed **zero internal changes** — it already
+takes independent CSR-role and CSC-role array arguments, and for a square
+matrix on a square grid with `.sorted_indices()` applied, `csc(A^T) ==
+csr(A)` and `csr(A^T) == csc(A)`, so swapping which physical array goes
+into which parameter slot at the call site produces the transposed layout
+for free.
+
+**What was built**: `parent_values: [max_local_nnz_rows]u32`, position-aligned
+to the resident `mat_row_idx_buf` (`parent_values[i]` is the parent for
+local row `mat_row_idx_buf[i]`) — replaces `parent_compact_indices`/`values`/
+`count` and `parent_round_seen_bitmap` entirely: `compute_bottomup()`
+writes `parent_values[i] = global_c` directly (the loop already has `i` in
+hand — no bounds check, no dedup gate needed). `start_spmv()`'s reset
+becomes an `O(local_nnz_rows[0])` sentinel fill (real, but bounded, paid
+once per run — the discovery-order scheme's reset this replaces was O(1),
+since it only needed a running count, not every slot touched).
+`term_col_bcast_done()`'s convergence branch (confirmed to fire **exactly
+once per run**, never per-round) does a one-time compress-scan over
+`parent_values`/`mat_row_idx_buf`, pulling real row numbers (not positions)
+for cross-PE correctness, that does double duty as both the membership-
+bitmap source and the `blk`-sized copy-into-scratch #20's fix already
+required — no new per-call cost class, just a different scan predicate
+over the same buffers.
+
+**Host readback needed zero changes**: the relay's own on-device
+`decompress_indexed_to_dense()` step already produces a dense `[blk]`
+`parent_relay_result` (exported as `"parent_local_buf"`) regardless of how
+the send side was populated — this invariant, already true before this
+change, is what made the redesign possible without touching `device_io.py`'s
+`extract_parent_result()` at all.
+
+**Verification**: kernel compiles clean (both variants, `cslc` direct and
+via `run_bfs.py --compile-only`) at the RMAT s12 8x8 smoke scale.
+**Correctness re-run initially FAILED — see #22 for a real bug this
+surfaced and its fix; #23 for the subsequent removal of the dense
+variant entirely.**
+
+**Known, accepted breakage (out of scope, per explicit decision)**:
+`run_graph500.py` and `bfs/scripts/commands_wse3_graph500.sh` both assume
+the CSC-by-source upload path (always dense/top-down, never
+`--directional`) and will fail once compiled against the new kernel —
+`run_graph500.py` calls `preprocess()` unswapped and `csl_compile_core()`
+with the old positional-argument shape; `commands_wse3_graph500.sh`
+hardcodes `--params=...,max_local_nnz_cols:4,...` directly to `cslc`, which
+no longer declares that param. Not fixed — left as a documented, deliberate
+break, not a regression to chase.
+
+**Status**: **Fully verified**, smoke through real hardware. See #22 for
+the real correctness bug this design's own first correctness run
+surfaced, and its fix. Mid-scale + real-hardware re-verification (2026-09-11,
+RMAT s19 512x512, blk=1024 — the smallest config #8/#17 originally
+documented as failing to compile): both the free simulator and real WSE-3
+hardware now compile this config cleanly and run it correctly --
+`0/524288` visited-set mismatches, `0` invalid parents, scipy cross-check
+OK on real hardware (291s execution, 6 rounds). Fresh `cslc`+`cs_readelf -m`
+peak per-tile memory at this scale: **40,736 bytes**, down from the
+46,032B measured right after #19/#20 alone (before this entry's own
+CSC-structure/transpose-scratch/dense removals) -- margin against the
+~49,152B ceiling grew from ~3.1KB/6.3% to ~8.4KB/17%. First real
+performance numbers for this exact kernel: 0.55 GTEPS (full), 6.23 GTEPS
+(excl. h2d/d2h), 44.3 GTEPS (excl. parent_resolve too). One thing to watch:
+both the compile and run jobs logged an `InconsistentVersion` warning
+(client 1.14.0 vs. cluster server 1.20.2) -- did not block either job this
+time, but worth checking first if something looks off on a future
+appliance run.
+
+### 22. `preprocess()` call-site swap silently transposed the (px,py) PE-grid axes — real bug caught by #21's own first correctness run
+
+**Where**: `run_bfs.py`/`run_bfs.appliance.py`'s `preprocess()` call site
+(the CSR/CSC argument-pair swap #21 introduced to get a CSR-by-destination
+layout with zero changes to `preprocess_bool.py`).
+
+**Symptom**: #21's first real correctness run (not just `--compile-only`)
+failed identically at every source tried (0, 5, 50), on RMAT s12 8x8:
+`303/4096` visited-set mismatches vs. scipy, `visited_count=3169/4096`
+(scipy's own true count is `3342/4096`) — the SAME failure signature
+regardless of `parent_resolve_variant`, which was the key diagnostic: since
+dense's own parent-storage code (`parent_local_buf`) was completely
+untouched by #21's redesign, an identical failure on both variants meant
+the bug had to be upstream of parent storage entirely, in the shared
+traversal/data path.
+
+**Root cause, found via a standalone host-side test** (not the real
+kernel — just `preprocess_bool.preprocess()` called directly, checked
+against `scipy`'s own CSR ground truth for a small hand-built graph on a
+2x2 grid, then confirmed at 4x4/8x8): `preprocess()`'s own block-placement
+formula (`block_id = row_b*fabx + col_b`, reshaped as `(faby, fabx, ...)`)
+treats whichever array is fed into the `cscColPtr`/`cscRowInd` parameter
+role as the one whose per-nonzero "row_b" becomes the array's FIRST
+output axis. Under #21's swap, the CSR-role data (`A_csr`, genuinely
+indexed by row) was fed into that slot -- its own per-nonzero "row_b"
+computation ends up numerically equal to the actual **column**-block index
+(px), not the row-block index (py), because of how the mislabeled
+row/col-per-nonzero values interact with the `bx`/`by` divisors (this only
+avoids an outright shape mismatch because the kernel's grid is always
+square, `fabx == faby`, per `bool_pe.csl`'s own `prows == pcols` assert --
+it does NOT save the block-placement math from being transposed). Net
+effect: `preprocess()` still returns fully correct DATA (confirmed via the
+standalone test) but with its returned arrays' first two axes silently
+swapped -- `matrix_info[...][px, py, :]` where every other caller convention
+(and the un-swapped, pre-#21 code) expects `[py, px, :]`. Every off-
+diagonal PE (`px != py`) received its transpose partner's block; diagonal
+PEs (`px == py`) were coincidentally unaffected, which is why the bug
+wasn't a crash or a gross shape error -- just wrong BFS results.
+
+**Confirmed NOT an artifact of the swap-trick specifically**: also tried
+computing the actual transposed matrix (`A_csr.transpose()`) and calling
+`preprocess()` UNSWAPPED on it -- algebraically identical to the swap (per
+the same `csc(A^T)==csr(A)` identity #21 relied on, confirmed byte-for-byte
+via `np.array_equal`), and empirically produces the exact same transposed
+result. So this is a genuine, inherent property of using `preprocess()`
+this way (feeding it a "logically transposed" input), not a mistake
+specific to the manual argument-swap framing.
+
+**Fix**: transpose the first two axes of every array `preprocess()`
+returns that's derived from the (now CSR-role-fed) compact-array branch --
+`mat_row_idx_buf`/`mat_row_loc_buf`/`mat_row_len_buf`/`mat_rows_buf`/
+`local_nnz`/`local_nnz_rows` -- via `np.transpose(..., (1, 0, 2))`
+immediately after extraction from `matrix_info`, in both `run_bfs.py` and
+`run_bfs.appliance.py`. `local_nnz` itself is no longer read on-device
+(its only consumers, `compute_topdown()`/`transpose_structure()`, were
+removed in #21) but was transposed too, for consistency with the host-side
+`--dump-pe-timing` structural-grid diagnostic.
+
+**Verification**: standalone test (`preprocess()` output vs. scipy ground
+truth, per-PE, per-row) passes at 2x2, 4x4, and 8x8 grids after the fix.
+Real kernel re-run (RMAT s12 8x8, indexed variant, sources {0, 5, 50}):
+`0/4096` mismatches, `0` invalid parents, scipy cross-check OK, at every
+source -- matching #19's own pre-#21 clean baseline exactly
+(`visited_count=3342/4096` in both).
+
+**Status**: **Fixed**. This was the actual, sole blocker for #21's design --
+no further changes to the bottom-up-only traversal or `parent_values`
+storage itself were needed.
+
+### 23. Dense (`parent_resolve_variant==0`) removed entirely
+
+**Where**: `bool_pe.csl` (`parent_local_buf`/`PARENT_LOCAL_BUF_LEN`,
+`occ_bitmap`/`occ_popcnt_scratch`/`occ_popcnt_src_dsd`/`occ_popcnt_dst_dsd`,
+the `param parent_resolve_variant` declaration itself, and every `if
+(parent_resolve_variant == 2) ... else ...` branch -- `INDEXED_BITMAP_LEN`/
+`INDEXED_ARRAY_LEN`/`PARENT_VALUES_LEN` are now unconditional constants),
+`layout_bool.csl` (matching param/wiring removal), `device_io.py`
+(`csl_compile_core`/`csl_compile_core_appliance` lost the
+`parent_resolve_variant` parameter), `run_bfs.py`/`run_bfs.appliance.py`
+(`--parent-resolve-variant` CLI flag and its `{"dense":0,"indexed":2}`
+mapping removed -- the indexed/sparse path via
+`reduce_select_any_indexed_precompacted()` is now the kernel's only
+parent-resolution behavior).
+
+**Reasoning**: once bottom-up became the only traversal strategy (#21),
+dense's own `parent_local_buf` scheme had no remaining reason to exist
+side-by-side with `parent_values` -- it was never the point of this
+session's redesign, just carried along as an unaffected fallback. With
+#22's fix confirming the indexed/sparse path is fully correct, keeping
+dense around was pure maintenance surface (a second buffer scheme, a
+second relay call, `occ_bitmap`'s own separate occupancy-instrumentation
+path) for a variant nobody intended to keep using. Explicit user decision,
+not a default assumption.
+
+**Verification**: kernel compiles clean with `parent_resolve_variant` fully
+absent from both `bool_pe.csl` and `layout_bool.csl`. Real kernel re-run
+(RMAT s12 8x8, sources {0, 5, 50}, no variant flag): `0/4096` mismatches,
+`0` invalid parents, scipy cross-check OK at every source -- identical
+numbers to #22's own post-fix verification, confirming the removal itself
+introduced no regression.
+
+**Status**: **Done**. The kernel now has a single parent-resolution path;
+`--parent-resolve-variant` no longer exists as a CLI concept.
+`docs/COLLECTIVES_TOPOLOGY.md`'s own variant-comparison table is
+`collectives_2d/pe.csl`-level (the collectives themselves, `reduce_or`/
+`reduce_select_any`/`reduce_select_any_indexed`, are all still present in
+that library file as reference/history, per #16/#17/#18's own "kept as
+reference" convention) and needs no change -- only `bool_pe.csl`'s own
+CALLER-side selection of which collective to use was narrowed to one.
 
 ## Summary table
 
@@ -783,4 +1119,8 @@ the concrete next steps.
 | 16 | `reduce_select_any_sparse` ~7.6-8x slower, not a bug | RMAT s17 (750x750) + s19 (512x512), real hardware | manual O(`blk`) scalar bit-scan every hop, ~10x more cycles/word than dense's `@mov32` DMA transfer, dwarfing the bytes saved by low occupancy | **Not adopted, fully removed** (no regime where it won; deleted entirely from `collectives_2d/pe.csl` and `bool_pe.csl`, not just unwired) |
 | 17 | `reduce_select_any_indexed` 4.5-8.9x FASTER than dense, real win | RMAT s17 (750x750, blk=175) + s19 (750x750, blk=700), real hardware; s19 (512x512, blk=1024) blocked by #8 | explicit `(row_index,value)` pairs give O(popcount) merge vs sparse's O(`blk`) scan; ceiling at blk=1024 traced to indexed's own code size, not caller-side buffers (comptime-sizing + removing sparse AND scatter/gather narrowed but didn't clear it) | **Kept as opt-in** (`parent_resolve_variant=2`; default remains dense since the code/data cost blocks the largest-`blk` grids, see #8) |
 | 18 | Dead `scatter`/`gather` collectives, zero call sites | `collectives_2d/pe.csl` (bool_diag_spmv's private fork) | vestigial from the original library; 10 functions, never called by this kernel or any of its test harnesses | **Removed** (regression-tested clean; shrank but didn't clear #8's blk=1024 ceiling) |
-| 19 | Indexed's dense send-side parent buffers cost more than needed; also a real intra-round duplicate-append bug found+fixed during this change's own development | RMAT s8 4x4 (smoke-test scale; larger-grid A/B not yet run) | `parent_local_buf`/`parent_send_indices`/`parent_send_values` sized by `blk` when only `max_local_nnz_rows` slots can ever be used; dev bug: `visited_bitmap` alone doesn't dedup two hits on the same row within one round's `compute_topdown()` | **Fixed** (compacted `parent_compact_indices/values` + `reduce_select_any_indexed_precompacted`, `variant==2` only; dev bug fixed via new per-round `parent_round_seen_bitmap`; -768B/-2.8% measured at smoke-test scale, dense unaffected; does not clear #8's blk=1024 ceiling) |
+| 19 | Indexed's dense send-side parent buffers cost more than needed; also a real intra-round duplicate-append bug found+fixed during this change's own development | RMAT s8 4x4 (smoke-test scale; larger-grid A/B not yet run) | `parent_local_buf`/`parent_send_indices`/`parent_send_values` sized by `blk` when only `max_local_nnz_rows` slots can ever be used; dev bug: `visited_bitmap` alone doesn't dedup two hits on the same row within one round's `compute_topdown()` | **Fixed**, memory numbers revised by #20 (compacted `parent_compact_indices/values` + `reduce_select_any_indexed_precompacted`, `variant==2` only; dev bug fixed via new per-round `parent_round_seen_bitmap`; -768B/-2.8% measured at smoke-test scale predates #20's fix, no longer accurate; does not clear #8's blk=1024 ceiling) |
+| 20 | `reduce_select_any_indexed_precompacted()` send-side aliasing overflow — real crash, not silent corruption | RMAT s12 8x8, sources {0,1}, free simulator — first mid-scale test of #19's own follow-up list | send-side scratch aliased directly to `max_local_nnz_rows`-sized compact storage, but the relay's middle-root branch reuses it as a landing zone for a multi-PE union bounded by `blk`, not `max_local_nnz_rows` | **Fixed** (restored `blk`-sized `parent_send_indices/values`, copied from compact storage per call; re-verified 0 mismatches, 2 sources; narrows #19's projected memory saving, see there) |
+| 21 | Bottom-up-only BFS: top-down + on-device CSC→CSR transpose removed; `parent_resolve_variant==2`'s storage redefined to `parent_values` | RMAT s12 8x8 (smoke) through s19 512x512/blk=1024 (mid-scale, real WSE-3 hardware) | memory-capacity priority: bottom-up's single linear per-round pass makes #19/#20's discovery-order dedup scheme unnecessary; host now uploads the matrix pre-transposed instead of an on-device transpose | **Fully verified** (smoke through real hardware; 40,736B peak per-tile at s19 512x512, down from 46,032B pre-#21; 0 mismatches on real hardware) |
+| 22 | `preprocess()` call-site swap silently transposed the (px,py) PE-grid axes | RMAT s12 8x8, sources {0,5,50} — #21's own first correctness run | `preprocess()`'s block-placement formula treats the CSR-role-fed data's own row_b as the array's first output axis; under #21's swap that ends up holding the column-block index instead, transposing every off-diagonal PE's data with its transpose partner (diagonal PEs unaffected, masking it as a shape-safe compile) | **Fixed** (transpose returned arrays' first two axes post-extraction; 0/4096 mismatches at every source after) |
+| 23 | Dense (`parent_resolve_variant==0`) removed entirely | RMAT s12 8x8, sources {0,5,50} | no longer needed once #21 made bottom-up the only strategy and #22 confirmed indexed/sparse fully correct; kept only as an unused fallback until now | **Done** (single parent-resolution path; `--parent-resolve-variant` no longer exists; 0/4096 mismatches, no regression) |

@@ -4,10 +4,10 @@ timing chart: two panels instead of four, each on its own ms scale -- one
 for per-round device work, one for the one-shot h2d_seed/resolve/d2h bars.
 
 Dropped relative to plot_bfs_timing.py: h2d_matrix (kept only as a
---log-scale total), the local_compute breakdown panel,
-transpose_structure()'s segment, and every min/avg stat tick -- bar
-height (max across PEs) is the only number shown, for a cleaner poster
-figure. Round bars fuse local_compute+local_term_cond into one "compute"
+--log-scale total), the local_compute breakdown panel, and every min/avg
+stat tick -- bar height (max across PEs) is the only number shown, for a
+cleaner poster figure. Round bars fuse local_compute+local_term_cond into
+one "compute"
 segment and lump the rest into "communication", colored to match
 plot_grid_scale_heatmap.py's aqua/orange compute/communication poles.
 

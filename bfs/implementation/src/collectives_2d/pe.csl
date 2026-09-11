@@ -649,19 +649,25 @@ fn build_bitmap_from_indices(indices: [*]u16, cnt: u16, bitmap_words: u16, out_b
 // reduce_select_any_indexed()'s `count` parameter. my_count is just how
 // many of those `count` possible rows THIS PE is contributing.
 //
-// Safe to alias my_indices/my_values directly into indexed_send_indices/
-// fsm_state.send_buf (a long-lived, persistent caller buffer, unlike every
-// existing caller today which passes a fresh, call-scoped array via
-// compress_dense_to_indexed() first): append_merge_indexed()'s contract
-// already treats the whole "send"/incoming side as read-only for the
-// entire relay (see its own comment) -- the only mutation this relay ever
-// makes to a *_send_* buffer is overwriting send_bitmap's memory as a
-// middle root's landing zone for the second incoming side (see
-// transfer_data_reduce_select_any_indexed()'s pass-5/counter==4 root
-// branch), which is exactly why my_bitmap must be caller-provided SCRATCH
-// (rebuilt fresh via build_bitmap_from_indices() every call), never the
-// caller's own persistent bitmap of record -- my_indices/my_values
-// themselves are never written.
+// my_indices/my_values/my_bitmap must all be caller-provided SCRATCH sized
+// to the FULL `count` width, NOT just my_count-sized, even though this PE
+// only ever writes my_count real entries into them -- CONFIRMED THE HARD
+// WAY (docs/ERRORS.md #19's crash writeup) by an earlier version of this
+// comment that claimed the opposite for indices/values. The reason: when
+// root isn't at an extreme PE (e.g. bool_pe.csl's root=MID), transfer_data_
+// reduce_select_any_indexed()'s middle-root branch reuses *_send_* memory
+// (send_bitmap AND send_indices/fsm_state.send_buf, once this PE's own
+// my_count entries have been merged into recv) as the landing zone for
+// side B's incoming data -- and side B is itself already the merged UNION
+// of every PE further down that relay chain, bounded by `count`, not by
+// my_count. A buffer sized only to my_count (e.g. a caller's own
+// max_local_nnz_rows-sized compact storage, handed in directly) silently
+// overflows there. A caller whose own persistent buffer is smaller than
+// `count` (e.g. bool_pe.csl's parent_compact_indices/values) MUST copy into
+// a dedicated `count`-sized scratch before calling this, same as my_bitmap
+// already has to (rebuilt fresh via build_bitmap_from_indices() every
+// call) -- my_indices/my_values are never WRITTEN by this PE itself, but
+// they are by the relay on its behalf.
 fn reduce_select_any_indexed_precompacted(root: u16, my_indices: [*]u16, my_values: [*]u32,
                                           my_count: u16, my_bitmap: [*]u32,
                                           recv_buf: [*]u32, recv_bitmap: [*]u32,

@@ -1,8 +1,22 @@
 # Knowledge
 
+## Recent history
+
+Bottom-up-only BFS redesign (docs/ERRORS.md #21) landed 2026-09-07 through
+2026-09-11: a real `preprocess()` axis-transpose bug was found and fixed
+(#22), then dense (`parent_resolve_variant==0`) was removed entirely (#23)
+-- the kernel now has a single parent-resolution path. Mid-scale + real
+hardware re-verification (RMAT s19 512x512, blk=1024 -- the config #8/#17
+originally documented as failing to compile) confirmed clean on 2026-09-11:
+compiles and runs correctly on real WSE-3 hardware, 0/524288 mismatches,
+peak per-tile memory down to 40,736B (from 46,032B pre-#21). See
+`bfs/HANDOFF_BOTTOMUP_WIP.md` for how the original bug was found
+(historical record) and docs/ERRORS.md #21-23 for the full story,
+including current numbers.
+
 ## Key files
 
-- `docs/ERRORS.md` — the full compendium (15 numbered issues + a summary
+- `docs/ERRORS.md` — the full compendium (23 numbered issues + a summary
   table). Read this for the complete history/root causes; this handoff
   only summarizes what's actionable right now.
 - `bfs/implementation/device_io.py` — `memcpy_h2d_chunked` (h2d fix)
@@ -16,9 +30,11 @@
 
 ## Environment notes (easy to get wrong)
 
-- Real hardware runs happen on `cer-usn-01` via ssh; the repo is NFS-
-  mirrored to the local machine used for editing, but `git`/`cslc`/the
-  appliance SDK only exist on `cer-usn-01`.
+- Real hardware runs, `cslc`, and the appliance SDK live on `cer-usn-01`
+  via ssh; the repo is NFS-mirrored to the local machine used for editing.
+  `git` is on **`cer-usn-02`** instead (verified directly — cer-usn-01 has
+  no `git` on PATH), correcting this file's own previous claim that it was
+  on cer-usn-01 too.
 - Always `source /home/elia/cs_appliance_sdk/bin/activate` before any
   appliance-mode Python invocation — bare `python` fails instantly
   otherwise.

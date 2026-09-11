@@ -12,9 +12,9 @@
   communication phase (visited_bcast/vertical_bcast/reduce/relay). That
   machinery was found unreliable and removed entirely -- see
   docs/GRAPH500_BENCHMARK.md. The replacement methodology is simple and robust:
-  compute = local_compute + local_term_cond + transpose (each its own tsc
-  bracket, max across PEs); device_time = the whole-run round_trip_start_buffer
-  -> round_trip_done_buffer span (excl. parent_resolve, max across PEs);
+  compute = local_compute + local_term_cond (each its own tsc bracket, max
+  across PEs); device_time = the whole-run round_trip_start_buffer ->
+  round_trip_done_buffer span (excl. parent_resolve, max across PEs);
   communication = device_time - compute. Per round, communication = round_time
   - round_compute, where round_time is the same non-decomposed round span
   this file already computed (compute_round_summary, never part of the
@@ -224,24 +224,24 @@ def compute_round_summary(round_start, round_end):
 
 def check_round_vs_total_communication(round_duration_cycles, local_compute_max_cycles,
                                         local_term_cond_max_cycles, device_time_cycles,
-                                        transpose_max_cycles, verbose=True):
+                                        verbose=True):
   """Sanity check tying the per-round split to the whole-run split: per
   round, communication = round_time - round_compute (round_compute =
   local_compute_max + local_term_cond_max for that round); summed across
   rounds, this should be close to device_time - total_compute (total_compute
-  = sum of local_compute/local_term_cond across rounds, + transpose, a
-  one-time cost). The two sides are measured two structurally different
-  ways -- a sum of independently-maxed per-round stragglers vs. one
-  whole-run per-PE span, then maxed once -- so exact equality isn't
-  expected (summed independent maxes tend to run a bit HIGHER, since
-  different rounds' stragglers are rarely the same PE), but a large
-  mismatch is a real signal something is off, not just normal variance.
+  = sum of local_compute/local_term_cond across rounds). The two sides are
+  measured two structurally different ways -- a sum of independently-maxed
+  per-round stragglers vs. one whole-run per-PE span, then maxed once -- so
+  exact equality isn't expected (summed independent maxes tend to run a bit
+  HIGHER, since different rounds' stragglers are rarely the same PE), but a
+  large mismatch is a real signal something is off, not just normal
+  variance.
 
   Returns (delta, tolerance) so the caller can decide whether to log-only
   or raise; also prints a warning itself when the tolerance is exceeded."""
   round_compute = local_compute_max_cycles + local_term_cond_max_cycles
   round_communication = np.clip(round_duration_cycles - round_compute, 0, None)
-  total_compute = int(round_compute.sum()) + int(transpose_max_cycles)
+  total_compute = int(round_compute.sum())
   implied_communication = device_time_cycles - total_compute
   summed_communication = int(round_communication.sum())
   delta = summed_communication - implied_communication

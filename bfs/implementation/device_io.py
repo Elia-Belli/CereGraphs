@@ -219,14 +219,11 @@ def csl_compile_core(
     np_rows: int,
     blk: int,
     max_local_nnz: int,
-    max_local_nnz_cols: int,
     max_local_nnz_rows: int,
     channels: int,
     width_west_buf: int,
     width_east_buf: int,
     max_rounds: Optional[int] = None,
-    tau_switch_count: Optional[int] = None,
-    parent_resolve_variant: Optional[int] = None,
 ):
   comp_dir = elf_dir
 
@@ -240,21 +237,11 @@ def csl_compile_core(
     args.append(f"--params=prows:{np_rows}")
     args.append(f"--params=blk:{blk}")
     args.append(f"--params=max_local_nnz:{max_local_nnz}")
-    args.append(f"--params=max_local_nnz_cols:{max_local_nnz_cols}")
     args.append(f"--params=max_local_nnz_rows:{max_local_nnz_rows}")
     # left at layout_bool.csl's own default (32) unless a caller (see
     # run_bfs.py) needs per-round timing over a deeper BFS.
     if max_rounds is not None:
       args.append(f"--params=max_rounds:{max_rounds}")
-    # left at layout_bool.csl's own default (effectively unreachable, i.e.
-    # always top-down) unless a caller (see run_bfs.py) opts into the
-    # direction-optimizing switch with a real fraction of n.
-    if tau_switch_count is not None:
-      args.append(f"--params=tau_switch_count:{int(tau_switch_count)}")
-    # left at layout_bool.csl's own default (0, dense reduce_select_any)
-    # unless a caller opts into validating one of the sparse collectives.
-    if parent_resolve_variant is not None:
-      args.append(f"--params=parent_resolve_variant:{int(parent_resolve_variant)}")
 
     args.append(f"-o={comp_dir}")
     if arch is not None:
@@ -283,14 +270,11 @@ def csl_compile_core_appliance(
     np_rows: int,
     blk: int,
     max_local_nnz: int,
-    max_local_nnz_cols: int,
     max_local_nnz_rows: int,
     channels: int,
     width_west_buf: int,
     width_east_buf: int,
     max_rounds: Optional[int] = None,
-    tau_switch_count: Optional[int] = None,
-    parent_resolve_variant: Optional[int] = None,
 ):
   """Appliance-mode counterpart to csl_compile_core: same --params, but
   compiled via cerebras.sdk.client.SdkCompiler instead of a direct `cslc`
@@ -320,14 +304,9 @@ def csl_compile_core_appliance(
   args.append(f"--params=prows:{np_rows}")
   args.append(f"--params=blk:{blk}")
   args.append(f"--params=max_local_nnz:{max_local_nnz}")
-  args.append(f"--params=max_local_nnz_cols:{max_local_nnz_cols}")
   args.append(f"--params=max_local_nnz_rows:{max_local_nnz_rows}")
   if max_rounds is not None:
     args.append(f"--params=max_rounds:{max_rounds}")
-  if tau_switch_count is not None:
-    args.append(f"--params=tau_switch_count:{int(tau_switch_count)}")
-  if parent_resolve_variant is not None:
-    args.append(f"--params=parent_resolve_variant:{int(parent_resolve_variant)}")
 
   args.append(f"-o={elf_dir}")
   if arch is not None:

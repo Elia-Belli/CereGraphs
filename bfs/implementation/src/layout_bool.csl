@@ -20,22 +20,11 @@ param pcols: u16;   // number of PE cols (width of the core rectangle)
 
 param blk: u16;                 // per-PE dense vector chunk size = ceil(n/P)
 param max_local_nnz: u16;
-param max_local_nnz_cols: u16;
 param max_local_nnz_rows: u16;
 // upper bound on f_spmv_iter rounds profiled by ts_buf (see bool_pe.csl) --
 // defaulted so callers that don't care about per-round timing don't need to
 // pass anything; run_bfs.py overrides it explicitly.
 param max_rounds: u16 = 10;
-// direction-optimizing BFS switch threshold (see bool_pe.csl's own comment) --
-// defaulted effectively unreachable so callers that don't pass it keep
-// pure-top-down behavior; run_bfs.py-class callers override it with a real
-// fraction of n. u32 (not f32) since cslc's --params CLI flag only accepts
-// unsigned integers.
-param tau_switch_count: u32 = 4294967295;
-// A/B/C switch for the two sparse reduce_select_any counterparts -- see
-// bool_pe.csl's own param comment. Defaulted to 0 (dense, the production
-// path) so callers that don't pass it keep today's behavior unchanged.
-param parent_resolve_variant: u16 = 0;
 
 comptime {
     // the diagonal-target design requires a square grid: every row/column
@@ -72,11 +61,8 @@ layout {
                 .c2d_params = c2d_params,
                 .blk = blk,
                 .max_local_nnz = max_local_nnz,
-                .max_local_nnz_cols = max_local_nnz_cols,
                 .max_local_nnz_rows = max_local_nnz_rows,
                 .max_rounds = max_rounds,
-                .tau_switch_count = tau_switch_count,
-                .parent_resolve_variant = parent_resolve_variant,
             });
         } // while py
     } // while px
@@ -89,15 +75,10 @@ layout {
     @export_name("parent_occupancy", [*]u32, true);
 
     @export_name("mat_rows_buf", [*]u16, true);
-    @export_name("mat_col_idx_buf", [*]u16, true);
-    @export_name("mat_col_loc_buf", [*]u16, true);
-    @export_name("mat_col_len_buf", [*]u16, true);
 
     @export_name("local_nnz", [*]u16, true);
-    @export_name("local_nnz_cols", [*]u16, true);
     @export_name("local_nnz_rows", [*]u16, true);
     @export_name("nz_total", [*]f32, true);
-    @export_name("is_bottom_up_dbg", [*]u16, true);
     @export_name("mat_row_idx_buf", [*]u16, true);
     @export_name("mat_row_loc_buf", [*]u16, true);
     @export_name("mat_row_len_buf", [*]u16, true);
@@ -105,15 +86,12 @@ layout {
     @export_name("tsc_start_buffer", [*]u16, true);
     @export_name("tsc_end_buffer", [*]u16, true);
     @export_name("tsc_ref_buffer", [*]u16, true);
-    @export_name("transpose_tic_buffer", [*]u16, true);
-    @export_name("transpose_toc_buffer", [*]u16, true);
     @export_name("round_trip_start_buffer", [*]u16, true);
     @export_name("round_trip_done_buffer", [*]u16, true);
     @export_name("parent_resolve_tic_buffer", [*]u16, true);
     @export_name("parent_resolve_toc_buffer", [*]u16, true);
     @export_name("ts_buf", [*]u16, true);
     @export_name("nf_history", [*]u32, true);
-    @export_name("direction_history", [*]u16, true);
 
     @export_name("f_spmv_iter", fn()void);
     @export_name("f_enable_tsc", fn()void);
