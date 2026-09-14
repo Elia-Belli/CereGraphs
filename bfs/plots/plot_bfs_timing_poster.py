@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Poster-simplified version of plot_bfs_timing.py's per-run stacked
 timing chart: two panels instead of four, each on its own ms scale -- one
-for per-round device work, one for the one-shot h2d_seed/resolve/d2h bars.
+for per-round device work, one for the one-shot h2d_seed/resolve/d2h(/combine)
+bars. "combine" (docs/ERRORS.md #25) is the real per-row parent combine,
+timed host-side wall-clock since #24 moved it off-device -- drawn only for
+CSV rows recorded after that column existed, never a false zero for older
+rows.
 
 Dropped relative to plot_bfs_timing.py: h2d_matrix (kept only as a
 --log-scale total), the local_compute breakdown panel, and every min/avg
@@ -55,8 +59,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
                                  "implementation"))
 from bfs_timing import CLOCK_FREQ_HZ  # pylint: disable=wrong-import-position
 from plot_bfs_timing import (  # pylint: disable=wrong-import-position
-    BASELINE, GRIDLINE, H2D_BASE_HEX, PARENT_RESOLVE_COLOR, SURFACE, TEXT_MUTED, TEXT_PRIMARY,
-    parse_args, parse_cycle_list, select_rows,
+    BASELINE, GRIDLINE, H2D_BASE_HEX, HOST_COMBINE_COLOR, PARENT_RESOLVE_COLOR, SURFACE,
+    TEXT_MUTED, TEXT_PRIMARY, parse_args, parse_cycle_list, select_rows,
 )
 
 # Matches plot_grid_scale_heatmap.py's AQUA/ORANGE compute/communication
@@ -114,6 +118,25 @@ def mean_std_ms(rows, cycles_key, clock_freq_hz):
   values = cycles_to_ms(np.array([int(r[cycles_key]) for r in rows], dtype=np.float64),
                          clock_freq_hz)
   return float(values.mean()), (float(values.std(ddof=1)) if len(values) > 1 else 0.0)
+
+
+def mean_std_ms_from_seconds(rows, seconds_key):
+  """Like mean_std_ms, but for a column already stored in seconds (not
+  device cycles) -- host_parent_combine_seconds (docs/ERRORS.md #25) is
+  host wall-clock, so it has no clock_freq_hz to convert through."""
+  values = np.array([float(r[seconds_key]) for r in rows], dtype=np.float64) * 1000.0
+  return float(values.mean()), (float(values.std(ddof=1)) if len(values) > 1 else 0.0)
+
+
+def has_host_combine_column(row):
+  """host_parent_combine_seconds (docs/ERRORS.md #25) is absent from CSV
+  rows recorded before this column existed -- every poster mode draws that
+  bar only when present, rather than implying a measured-zero cost for old
+  data. The strict header-consistency check in run_bfs.py's own CSV writer
+  means every row in one CSV file has the same columns, so checking just
+  the representative `row` (as every other column here already does) is
+  enough -- no need to check every row in `rows`."""
+  return row.get("host_parent_combine_seconds") not in (None, "")
 
 
 def _mean_std(stack, axis):
@@ -188,9 +211,12 @@ def _plot_timing_row_poster_linear(rows, out_path):
   parent_resolve_mean, parent_resolve_std = mean_std_ms(
       rows, "parent_resolve_max_cycles", clock_freq_hz)
   d2h_mean, d2h_std = mean_std_ms(rows, "d2h_span_cycles", clock_freq_hz)
+  has_combine = has_host_combine_column(row)
+  if has_combine:
+    combine_mean, combine_std = mean_std_ms_from_seconds(rows, "host_parent_combine_seconds")
 
   round_xs = np.arange(profiled_rounds)
-  transfer_labels = ["h2d_seed", "resolve", "d2h"]
+  transfer_labels = ["h2d_seed", "resolve", "d2h"] + (["combine"] if has_combine else [])
   transfer_xs = np.arange(len(transfer_labels))
 
   # h2d_matrix (a one-time, whole-matrix upload) gets its own panel/scale,
@@ -249,10 +275,16 @@ def _plot_timing_row_poster_linear(rows, out_path):
   add_solo_bar(ax_transfer, transfer_xs[1], parent_resolve_mean, PARENT_RESOLVE_COLOR,
                "resolve", yerr=parent_resolve_std)
   add_solo_bar(ax_transfer, transfer_xs[2], d2h_mean, DEVICE_TO_HOST_COLOR, "d2h", yerr=d2h_std)
+  if has_combine:
+    add_solo_bar(ax_transfer, transfer_xs[3], combine_mean, HOST_COMBINE_COLOR, "combine",
+                 yerr=combine_std)
 
   round_max = max((bottom + round_total_std).max() if profiled_rounds else 0.0, 1e-9)
-  transfer_max = max(h2d_seed_mean + h2d_seed_std, parent_resolve_mean + parent_resolve_std,
-                      d2h_mean + d2h_std, 1e-9)
+  transfer_bar_tops = [h2d_seed_mean + h2d_seed_std, parent_resolve_mean + parent_resolve_std,
+                        d2h_mean + d2h_std]
+  if has_combine:
+    transfer_bar_tops.append(combine_mean + combine_std)
+  transfer_max = max(*transfer_bar_tops, 1e-9)
   h2d_matrix_max = max(h2d_matrix_mean + h2d_matrix_std, 1e-9)
   ax_rounds.set_ylim(0, round_max * 1.25)
   ax_transfer.set_ylim(0, transfer_max * 1.15)
@@ -322,6 +354,9 @@ def _plot_timing_row_poster_linear(rows, out_path):
   handles += [Patch(color=HOST_TO_DEVICE_COLOR), Patch(color=PARENT_RESOLVE_COLOR),
               Patch(color=DEVICE_TO_HOST_COLOR)]
   labels += ["Host to Device", "Parent Resolve", "Device to Host"]
+  if has_combine:
+    handles.append(Patch(color=HOST_COMBINE_COLOR))
+    labels.append("Host Combine")
   fig.legend(handles, labels, loc="lower center", ncol=len(handles), frameon=False,
              fontsize=LEGEND_FONTSIZE, bbox_to_anchor=(0.5, 0.01), columnspacing=1.8,
              handletextpad=0.6, labelspacing=1.0)
@@ -354,8 +389,10 @@ def _plot_timing_row_poster_linear(rows, out_path):
   # the scale mismatch.
   pos_transfer = ax_transfer.get_position()
   pos_h2d_matrix = ax_h2d_matrix.get_position()
+  transfer_panel_title = ("Parent Resolve + Host-Device + Combine Time" if has_combine
+                           else "Parent Resolve + Host-Device Time")
   fig.text((pos_transfer.x0 + pos_h2d_matrix.x1) / 2, title_y,
-            "Parent Resolve + Host-Device Time",
+            transfer_panel_title,
             ha="center", va="bottom", fontsize=PANEL_TITLE_FONTSIZE, color=TEXT_PRIMARY)
 
   os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -395,13 +432,17 @@ def _plot_timing_row_poster_log(rows, out_path):
   parent_resolve_mean, parent_resolve_std = mean_std_ms(
       rows, "parent_resolve_max_cycles", clock_freq_hz)
   d2h_mean, d2h_std = mean_std_ms(rows, "d2h_span_cycles", clock_freq_hz)
+  has_combine = has_host_combine_column(row)
 
   # Chronological, grouped order: the 3 phases a search actually goes
   # through -- Host to Device, Kernel, Device to Host. resolve is
   # on-device only, but it's the step that produces exactly what d2h then
   # reads off, so it sits in the "Device to Host" group by position, not
   # by color (it keeps its own distinct PARENT_RESOLVE_COLOR). See
-  # group_spans below for the separators/labels.
+  # group_spans below for the separators/labels. "combine" (docs/ERRORS.md
+  # #25), when present, is the real per-row combine itself -- host
+  # wall-clock, appended last in the "Device to Host" group since it runs
+  # right after d2h reads the data it combines.
   bars = [
       ("h2d_matrix", h2d_matrix_mean, HOST_TO_DEVICE_COLOR, h2d_matrix_std),
       ("h2d_seed", h2d_seed_mean, HOST_TO_DEVICE_COLOR, h2d_seed_std),
@@ -411,6 +452,10 @@ def _plot_timing_row_poster_log(rows, out_path):
       ("d2h", d2h_mean, DEVICE_TO_HOST_COLOR, d2h_std),
   ]
   group_spans = [("Host to Device", 0, 1), ("Kernel", 2, 3), ("Device to Host", 4, 5)]
+  if has_combine:
+    combine_mean, combine_std = mean_std_ms_from_seconds(rows, "host_parent_combine_seconds")
+    bars.append(("combine", combine_mean, HOST_COMBINE_COLOR, combine_std))
+    group_spans[-1] = ("Device to Host", 4, 6)
 
   fig, ax = plt.subplots(figsize=(1.5 * len(bars) + 1.5, 5.5))
   bar_width = 0.62

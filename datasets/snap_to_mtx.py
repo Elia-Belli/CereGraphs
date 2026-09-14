@@ -30,7 +30,7 @@ import sys
 from scipy.io import mmwrite
 from scipy.sparse import coo_matrix, eye
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bfs", "bool_diag_spmv"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bfs", "implementation"))
 from graph_loader import load_graph  # pylint: disable=wrong-import-position
 
 
@@ -54,7 +54,17 @@ def main():
   if do_symmetrize:
     matrix = symmetrize(matrix)
     print(f"symmetrized: {matrix.shape[0]}x{matrix.shape[1]}, nnz={matrix.nnz}")
-  mmwrite(outfile, matrix)
+  # field='real' explicitly -- matching gen_rmat.py's own mmwrite() call.
+  # Without it, scipy infers the MTX field type from the array's actual
+  # dtype: load_graph()'s .data is uint8 now (docs/ERRORS.md #26, shrunk
+  # from float64 since nothing ever reads it), so an unqualified mmwrite()
+  # here writes "integer" instead -- a real regression this fix caught:
+  # util/analyze's mmio.c reader only understands "real"/"pattern", not
+  # "integer", and aborts on it ("Sorry, this application does not
+  # support Market Market type"). gen_rmat.py's own RMAT files were never
+  # affected (they've always forced field='real'), which is why this went
+  # uncaught until a real SNAP graph was run through this exact script.
+  mmwrite(outfile, matrix, field='real')
   print(f"wrote {outfile}")
 
 

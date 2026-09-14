@@ -1096,6 +1096,415 @@ that library file as reference/history, per #16/#17/#18's own "kept as
 reference" convention) and needs no change -- only `bool_pe.csl`'s own
 CALLER-side selection of which collective to use was narrowed to one.
 
+### 24. On-device parent-aggregation relay eliminated entirely; per-row combine moved host-side
+
+**Where**: `bool_pe.csl` (deleted `parent_relay_result`, `parent_send_bitmap`/
+`parent_recv_bitmap`, `parent_send_indices`/`parent_recv_indices`,
+`parent_send_values`/`parent_recv_values`, `INDEXED_BITMAP_LEN`/
+`INDEXED_ARRAY_LEN` and their pointer vars; `term_col_bcast_done()`'s
+convergence branch now just scans `parent_values`/`local_nnz_rows` for an
+occupancy count, no compress-scan/bitmap-build/relay-call; `parent_values`
+itself exported directly under its own name instead of via a
+`parent_relay_result` alias), `layout_bool.csl` (`@export_name` updated
+to match), `collectives_2d/pe.csl` (deleted both `reduce_select_any` and
+`reduce_select_any_indexed` -- the indexed variant because its sole caller
+just went away, the dense variant as bonus cleanup since it had zero
+callers already, see #23 -- along with their module-scope scratch,
+`Ftype` tokens, the now-dead `Network_Config.sentinel` field, and their
+FSM bodies/dispatch-switch cases), `device_io.py` (`extract_parent_result()`
+rewritten to take every PE's own `(mat_row_idx_buf, parent_values,
+local_nnz_rows)` triple and do the per-row combine itself, vectorized with
+numpy fancy-indexing scatter-assign), `run_bfs.py`/`run_bfs.appliance.py`
+(d2h readback replaced: one `parent_local_buf` column ->
+whole-grid `parent_values`; call site updated to the new
+`extract_parent_result()` signature), `plot_bfs_timing.py` (docstring
+line only), `run_snap_sweep.sh` (stale d2h-size-estimate comment updated,
+old per-graph predictions flagged stale/unverified against the new
+formula).
+
+**Reasoning**: the buffer recap this entry is named for (prompted by the
+user's "i expected more free space" reaction to #21's sparse `parent_values`
+redesign alone) found that sparsification never touched the actual
+biggest cost: the relay's five `blk`-sized wire buffers
+(`parent_relay_result`/`parent_send_values`/`parent_recv_values`/
+`parent_send_indices`/`parent_recv_indices`), together **~22.4KB, roughly
+half of the whole 47,120B per-tile footprint at RMAT s20 750x750**. These
+buffers are `blk`-sized (not `max_local_nnz_rows`-sized) by necessity --
+#20's fix already established the relay's middle-root (`MID = P/2`)
+cross-PE union is genuinely bounded by `blk`, and real runs routinely
+approach that bound (64-82% block occupancy measured), so shrinking them
+was never safe. Explicit user decision: stop aggregating on-device at
+all, ship each PE's own compact array to the host and combine there --
+matching how this exact kernel worked before an on-device relay ("Phase
+B") was ever added -- accepting slower d2h transfer since memory capacity
+remains the stated priority, not raw speed.
+
+**Host-side combine semantics**: unchanged from every prior on-device
+tie-break convention in this kernel -- multiple `(py,px)` can legally
+claim the same global row (different column ranges can both have a real
+edge into it), and any valid candidate winning is correct, so a plain
+numpy scatter-assign (last write wins in whatever order) needs no
+additional tie-break logic.
+
+**Verification**: compile-only smoke (RMAT s12 8x8) clean via both raw
+`cslc` and `run_bfs.py --compile-only`; full correctness re-run same
+scale, sources {0,5,50}: `0/4096` mismatches, `0` invalid device parents,
+scipy cross-check OK at every source -- identical to #22/#23's own
+post-fix numbers, confirming the host-side combine introduces no
+regression. Mid-scale `cslc`+`cs_readelf -m` peak-per-tile measurement,
+compared directly against this session's own recorded baselines:
+
+- RMAT s19 512x512 (`blk=1024`): **40,736B -> 16,384B** (-24,352B, -59.8%)
+- RMAT s20 750x750 (`blk=1399`, the config that motivated this change):
+  **47,120B -> 16,672B** (-30,448B, -64.6%)
+
+Both drops exceed the ~22.4KB relay-buffer-only prediction -- confirms a
+real additional code-size win from the `collectives_2d/pe.csl` cleanup
+(two entire FSM bodies plus their design-comment blocks removed, not just
+their buffers). **Real hardware**, RMAT s19 512x512, source 0 (same
+config #21 already validated on real WSE-3 silicon): `0/524288` visited
+mismatches, `0` invalid device parents, scipy cross-check OK, 6 rounds,
+170.6s execution (vs. #21's 291s at the same scale -- not a controlled
+comparison, job-to-job cluster variance not accounted for, not claimed as
+a speedup). D2H readback span grew as expected with the larger transfer
+(now every PE's own `parent_values` array instead of one relay-produced
+column) -- `sync-corrected span=601481218` cycles (~687ms @875MHz) for
+this run, still trivially far under the 2GiB gRPC ceiling (#1/#4) at
+~198MB actual payload for this scale. Same `InconsistentVersion` warning
+(client 1.14.0 vs. cluster server 1.20.2) seen again, still benign.
+
+**Known, accepted trade-off**: d2h transfer volume grows ~47x (one
+`blk`-sized column -> every PE's own `max_local_nnz_rows`-sized array,
+`P*blk*4B` -> `P*P*max_local_nnz_rows*4B`) -- pure transfer-time cost, no
+new failure mode, explicitly accepted since memory capacity is the
+stated priority for this whole effort. `run_snap_sweep.sh`'s per-graph
+d2h-size predictions (berkstan/pokec/etc.) predate this change and have
+not been re-derived against the new formula -- flagged stale in that
+script's own header comment, not re-measured here.
+
+**Status**: **Fully verified**, smoke through real hardware. Net result
+of #21+#24 together against the pre-#21 baseline: RMAT s19 512x512 peak
+per-tile memory went 46,032B (pre-#21) -> 40,736B (#21 alone) ->
+16,384B (#21+#24), margin against the ~49,152B ceiling grew from
+~3.1KB/6.3% to ~32.8KB/67%.
+
+### 25. Host-side parent-combine had no timer at all -- real cost invisible to every measurement
+
+**Where**: `run_bfs.py`/`run_bfs.appliance.py` (new
+`host_parent_combine_seconds` wall-clock timer wrapping
+`extract_parent_result()`, new CSV column), `plot_bfs_timing.py` (new
+"combine" bar in the `ax_d2h` panel), `plot_bfs_timing_poster.py` (new
+"combine" bar in both the linear and `--log-scale` modes,
+`mean_std_ms_from_seconds` helper, `has_host_combine_column` guard).
+
+**Symptom, caught by the user**: #24 moved the real per-row parent combine
+off-device entirely, but `extract_parent_result()` ran strictly AFTER
+`end = time.time()` in both run scripts -- so its cost was outside every
+existing measurement: not in `search_time_cycles`/GTEPS (device+transfer-
+only, correctly so), not in the CSV, not in either plot. The on-device
+"parent_resolve" TSC bracket still existed and still got reported, but by
+#24 it only brackets a trivial occupancy-count scan -- confirmed later,
+on the s22 real-hardware log-scale poster, at a genuinely negligible
+0.005ms. Nothing was actually measuring the real combine cost anywhere.
+
+**Fix**: `time.time()` around the `extract_parent_result()` call in both
+scripts, printed and added as a new CSV column
+(`host_parent_combine_seconds`) -- deliberately a separate unit/column
+from every `*_cycles` field (host wall-clock, not a device TSC span), and
+deliberately NOT folded into `search_time_cycles`/`gteps` (those stay
+device+transfer-only, comparable across runs the same way they always
+were). Both plot scripts draw a new "combine" bar (converted to an
+equivalent cycle count, `seconds * CLOCK_FREQ_HZ`, purely so it shares the
+existing cycle-scale panels -- not a device measurement) only when the
+CSV row actually has the column, so older rows render exactly as before
+(no false zero implied for data that predates this fix).
+
+**Verification**: confirmed via the s22@750x750 real-hardware run's own
+generated poster plots -- log-scale mode shows `resolve=0.005ms` cleanly
+separated from a real, nonzero `combine` bar, visually confirming #24's
+relay removal actually made on-device resolve free, while the real
+(formerly invisible) cost now has its own honest number.
+
+**Status**: **Fixed**. No regression risk (additive: new column, new
+optional plot bars, existing behavior for old CSV rows unchanged).
+
+### 26. `parent_values` shrunk to a local u16 column offset (not a global u32 vertex id); real host-side preprocessing memory work; RMAT s25 @ 750x750 still blocked by a host-side (not WSE-3) memory ceiling
+
+**Where**:
+- `bool_pe.csl`/`layout_bool.csl`: `parent_values` is now `u16` (was
+  `u32`); `PARENT_NONE` is now `65535` (was `4294967295`);
+  `compute_bottomup()` stores the local column `c` directly -- the
+  on-device `global_c = pcol_id*blk + c` computation this kernel used to
+  do at every write is gone entirely.
+- `device_io.py`: `extract_parent_result()` now reconstructs each
+  candidate's global vertex id itself (`px_idx*blk + parent_values_hwl`,
+  the same way it already reconstructed each row's global index from
+  `py_idx*blk + mat_row_idx_buf_hwl`); `PARENT_NONE_LOCAL` (65535)
+  replaces `PARENT_NONE_GLOBAL`.
+- `run_bfs.py`/`run_bfs.appliance.py`: the `parent_values` d2h read
+  switched to `data_type=MemcpyDataType.MEMCPY_16BIT` -- but the HOST-side
+  numpy buffer stays `np.uint32` (a real, easy-to-miss SDK requirement:
+  passing a `uint16` host buffer throws `RuntimeError: Internal data type
+  of any memcpy_d2h()/memcpy_h2d() operation should be 32 bit` at runtime,
+  even though `data_type=MEMCPY_16BIT` is what actually controls the
+  DEVICE-side transfer width; this codebase's own `rounds_completed`/
+  `mat_row_idx_buf`/`ts_buf`/`nf_history` transfers already followed this
+  convention -- only the new `parent_values` read initially missed it).
+- `preprocess_bool.py` (host-side memory fixes, motivated by an RMAT-s25
+  OOM -- see below): removed a genuinely dead array (`col_l_per_nz`,
+  computed but never read anywhere); freed 7 other large nnz-sized
+  intermediates via explicit `del` as soon as their last real use passed
+  (Python locals otherwise live for the WHOLE function frame, not just
+  until their last use -- a real, if easy to miss, difference from how
+  memory would be freed in a language with proper scoping/lifetime
+  analysis); safely downcast `row_b_per_nz`/`col_b_per_nz` to `int32` and
+  `row_l_per_nz` to `uint16` (both bounded by `faby`/`fabx`/`by`, all
+  already asserted `< uint16::max`). The `int32` downcast was tried once
+  and got REVERTED first: `row_b_per_nz.astype(np.int32) * np.int64(ncols)`
+  does NOT reliably promote to int64 under numpy 1.25's actual behavior
+  (confirmed empirically: `np.array([749], dtype=np.int32) *
+  np.int64(4194750)` stays `int32` and silently overflows to a negative
+  number) -- real at RMAT-s22 scale and up, caught by this session's own
+  regression test before it ever reached real hardware. Fixed correctly
+  the second time via an explicit `.astype(np.int64)` on `row_b_per_nz`
+  itself at that one call site, not by wrapping the OTHER operand.
+  Replaced `np.unique(rowb_col_key, return_inverse=True,
+  return_counts=True)` with `np.unique(rowb_col_key, return_counts=True)`
+  + a separate `np.searchsorted(unique_rc_key, rowb_col_key)` call
+  (`return_inverse=True`'s own implementation builds several MORE
+  nnz-sized int64 temporaries internally -- an argsort permutation, a
+  sorted copy, a boolean mask, a cumulative rank, and the inverse
+  permutation itself -- entirely invisible to any `del` on the Python
+  side, since they live and die inside numpy's own C implementation for
+  the duration of that one call).
+- `graph_loader.py`: `load_graph()` now downcasts `.data` to `uint8` right
+  at the source -- structural-only, never read downstream by any caller
+  in this repo, but previously carried at `mmread`'s default `float64` (8
+  bytes/nonzero for a value nobody looks at) through every later
+  `.tocsr()`/`.tocsc()` copy. `run_bfs.py`/`run_bfs.appliance.py`:
+  `del A_coo` immediately after building `A_csr` from it, instead of
+  holding `A_coo`/`A_csr`/`A_csc` all alive simultaneously (3 full live
+  copies of the whole matrix at once, previously).
+
+**Motivation**: an attempt to push this whole effort's memory-capacity
+work to RMAT s25 @ 750x750 (`n=33,554,432`, `nnz=1,047,214,494`) hit a
+real, reproducible host-side OOM in `preprocess_bool.py` well before ever
+reaching the WSE-3 compiler. Every fix above is real and independently
+verified, but collectively they did NOT get s25 under the ceiling -- see
+Status below.
+
+**Verification**: regression-tested clean at every single step (identical
+`max_local_nnz`/`max_local_nnz_rows` at RMAT s19 512x512, s20/s21/s22
+750x750 before and after each fix, via a standalone probe script built
+this session -- loads a balanced `.mtx`, calls `preprocess()` directly, no
+appliance/compile needed). Smoke-scale correctness re-run (RMAT s12 8x8,
+sources {0,5,50}) after the kernel-side u16 change: `0/4096` mismatches,
+`0` invalid device parents, scipy cross-check OK at every source -- the
+host-side global-id reconstruction (`px_idx*blk + local`) is correct.
+Real peak-per-tile memory (`cslc`+`cs_readelf -m`, re-measured after this
+entry's changes, compared against #24's own numbers):
+
+- RMAT s19 512x512: 16,384B -> **16,192B** (-192B)
+- RMAT s20 750x750: 16,672B -> **16,384B** (-288B)
+- RMAT s22 750x750: 21,488B -> **20,848B** (-640B)
+
+Each drop matches `2 bytes * max_local_nnz_rows` exactly (96, 92, and 270
+respectively) -- confirms the model: this entry's on-device change is a
+clean halving of `parent_values` alone, nothing else moved.
+
+**RMAT s25 @ 750x750 -- generated and balanced clean, but blocked on a
+host-side ceiling, not the WSE-3 kernel**: `util/analyze` balanced the
+raw 18.7GB matrix to a 20.2GB output cleanly (~107 minutes real time).
+Host-side `preprocess()` repeatedly hit the **100GiB per-user cgroup
+memory limit** enforced on `cer-usn-01`/`02`/`03` (confirmed identical via
+`cat /sys/fs/cgroup/memory/user.slice/user-<uid>.slice/memory.limit_in_bytes`
+== `107374182400` on all three -- a cluster-wide policy, not local to one
+node, and not something to work around by switching hosts) -- this is a
+**host-side Python/numpy ceiling, structurally unrelated to the WSE-3
+per-PE static-memory ceiling** every other entry in this file targets.
+Instrumented checkpoint-by-checkpoint measurement (peak RSS via
+`resource.getrusage`, re-run after every fix above) isolated the real
+breakdown: after all the fixes in this entry, the graph-loading/
+conversion pipeline (`mmread` + `.tocsr()` + `.tocsc()`) stays flat at
+**16.63GB** for s25 (matches a linear extrapolation from s22's own
+measured 2.11GB at 8.16x less `nnz`) -- `preprocess()` itself then
+consumes the remaining ~83GB of budget and gets OOM-killed before
+completing, every single time this was tried (5 attempts across this
+entry's fixes, each regression-tested clean at smaller scales first). The
+likely irreducible-without-a-rewrite cost is `preprocess()`'s own TWO
+full-`nnz`-element sorts (one `np.unique()` for the CSC-ordered dedup, one
+for the CSR-ordered one) -- each needs several more nnz-sized int64
+temporaries alive simultaneously inside numpy's own C implementation,
+invisible to any further Python-level `del`.
+
+**Lead for next session, not yet implemented or tested**: tracing what
+each of the two sorts actually feeds shows the CSR-ordered one computes
+ONLY `local_nzrows` (distinct-row count per PE tile) -- nothing else
+downstream depends on it. That count looks derivable from data the
+CSC-ordered pass ALREADY has in memory (`row_b_per_nz`/`col_b_per_nz`/
+`row_l_per_nz`, or equivalently a combined key
+`block_id_per_nz * by + row_l_per_nz`) via one more, much cheaper
+`np.unique()` call -- eliminating the second full sort AND the second
+scipy sparse representation (`A_csc`) as a caller-side input entirely,
+if it holds up under implementation + the same regression tests already
+in place. See `bfs/HANDOFF.md`'s own "Next session" section for the full
+writeup.
+
+**Status**: **Partial**. The u16 local-column change and the host-side
+memory fixes above are real, verified, and landed (not reverted) --
+RMAT s19-s22 @ their respective grids all still compile and run clean at
+the new, lower peak-memory numbers. RMAT s25 @ 750x750 itself remains
+unreached, blocked by a host-side (not on-device) memory ceiling, pending
+either the CSR/CSC-redundancy lead above or a more invasive
+chunked/blocked rewrite of `preprocess()`.
+
+### 27. CSR/CSC redundancy eliminated from `preprocess_bool.py`; RMAT s25 @ 750x750 gets past the host-side wall, but hits a genuine, separate WSE-3 PE-memory ceiling
+
+**Where**: `preprocess_bool.py` (`preprocess()`'s `csrRowPtr`/`csrColInd`
+parameter pair removed entirely, along with the whole CSR-ordered
+`np.unique()` pass it fed -- `local_nzrows`/`max_local_nnz_rows` no
+longer computed or returned in `matrix_info` at all), `run_bfs.py`/
+`run_bfs.appliance.py` (no longer build `A_csc` at all -- `A_csr`'s
+arrays alone are passed into `preprocess()`'s remaining `cscColPtr`/
+`cscRowInd` slot), `.claude_scratch/probe_preprocess.py`/
+`probe_preprocess_instrumented.py` (matching updates).
+
+**The lead from #26's own "next session" writeup, now implemented and
+verified**: tracing every live caller (`run_bfs.py`, `run_bfs.appliance.py`
+-- `run_graph500.py` is a separate, already-broken caller predating #21's
+bottom-up swap, explicitly out of scope per #21/#24's own precedent)
+showed NEITHER ever reads `matrix_info["local_nnz_rows"]`/
+`["max_local_nnz_rows"]` -- both only ever consume `["local_nnz_cols"]`/
+`["max_local_nnz_cols"]` (renamed locally to `"*_rows"` post-#21's
+argument swap; each caller's own comment already said as much). The
+entire CSR-ordered computation -- a full second `nnz`-element sort, fed
+by a whole second scipy sparse representation the caller had to build --
+was **provably dead code** for every live path. Not just cheapened (a
+derivation from the CSC-ordered pass's own data was drafted and would
+have worked, see git history), but deleted outright: zero cost beats any
+cost, and one less parameter pair for callers to worry about getting
+right (this codebase already has a history of subtle CSR/CSC swap bugs,
+#22).
+
+**Verification**: regression-tested clean at every step (identical
+`max_local_nnz`/`max_local_nnz_rows` at RMAT s19/s20/s21/s22 before and
+after). Smoke-scale correctness re-run (RMAT s12 8x8, sources {0,5,50}):
+`0/4096` mismatches, `0` invalid device parents, scipy cross-check OK at
+every source -- confirms the signature change and dead-output removal
+introduced no regression. Instrumented peak-RSS re-measurement at RMAT
+s22 750x750: total dropped from 15.18GB to **11.78GB** (`preprocess()`
+itself: 13.07GB -> 9.67GB, ~26% cheaper) -- a real win at every scale,
+not just s25.
+
+**RMAT s25 @ 750x750 -- the host-side wall is cleared, but a NEW, genuine
+WSE-3 wall is hit immediately after**: with this fix, `preprocess()`
+completed successfully for the first time at this scale -- peak RSS
+**86.29GB**, comfortably under the 100GiB per-user cgroup ceiling (#26).
+`max_local_nnz=2078`, `max_local_nnz_rows=1293`, `blk=44740`. But the
+actual `cslc` compile then failed with a REAL, different error:
+```
+ld.lld: error: ran out of PE memory for data (section .bss)
+ld.lld: error: ran out of PE memory for task table
+ld.lld: error: ran out of PE memory for data (section .data.hi)
+```
+(the familiar "linker file-vanished" flake, #12, also appeared
+repeatedly in the same log, almost certainly a secondary symptom once
+the primary `ran out of PE memory` failures start cascading through the
+linker's worker pool -- not evidence this is actually a flake rather
+than a real overflow). This is the genuine **WSE-3 per-PE static-memory
+ceiling** every other entry in this file targets, structurally distinct
+from #26's host-side cgroup wall -- fixing one did not, and could not,
+fix the other. At RMAT s25's `max_local_nnz`/`max_local_nnz_rows`/`blk`
+values, the per-tile data this kernel needs genuinely exceeds the
+~49,152B ceiling at a 750x750 grid (WSE-3's practical max grid size,
+per `rmat_grid_sweep.sh`'s own header comment -- there is no bigger grid
+to fall back to for this exact matrix).
+
+**Also newly surfaced, not yet reached**: even if the PE-memory ceiling
+were somehow cleared, the `parent_values` d2h readback at this scale
+(`750*750*1293*4` bytes, confirmed via `device_io.py`'s own documented
+invariant that "the SDK's real wire payload is always 4 bytes/element...
+regardless of the `data_type` kwarg") is **~2.71GiB -- over the
+2,147,482,624-byte hard gRPC message-size ceiling** this project already
+hit once on the h2d side (#1/#4, fixed there via
+`prepare_h2d_chunked`/`send_h2d_chunked`). No equivalent d2h-side
+chunking exists in this codebase yet -- would need implementing before
+any RMAT s25-scale real-hardware run could work, independent of the
+PE-memory question above.
+
+**Status**: **Done** (the CSR/CSC-redundancy fix itself: verified,
+landed, a real improvement at every scale tested). RMAT s25 @ 750x750
+remains **blocked**, now by a different, harder, and more fundamental
+wall than #26 left it at -- genuine WSE-3 PE-memory overflow at this
+scale's `max_local_nnz`/`max_local_nnz_rows`/`blk` values, with a second,
+independent d2h gRPC-ceiling problem waiting behind it. Neither is fixed
+by anything in this entry. See `bfs/HANDOFF.md`'s "Next session" section
+for the current recommendation (fall back to RMAT s23/s24 as the next
+real-hardware high-water mark instead of continuing to chase s25).
+
+### 28. RMAT s23/s24 real-hardware verified as new high-water marks; scipy cross-check's own memory cost discovered and auto-disabled above RMAT-s20 scale
+
+**Where**: `run_bfs.py`/`run_bfs.appliance.py` (new `_SCIPY_CHECK_AUTO_DISABLE_N`
+module constant, new `--force-scipy` flag, auto-disable check inserted
+right after `n` is known).
+
+**RMAT s23/s24 @ 750x750 -- both compile and run clean on real WSE-3
+hardware**, following #27's fix:
+
+- **s23** (`blk=11,185`, `max_local_nnz=567`, `max_local_nnz_rows=451`):
+  **26,320B** peak per-tile (46% margin). Real hardware: `0/8,388,750`
+  mismatches, `0` invalid parents, scipy cross-check OK, 6 rounds,
+  **224.5 GTEPS** (excl. transfer).
+- **s24** (`blk=22,370`, `max_local_nnz=1075`, `max_local_nnz_rows=755`):
+  **36,768B** peak per-tile (25% margin). Real hardware: 6 rounds,
+  **273.99 GTEPS** (excl. transfer) -- new high. Correctness NOT
+  independently confirmed at this scale (see below) -- compile and
+  on-device execution are real and verified; the scipy reference check
+  itself is what's missing here, not evidence against correctness.
+
+Both are genuine new real-hardware high-water marks for this whole
+memory-capacity effort (previous: RMAT s22, 20,848B, 164 GTEPS).
+
+**New problem found while verifying s24**: the real-hardware run got
+**OOM-killed** (`dmesg`-confirmed: `anon-rss:104639284kB`, right at the
+100GiB per-user cgroup ceiling) with the process printing **nothing at
+all** -- not even `"Run done in Xs"`, which always appears before the
+scipy cross-check starts in every prior successful run. This pointed
+directly at the scipy correctness-check code (`breadth_first_order()` +
+`A_fwd = A_csr.transpose().tocsr()`, a second full CSR copy on top of
+the one already held), NOT `preprocess()` (which succeeds fine at this
+scale on its own, confirmed by the local compile-only succeeding) and
+NOT the on-device execution (confirmed by a `--nocorrectness` re-run
+completing cleanly). A **third, distinct host-memory wall** from #26's
+`preprocess()` one and #27's on-device one -- this one specific to the
+*correctness-verification* code path.
+
+**Fix**: `run_bfs.py`/`run_bfs.appliance.py` now auto-disable the scipy
+cross-check (both the printed correctness summary and the tree plot's
+own scipy dependency) once the matrix exceeds
+`_SCIPY_CHECK_AUTO_DISABLE_N = 1,100,000` vertices -- RMAT s20's own `n`
+(1,049,250) is the largest scale this project has verified the scipy
+check itself against without incident, so that's the threshold, with
+headroom. A new `--force-scipy` flag overrides it for anyone who's
+checked host memory headroom themselves. The auto-disable only fires
+when `--notree` is also set (tree-plot rendering unconditionally expects
+scipy data further downstream; silently passing it `None` there would be
+worse than just respecting an explicit tree-plot request at large scale).
+Verified: smoke-scale (RMAT s12 8x8, well under threshold) behavior is
+byte-for-byte unchanged (`0/4096` mismatches, scipy check still runs);
+RMAT s24 real hardware with **no flags at all** now prints the auto-disable
+NOTE and completes cleanly, matching the explicit `--nocorrectness`
+run's own numbers exactly (`273.99` GTEPS both times).
+
+**Status**: **Done**. RMAT s23 is fully scipy-verified on real hardware;
+RMAT s24 is compile+execution-verified on real hardware, with the scipy
+cross-check itself now understood to need a memory-cost fix of its own
+(not yet done -- would need the same kind of treatment #26/#27 gave
+`preprocess()`, e.g. freeing `A_csr` before/while building `A_fwd`, or a
+lighter validation approach) before it can safely run at this scale.
+Every scale above the new threshold auto-skips it by default now, rather
+than risking a silent OOM.
+
 ## Summary table
 
 | # | Error | Where confirmed | Cause | Status |
@@ -1124,3 +1533,8 @@ CALLER-side selection of which collective to use was narrowed to one.
 | 21 | Bottom-up-only BFS: top-down + on-device CSC→CSR transpose removed; `parent_resolve_variant==2`'s storage redefined to `parent_values` | RMAT s12 8x8 (smoke) through s19 512x512/blk=1024 (mid-scale, real WSE-3 hardware) | memory-capacity priority: bottom-up's single linear per-round pass makes #19/#20's discovery-order dedup scheme unnecessary; host now uploads the matrix pre-transposed instead of an on-device transpose | **Fully verified** (smoke through real hardware; 40,736B peak per-tile at s19 512x512, down from 46,032B pre-#21; 0 mismatches on real hardware) |
 | 22 | `preprocess()` call-site swap silently transposed the (px,py) PE-grid axes | RMAT s12 8x8, sources {0,5,50} — #21's own first correctness run | `preprocess()`'s block-placement formula treats the CSR-role-fed data's own row_b as the array's first output axis; under #21's swap that ends up holding the column-block index instead, transposing every off-diagonal PE's data with its transpose partner (diagonal PEs unaffected, masking it as a shape-safe compile) | **Fixed** (transpose returned arrays' first two axes post-extraction; 0/4096 mismatches at every source after) |
 | 23 | Dense (`parent_resolve_variant==0`) removed entirely | RMAT s12 8x8, sources {0,5,50} | no longer needed once #21 made bottom-up the only strategy and #22 confirmed indexed/sparse fully correct; kept only as an unused fallback until now | **Done** (single parent-resolution path; `--parent-resolve-variant` no longer exists; 0/4096 mismatches, no regression) |
+| 24 | On-device parent-aggregation relay (`reduce_select_any_indexed`) + dense `reduce_select_any` both removed; combine moved host-side | RMAT s12 8x8 (smoke) through s19 512x512/blk=1024 (real WSE-3 hardware); s20 750x750/blk=1399 (mid-scale memory) | relay's 5 `blk`-sized wire buffers (~22.4KB) were the actual dominant static-memory cost, untouched by #21's sparse `parent_values` alone, and structurally couldn't shrink (union bound by `blk`, not `max_local_nnz_rows`, per #20) | **Fully verified** (smoke through real hardware; 40,736B->16,384B at s19 512x512, 47,120B->16,672B at s20 750x750, both ~60-65% peak-memory reduction; 0 mismatches on real hardware; ~47x d2h volume increase accepted) |
+| 25 | Host-side parent-combine had no timer at all | s22 750x750, real hardware (poster plots) | #24 moved the real combine off-device, but `extract_parent_result()` ran after every existing timer stopped -- invisible to search_time_cycles/GTEPS/CSV/plots | **Fixed** (new `host_parent_combine_seconds` wall-clock column + poster/detail plot bars, additive/backward-compatible) |
+| 26 | `parent_values` shrunk to local u16 column offset (was global u32 vertex id); real host-side `preprocess()` memory fixes; RMAT s25 @ 750x750 still blocked | RMAT s12 8x8 (smoke) through s19-s22 @ their own grids (real peak-memory re-measurement); RMAT s25 @ 750x750 (host-side OOM, not reached) | on-device global-id computation was pure host-side-derivable waste once #24 moved the combine off-device; separately, `preprocess_bool.py`/`graph_loader.py` held many more nnz-sized temporaries/copies alive than needed, hitting a 100GiB per-user cgroup ceiling (host-side, NOT the WSE-3 per-PE ceiling) at RMAT-s25 scale | **Partial** (u16 change + memory fixes landed/verified, 16,384B->16,192B at s19, 16,672B->16,384B at s20, 21,488B->20,848B at s22; RMAT s25 still blocked -- CSR/CSC-redundancy lead flagged for next session, not yet implemented) |
+| 27 | CSR/CSC redundancy eliminated from `preprocess_bool.py` (`local_nzrows`/`max_local_nnz_rows` was dead code for every live caller); RMAT s25 @ 750x750 clears the host-side wall but hits a genuine WSE-3 PE-memory overflow | RMAT s19-s22 @ their own grids (regression + real memory re-measurement, ~26% cheaper preprocess() at every scale); RMAT s25 @ 750x750 (preprocess() succeeds at 86.29GB RSS; `cslc` fails with real `ran out of PE memory`) | a whole second full-nnz sort + second scipy sparse representation was computing an output neither live caller ever read; separately, RMAT s25's own `max_local_nnz`/`max_local_nnz_rows`/`blk` values genuinely exceed the ~49,152B WSE-3 per-PE ceiling at the largest available (750x750) grid | **Done** (CSR/CSC fix itself, verified/landed); RMAT s25 **still blocked** -- now by a real, harder, on-device ceiling (not host-side), plus an unaddressed ~2.71GiB d2h payload over the 2GiB gRPC ceiling waiting behind it |
+| 28 | RMAT s23/s24 verified as new real-hardware high-water marks; a THIRD host-memory wall found in the scipy correctness-check code itself (distinct from #26's `preprocess()` wall and #27's on-device wall) | RMAT s23 @ 750x750 (26,320B, 0/8,388,750 mismatches, 224.5 GTEPS); RMAT s24 @ 750x750 (36,768B, 273.99 GTEPS, OOM-killed at ~99.8GiB anon-rss when the scipy check ran) | `breadth_first_order()` + rebuilding a transposed CSR copy of A is itself memory-hungry at large `n`, independent of `preprocess()`/on-device costs -- undiscovered until RMAT s24 was the first scale big enough to hit it | **Done** (scipy cross-check auto-disabled above RMAT-s20 scale by default, `--force-scipy` to override; verified byte-identical smoke-scale behavior and a clean RMAT s24 real-hardware run with no flags at all) |

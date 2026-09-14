@@ -36,9 +36,19 @@ def load_graph(path):
   (all-1.0 data -- callers here only ever consume .indptr/.indices via
   .tocsr(), never .data, so real edge weights are neither expected nor
   preserved)."""
-  if _is_mtx(path):
-    return _load_mtx(path)
-  return _load_edgelist(path)
+  A = _load_mtx(path) if _is_mtx(path) else _load_edgelist(path)
+  # .data is genuinely never read anywhere downstream (see this docstring
+  # above) -- mmread's own default float64 (or _load_edgelist's own
+  # explicit float64) is 8 bytes/nonzero spent on a value nobody looks at,
+  # and that same width then survives every later .tocsr()/.tocsc()/
+  # .sorted_indices() copy the calling scripts make (3+ live copies of the
+  # whole matrix at once, docs/ERRORS.md #26). uint8 is scipy's smallest
+  # accepted numeric dtype and is more than sufficient for an all-1s
+  # structural marker -- this was a real, measured contributor to a
+  # host-side OOM at RMAT-s25 scale (~1B nonzeros, so ~7GB saved per live
+  # copy just from this one change).
+  A.data = np.ones(len(A.data), dtype=np.uint8)
+  return A
 
 
 def _is_mtx(path):

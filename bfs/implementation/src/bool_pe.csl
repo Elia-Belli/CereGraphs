@@ -77,23 +77,31 @@
 // each round -- see visited_bcast_done()/term_col_bcast_done() below.
 //
 // Each PE records a parent candidate per local row it discovers this run,
-// storing the FULL GLOBAL vertex id (pcol_id*blk + local column), computed
-// on-device at write time -- see compute_bottomup() below. Storage is
+// storing just the LOCAL column (u16, in [0, blk)) it hit -- NOT the full
+// global vertex id -- see compute_bottomup() below. Storage is
 // `parent_values`, position-aligned to `mat_row_idx_buf` (see its own
 // declaration comment) -- see docs/ERRORS.md #21/#22 for how this replaced
 // both the original dense `parent_local_buf` scheme and #19/#20's
-// discovery-order compacted scheme in turn. The tie-break for multiple
-// local columns hitting the same row in the same discovery round is
-// intentionally NOT the lowest global index -- any candidate gated by
-// visited_bitmap above is already a legal one-hop-closer parent, so
-// there's no correctness reason to prefer the minimum one.
+// discovery-order compacted scheme in turn, and #26 for why the on-device
+// global_c = pcol_id*blk + local_column computation this comment used to
+// describe was dropped entirely once #24 had already moved the per-row
+// combine host-side (the host reconstructs the global id itself instead,
+// see extract_parent_result()). The tie-break for multiple local columns
+// hitting the same row in the same discovery round is intentionally NOT
+// the lowest global index -- any candidate gated by visited_bitmap above
+// is already a legal one-hop-closer parent, so there's no correctness
+// reason to prefer the minimum one.
 // Because different PEs in the SAME row cover different column ranges, a
-// per-row cross-PE combine is still needed: term_col_bcast_done() resolves
-// it on-device, once per run at convergence, via
-// reduce_select_any_indexed_precompacted (collectives_2d/pe.csl) -- host
-// readback (extract_parent_result() in ../device_io.py) always sees a
-// plain dense per-column result, since the relay's own on-device
-// decompress step already did the combine.
+// per-row cross-PE combine is still needed -- but as of #24, it happens
+// HOST-SIDE, not on-device: every PE's own (mat_row_idx_buf, parent_values)
+// pair is read back directly via d2h, and extract_parent_result() (see
+// ../device_io.py) does the per-row combine itself, reconstructing each
+// candidate's global vertex id from the producing PE's own pcol_id and
+// `blk` (#26) along the way. No on-device relay, no blk-sized wire buffers
+// -- see docs/ERRORS.md #24 for why (the relay's own cross-PE union needed
+// blk-sized scratch regardless of how sparse any one PE's local storage
+// was, which turned out to dominate the memory footprint this whole
+// sparse-storage effort was actually trying to shrink).
 
 param memcpy_params;
 param c2d_params;
@@ -114,15 +122,6 @@ const term_col_bcast_done_task_id: local_task_id = @get_local_task_id(19);
 // distributes visited_bitmap across each row before compute() runs -- see the
 // module docstring above and visited_bcast_done() below.
 const visited_bcast_done_task_id: local_task_id = @get_local_task_id(20);
-// callback for the one-time, end-of-run parent resolution reduce (Phase B
-// of the on-device parent resolution plan) -- see parent_resolve_done()
-// below. id 21 (the naive next-free-slot guess after 10-20 above) was
-// tried first and rejected by cslc itself at compile time ("task ID '21'
-// bound to more than one task" -- memcpy's own LOCAL_MEMCPYD2H_DATA task,
-// confirming layout_bool.csl's "21-23, 27-30, 33-37ish reserved by
-// memcpy" comment for real, not just in theory). 24 confirmed free by the
-// same real compile-time check.
-const parent_resolve_done_task_id: local_task_id = @get_local_task_id(24);
 // callback for the one-time host-device timing reference-clock sync (see
 // f_sync_hostdevice()/sync_hostdevice_done() below) -- 25 chosen the same
 // empirical way 24 was (next slot after the last confirmed-free one,
@@ -174,23 +173,18 @@ var sync_signal_buf = @zeros([1]u32);
 var round_trip_start_buffer = @zeros([timestamp.tsc_size_words]u16);
 var round_trip_done_buffer = @zeros([timestamp.tsc_size_words]u16);
 
-// Same idea, for the one-time end-of-run mpi_x.reduce_select_any() call
-// (Phase B of the on-device parent resolution plan, see
-// term_col_bcast_done()'s termination branch) -- without this, its cost
+// Brackets the one-time end-of-run parent-occupancy scan in
+// term_col_bcast_done()'s termination branch -- without this, its cost
 // would be an unattributed gap the same way transpose's was before
 // transpose_tic_buffer/toc_buffer existed: it runs strictly AFTER the last
 // round's own TERM_COL_BCAST_DONE timestamp and BEFORE the host's own
-// f_tic/f_toc d2h bracket even starts (f_spmv_iter's single blocking
-// launch doesn't return to the host until this reduce has also finished),
-// so none of decode_phase_row's per-round windows span it and it would
-// otherwise silently understate search_time_cycles/GTEPS. Unlike
-// transpose, this always fires exactly once per run (not
-// conditionally), so tic/toc are captured unconditionally around the
-// reduce_select_any call itself, not around a maybe-skipped branch --
-// tic is captured right before issuing the (async) reduce, toc inside its
-// callback (parent_resolve_done()), so this correctly measures the whole
-// async operation's wall-clock span, not just the issuing call's own
-// (near-instant) return.
+// f_tic/f_toc d2h bracket even starts, so none of decode_phase_row's
+// per-round windows span it. Since #24 removed the on-device relay this
+// used to bracket (the host now combines parent_values itself after d2h),
+// this is now a synchronous, near-instant local scan rather than an async
+// fabric operation -- tic/toc are both captured directly inline (no
+// callback/task indirection needed anymore), so this reports a much
+// smaller, but still real and comparable, span than before.
 var parent_resolve_tic_buffer = @zeros([timestamp.tsc_size_words]u16);
 var parent_resolve_toc_buffer = @zeros([timestamp.tsc_size_words]u16);
 
@@ -406,80 +400,61 @@ var popcnt_scratch = @zeros([2 * BITMAP_WORDS]u16);
 var popcnt_src_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &popcnt_scratch, .extent = 2 * BITMAP_WORDS });
 const popcnt_dst_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &popcnt_scratch, .extent = 2 * BITMAP_WORDS });
 
-// sentinel meaning "no candidate parent seen". Stores the FULL global
-// vertex id (pcol_id*blk + local column), not a local column index, so
-// this sentinel must exceed the max real GLOBAL vertex id (n-1) -- widened
-// to u32::MAX accordingly. Safe since n <= P*blk, comfortably under u32
-// range per preprocess_bool.py's own blk < u16::max assertion.
-const PARENT_NONE: u32 = 4294967295;
-
-// recv_buf for the parent-resolution reduce -- meaningful ONLY at PE-column
-// MID after f_spmv_iter converges (every other column's copy is a
-// non-root reduce participant, same "only the aggregation point's copy is
-// real" convention y_bitmap_reduced already uses for the diagonal).
-var parent_relay_result = @zeros([blk]u32);
-
-// Scratch reduce_select_any_indexed_precompacted() needs beyond
-// parent_values/parent_relay_result (see its own comment in
-// collectives_2d/pe.csl for the wire/workspace layout). INDEXED_ARRAY_LEN
-// covers both send and recv sides, blk-sized on PURPOSE (see docs/
-// ERRORS.md #19's crash writeup, and #20's fix): the relay's "middle root"
-// branch (collectives_2d/pe.csl's transfer_data_reduce_select_any_
-// indexed(), counter==6/7 in the `root and fsm_state.counter == 4` switch's
-// `else` arm) reuses the SEND-side indices/values buffers as a landing zone
-// for side B's incoming data once this PE's own contribution has been
-// merged away -- and side B, whenever root isn't at an extreme PE (true
-// here: root is MID, see bool_pe.csl's own MID comment), is itself already
-// the merged UNION of every PE further down that relay chain, bounded by
-// blk, NOT by any single PE's max_local_nnz_rows. A send buffer sized only
-// to this PE's own max_local_nnz_rows silently overflows there -- confirmed
-// as a real out-of-bounds write (an `hcf` fault on the root PE, column MID)
-// during #20's own testing. parent_values (below) stays
-// max_local_nnz_rows-sized -- still the right size for what THIS PE
-// accumulates -- but parent_send_indices/values (also below) are the
-// blk-sized copies actually handed to the relay, restoring the invariant
-// the landing-zone reuse trick depends on.
-const INDEXED_BITMAP_LEN: u16 = BITMAP_WORDS;
-const INDEXED_ARRAY_LEN: u16 = blk;
-var parent_send_bitmap = @zeros([INDEXED_BITMAP_LEN]u32);
-var parent_recv_bitmap = @zeros([INDEXED_BITMAP_LEN]u32);
-var parent_send_indices = @zeros([INDEXED_ARRAY_LEN]u16);
-var parent_send_values = @zeros([INDEXED_ARRAY_LEN]u32);
-var parent_recv_indices = @zeros([INDEXED_ARRAY_LEN]u16);
-var parent_recv_values = @zeros([INDEXED_ARRAY_LEN]u32);
+// sentinel meaning "no candidate parent seen". parent_values (below) now
+// stores the LOCAL column offset within the producing PE's own column
+// range, not the full global vertex id -- #24 already moved the
+// global-id reconstruction (pcol_id*blk + local column) entirely
+// host-side (no on-device relay left to need a global id in hand), so
+// #26 finishes the job by never computing the global id on-device at
+// all, storing just the u16 local column instead of a u32 global one.
+// Real local-column values span [0, blk), which preprocess_bool.py
+// already asserts fits under u16::max -- so u16::max itself is always a
+// safe, unambiguous sentinel.
+const PARENT_NONE: u16 = 65535;
 
 // parent_values: sparse, position-aligned parent-candidate storage -- see
-// docs/ERRORS.md #21/#22. Sized by max_local_nnz_rows and POSITION-ALIGNED
-// to the resident mat_row_idx_buf: parent_values[i] is the parent
-// candidate for local row mat_row_idx_buf[i]. This gives free O(1) row
-// identity via position -- no separate indices array, no discovery-order
-// append, no per-round dedup bitmap -- because compute_bottomup()'s single
-// linear pass over i (0..local_nnz_rows[0]) never revisits the same row
-// twice within one round (mat_row_idx_buf lists each distinct local row
-// exactly once), and bottom-up is the only traversal strategy (no
-// compute_topdown() nested-loop double-hit risk to guard against -- that
-// risk, and the parent_round_seen_bitmap it required, is what #19/#20's
-// discovery-order scheme existed to handle; both are superseded here, as
-// is the original dense parent_local_buf scheme, #22 having removed dense
-// entirely).
+// docs/ERRORS.md #21/#22/#24. Sized by max_local_nnz_rows and
+// POSITION-ALIGNED to the resident mat_row_idx_buf: parent_values[i] is
+// the parent candidate for local row mat_row_idx_buf[i]. This gives free
+// O(1) row identity via position -- no separate indices array, no
+// discovery-order append, no per-round dedup bitmap -- because
+// compute_bottomup()'s single linear pass over i (0..local_nnz_rows[0])
+// never revisits the same row twice within one round (mat_row_idx_buf
+// lists each distinct local row exactly once), and bottom-up is the only
+// traversal strategy (no compute_topdown() nested-loop double-hit risk to
+// guard against -- that risk, and the parent_round_seen_bitmap it
+// required, is what #19/#20's discovery-order scheme existed to handle;
+// both are superseded here, as is the original dense parent_local_buf
+// scheme, #22 having removed dense entirely).
 // Reset once per run in start_spmv() (O(local_nnz_rows[0]) sentinel fill,
-// see there), read at convergence in term_col_bcast_done() (a one-time,
-// end-of-run compress-scan pulling real row numbers from mat_row_idx_buf --
-// see its own comment for why real row numbers, not positions, are
-// required on the wire).
-var parent_values = @zeros([max_local_nnz_rows]u32);
+// see there). Host-readable directly (#24 removed the on-device
+// parent-resolution relay entirely -- the host now does the per-row
+// combine itself after d2h, since the relay's own cross-PE union needed
+// blk-sized wire buffers regardless of how sparse any one PE's local
+// storage was, which turned out to be the dominant cost this whole sparse
+// -storage effort was actually after; see #24's own writeup).
+// u16, not u32 (#26): stores the LOCAL column offset within this PE's own
+// column range (see compute_bottomup()'s own comment), not the global
+// vertex id -- the host already knows each PE's own pcol_id from the grid
+// layout, so it reconstructs global_c = pcol_id*blk + parent_values[i]
+// itself (extract_parent_result()'s own comment), same way it already
+// reconstructs each row's global index from mat_row_idx_buf + the PE's
+// prow_id.
+var parent_values = @zeros([max_local_nnz_rows]u16);
 
 // parent_occupancy: how many of this PE's local_nnz_rows[0] resident rows
-// have a real (non-PARENT_NONE) recorded candidate right before the
-// one-time end-of-run relay call -- a byproduct of that call's own
-// compress-scan (see term_col_bcast_done()), not separately computed.
+// have a real (non-PARENT_NONE) recorded candidate by the end of the run
+// -- a simple local count in term_col_bcast_done(), no relay/indices/
+// bitmap building needed since #24 (the host does its own combine from
+// the raw parent_values/mat_row_idx_buf d2h read instead).
 var parent_occupancy = @zeros([1]u32);
 
 var ptr_x_bitmap: [*]u32 = &x_bitmap;
 var ptr_y_bitmap_reduced: [*]u32 = &y_bitmap_reduced;
 var ptr_visited_bitmap: [*]u32 = &visited_bitmap;
 var ptr_rounds_completed: [*]u16 = &rounds_completed;
-var ptr_parent_relay_result: [*]u32 = &parent_relay_result;
+// Host-readable directly since #24 -- see parent_values' own declaration comment.
+var ptr_parent_values: [*]u16 = &parent_values;
 var ptr_parent_occupancy: [*]u32 = &parent_occupancy;
 var ptr_mat_rows_buf: [*]u16 = &mat_rows_buf;
 var ptr_local_nnz: [*]u16 = &local_nnz;
@@ -644,16 +619,18 @@ fn compute_bottomup() void {
             const c = mat_rows_buf[loc + j]; // source column
             if ((x_bitmap[c >> 5] >> (c & 31)) & 1 != 0) {
                 y_bitmap[r >> 5] |= (@as(u32, 1) << (r & 31));
-                // u32 arithmetic required to avoid silently truncating for
-                // any pcol_id*blk >= 65536.
-                const global_c: u32 = @as(u32, pcol_id) * @as(u32, blk) + @as(u32, c);
                 // Positional write, aligned to mat_row_idx_buf[i] == r (see
                 // parent_values' own declaration comment) -- no bounds
                 // check needed, i < local_nnz_rows[0] <= max_local_nnz_rows
                 // by loop construction, and no dedup gate needed either,
                 // since this loop visits each distinct row at most once
-                // per round.
-                parent_values[i] = global_c;
+                // per round. `c` is stored as-is (LOCAL column, u16) --
+                // #26 dropped the on-device global_c = pcol_id*blk + c
+                // computation entirely, since the host now does that
+                // reconstruction itself (see parent_values' own
+                // declaration comment); no u32 widening needed here at all
+                // any more.
+                parent_values[i] = c;
                 break; // first hit wins -- no need to look at r's other columns
             }
         }
@@ -805,54 +782,27 @@ task term_col_bcast_done() void {
         mpi_x.broadcast(prow_id, &visited_bitmap, BITMAP_WORDS, visited_bcast_done_task_id);
 
     } else {
-        // BFS has converged. One-time, end-of-run parent resolution: resolve
-        // each row's P per-PE candidates down to a single winner at
-        // PE-column MID, instead of leaving that combine to the host after
-        // a full P-wide transfer. Runs exactly once per f_spmv_iter call,
-        // never mid-round -- safe to reuse mpi_x's colors/queues/DSRs here
-        // since all other mpi_x traffic for this run has already fully
-        // torn down by the time termination is reached. Rooted at MID (not
-        // 0): this relay is a fully serial linear chain (no fused ALU op
-        // like reduce_or's @or16 exists for select_merge_u32 -- see its own
-        // comment), so root=0 forced a one-directional P-1-hop chain; MID
-        // lets two ~half-length chains converge from both sides in
-        // parallel, same latency-minimizing reasoning already used for
-        // reduce_fadds/broadcast above (see the P/MID comment near their
-        // declaration).
+        // BFS has converged. One-time, end-of-run parent-occupancy count --
+        // #24 removed the on-device relay that used to resolve each row's
+        // P per-PE candidates down to a single winner here; the host now
+        // reads every PE's own parent_values/mat_row_idx_buf directly via
+        // d2h and does that per-row combine itself (see docs/ERRORS.md
+        // #24 and device_io.py's extract_parent_result()). All that's left
+        // on-device is this occupancy count -- purely local, no fabric
+        // traffic, no callback needed, so tic/toc are captured directly
+        // inline instead of via an async relay's completion callback.
         timestamp.get_timestamp(&parent_resolve_tic_buffer);
-        // One-time compress-scan over parent_values/mat_row_idx_buf,
-        // filtering out still-PARENT_NONE (never-discovered) rows -- does
-        // double duty as both the membership-bitmap source and the
-        // blk-sized copy-into-scratch the relay's landing-zone reuse trick
-        // needs (see parent_send_indices' own declaration comment). Pulls
-        // REAL row numbers from mat_row_idx_buf, not positions -- required
-        // for cross-PE correctness (see parent_values' own declaration
-        // comment). O(local_nnz_rows[0]), paid once per run (this whole
-        // branch only runs at convergence, never per-round) --
-        // parent_occupancy[0] is a byproduct of this scan.
         var pc: u16 = 0;
         var pi: u16 = 0;
         while (pi < local_nnz_rows[0]) : (pi += 1) {
             if (parent_values[pi] != PARENT_NONE) {
-                parent_send_indices[pc] = mat_row_idx_buf[pi];
-                parent_send_values[pc] = parent_values[pi];
                 pc += 1;
             }
         }
         parent_occupancy[0] = @as(u32, pc);
-        mpi_x.build_bitmap_from_indices(&parent_send_indices, pc,
-                                         BITMAP_WORDS, &parent_send_bitmap);
-        mpi_x.reduce_select_any_indexed_precompacted(MID, &parent_send_indices, &parent_send_values,
-                                                      pc, &parent_send_bitmap,
-                                                      &parent_relay_result, &parent_recv_bitmap,
-                                                      &parent_recv_indices, &parent_recv_values,
-                                                      PARENT_NONE, blk, parent_resolve_done_task_id);
+        timestamp.get_timestamp(&parent_resolve_toc_buffer);
+        sys_mod.unblock_cmd_stream();
     }
-}
-
-task parent_resolve_done() void {
-    timestamp.get_timestamp(&parent_resolve_toc_buffer);
-    sys_mod.unblock_cmd_stream();
 }
 
 comptime {
@@ -863,21 +813,16 @@ comptime {
     @bind_local_task(term_row_bcast_done, term_row_bcast_done_task_id);
     @bind_local_task(term_col_bcast_done, term_col_bcast_done_task_id);
     @bind_local_task(visited_bcast_done, visited_bcast_done_task_id);
-    @bind_local_task(parent_resolve_done, parent_resolve_done_task_id);
     @bind_local_task(sync_hostdevice_done, sync_hostdevice_done_task_id);
 
     @export_symbol(ptr_x_bitmap, "x_bitmap");
     @export_symbol(ptr_y_bitmap_reduced, "y_bitmap_reduced");
     @export_symbol(ptr_visited_bitmap, "visited_bitmap");
     @export_symbol(ptr_rounds_completed, "rounds_completed");
-    // Exported name stays "parent_local_buf" for host-side backward
-    // compatibility (runner.get_id lookups are unchanged) even though the
-    // dense parent_local_buf variable this name originally referred to is
-    // gone (#22) -- it now points at parent_relay_result, the POST-REDUCE
-    // buffer, meaningful only at PE-column MID, not each PE's own raw
-    // candidate (parent_values). See parent_relay_result's own declaration
-    // comment.
-    @export_symbol(ptr_parent_relay_result, "parent_local_buf");
+    // "parent_local_buf" name retired with #24 -- there is no more
+    // post-relay dense result to alias it to; the host now reads each
+    // PE's own parent_values directly and combines per-row itself.
+    @export_symbol(ptr_parent_values, "parent_values");
     @export_symbol(ptr_parent_occupancy, "parent_occupancy");
     @export_symbol(ptr_mat_rows_buf, "mat_rows_buf");
     @export_symbol(ptr_local_nnz, "local_nnz");

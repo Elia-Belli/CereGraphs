@@ -7,12 +7,14 @@ import numpy as np
 #   C code           spmv kernel
 # ----------------------------------
 #  local_nzcols     local_nnzcols
-#  local_nzrows     local_nnzrows
 #  local_nnz        local_nnz
 #  A_colloc         mat_col_loc_buf
 #  A_collen         mat_col_len_buf
 #  A_colidx         mat_col_idx_buf
 #  A_rows           mat_rows_buf
+#
+# (local_nzrows/local_nnzrows used to be here too -- removed, see
+# docs/ERRORS.md #26 follow-up: provably unread by every live caller.)
 #
 # Vectorized with numpy (no per-nonzero Python loop) -- the original
 # implementation did three full O(nnz) passes in plain Python (`for col in
@@ -34,10 +36,15 @@ def preprocess(
     # core rectangle of spmv is fabx-by-faby
     fabx: int,
     faby: int,
-    # (csrRowPtr, csrColInd) is the CSR representation (structural, no values)
-    csrRowPtr: np.ndarray,
-    csrColInd: np.ndarray,
     # (cscColPtr, cscRowInd) is the CSC representation (structural, no values)
+    # -- the ONLY representation this function needs (see docs/ERRORS.md
+    # #26's follow-up entry): a CSR argument pair used to live here too,
+    # but fed a full SECOND np.unique()-based sort whose only output
+    # (local_nzrows/max_local_nnz_rows) turned out to be read by NEITHER
+    # live caller (traced both -- see step 2's own comment below), so it
+    # was deleted outright rather than kept in any form. Dropping the CSR
+    # argument pair means callers no longer need to build (or even load) a
+    # second scipy sparse representation of the matrix at all.
     cscColPtr: np.ndarray,
     cscRowInd: np.ndarray,
 ):
@@ -47,7 +54,6 @@ def preprocess(
     A such that PE(px=j, py=i) contains the submatrix Aij with the
     following quantities:
 
-    local_nzrows: number of nonzero rows
     local_nzcols: number of nonzero columns
     local_nnz: number of nonzero elements
     A_colloc[local_nzcols]: prefix sum of A_collen, used to point to A_rows
@@ -56,13 +62,18 @@ def preprocess(
     A_rows[local_nnz]: dense block-local row index of nonzeros (row_l)
 
     """
-  assert csrRowPtr[0] == 0, "CSR must be base-0"
   assert cscColPtr[0] == 0, "CSC must be base-0"
-  assert csrRowPtr[nrows] == nnz, "CSR has wrong nnz"
   assert cscColPtr[ncols] == nnz, "CSC has wrong nnz"
 
   bx = int((ncols + fabx - 1) / fabx)  # number of columns of a block
   by = int((nrows + faby - 1) / faby)  # number of rows of a block
+
+  # Checked here (not just where `by` is used far below) because
+  # row_l_per_nz's storage dtype right below depends on it -- see
+  # docs/ERRORS.md #26. Same assert, just moved earlier so the invariant it
+  # protects is verified before anything relies on it, not after.
+  assert (by < np.iinfo(
+      np.uint16).max), "PER-PE ROW BLOCK SIZE (by) WILL OVERFLOW, TRY USING A LARGER FABRIC"
 
   # ---- per-nonzero column/row arrays, CSC order (col-major: col ascending,
   # row ascending within each col -- REQUIRES sorted CSC row indices, same
@@ -75,7 +86,40 @@ def preprocess(
   row_b_per_nz = row_per_nz // by
   col_b_per_nz = col_per_nz // bx
   row_l_per_nz = row_per_nz - row_b_per_nz * by
-  col_l_per_nz = col_per_nz - col_b_per_nz * bx
+  # col_l_per_nz used to be computed here too (col_per_nz - col_b_per_nz *
+  # bx) but is never read anywhere below -- a whole nnz-sized int64 array
+  # (8+ GB at RMAT-s25 scale) that just sat alive for the rest of the
+  # function for no reason. Dropped entirely, see docs/ERRORS.md #26.
+
+  # row_b_per_nz/col_b_per_nz are values in [0, faby)/[0, fabx) -- both stay
+  # alive all the way to the final A_rows scatter near the end of this
+  # function, so halving them from int64 to int32 matters for real (see
+  # docs/ERRORS.md #26 for the RMAT-s25-scale OOM this whole pass of
+  # changes is fixing). This was tried once already and REVERTED: wrapping
+  # ncols in np.int64(...) at the rowb_col_key line below does NOT reliably
+  # promote that expression to int64 just because the multiplier is
+  # int64-typed -- numpy 1.25's actual behavior keeps an int32 array's own
+  # dtype there (confirmed empirically, not just reasoned about), silently
+  # overflowing once row_b_per_nz*ncols exceeds int32's range (real at
+  # RMAT-s22 scale and up). Fixed correctly this time: `.astype(np.int64)`
+  # explicitly on row_b_per_nz itself at that one call site (not just an
+  # int64-typed multiplier) forces an actual conversion, independent of
+  # numpy's scalar-promotion quirks -- a transient full-width copy exists
+  # only for that one expression, not for row_b_per_nz's whole lifetime.
+  row_b_per_nz = row_b_per_nz.astype(np.int32)
+  col_b_per_nz = col_b_per_nz.astype(np.int32)
+  # row_l_per_nz's only remaining use (the final A_rows assignment) already
+  # downcasts to uint16 for storage there -- do it now instead, since the
+  # `by < uint16 max` assert above already guarantees every real value
+  # fits, and this array otherwise lives (at int64) all the way to the end
+  # of the function too.
+  row_l_per_nz = row_l_per_nz.astype(np.uint16)
+
+  # row_per_nz's only other use was row_l_per_nz just above -- free it now
+  # rather than let it sit alive (nnz-sized int64, one of several such
+  # arrays that together drove a real host-side OOM at RMAT-s25 scale,
+  # docs/ERRORS.md #26) for the rest of the function.
+  del row_per_nz
 
   max_grid_dim = max(faby, fabx)
   del max_grid_dim  # unused now -- was the pure-Python loop's `counted[]` scratch size
@@ -85,6 +129,7 @@ def preprocess(
   # branching needed at all.
   block_id_per_nz = row_b_per_nz * fabx + col_b_per_nz
   local_nnz = np.bincount(block_id_per_nz, minlength=faby * fabx).reshape(faby, fabx, 1)
+  del block_id_per_nz  # only other use was the bincount just above
 
   # step 1 (local_nzcols): count of DISTINCT (row_b, col) combinations per
   # block -- the original loop's `counted[row_b] != check_token(=col)` gate
@@ -93,9 +138,37 @@ def preprocess(
   # from col). `col < ncols` always, so `row_b * ncols + col` is a safe
   # unique key -- np.unique's own sort does in one vectorized pass what the
   # scalar `counted[]` scratch array did one element at a time.
-  rowb_col_key = row_b_per_nz * np.int64(ncols) + col_per_nz
-  unique_rc_key, unique_rc_inverse, unique_rc_count = np.unique(
-      rowb_col_key, return_inverse=True, return_counts=True)
+  # .astype(np.int64) explicitly on row_b_per_nz -- see its own comment
+  # above for why merely wrapping ncols in np.int64(...) is NOT sufficient
+  # to force this expression to int64 when row_b_per_nz itself is int32.
+  rowb_col_key = row_b_per_nz.astype(np.int64) * ncols + col_per_nz
+  # col_per_nz's only other use was rowb_col_key just above; rowb_col_key
+  # itself is only consumed by the np.unique() call right below (both
+  # nnz-sized int64 -- freeing col_per_nz here also gives np.unique's own
+  # internal sort/argsort scratch more headroom to work in, see #26).
+  del col_per_nz
+  # return_inverse=True was tried here and REVERTED for memory, not
+  # correctness (see docs/ERRORS.md #26): numpy's own implementation builds
+  # several MORE nnz-sized int64 temporaries internally to compute the
+  # inverse mapping (an argsort permutation, a sorted copy, a boolean
+  # "new value" mask, a cumulative-sum-based rank, and the inverse
+  # permutation itself) -- invisible to any `del` on this side, since they
+  # live and die entirely inside numpy's C implementation for the
+  # DURATION of that one call. return_counts alone needs a strict subset
+  # of that same internal work, so dropping return_inverse and getting the
+  # same mapping back via a separate np.searchsorted() call (binary search
+  # against the already-sorted, MUCH smaller `unique_rc_key`, not another
+  # full-array sort) was the actual fix that got RMAT-s25 scale under the
+  # 100GiB per-user cgroup ceiling.
+  unique_rc_key, unique_rc_count = np.unique(rowb_col_key, return_counts=True)
+  # Safe specifically because every element of rowb_col_key is GUARANTEED
+  # to equal some element of unique_rc_key exactly (unique_rc_key is just
+  # its own deduplicated, sorted value set) -- searchsorted therefore
+  # always lands on an exact match, never a between-values insertion
+  # point, making this numerically identical to return_inverse's own
+  # mapping.
+  unique_rc_inverse = np.searchsorted(unique_rc_key, rowb_col_key)
+  del rowb_col_key
   u_row_b = unique_rc_key // ncols
   u_col = unique_rc_key % ncols
   u_col_b = u_col // bx
@@ -103,40 +176,43 @@ def preprocess(
   u_block_id = u_row_b * fabx + u_col_b
   local_nzcols = np.bincount(u_block_id, minlength=faby * fabx).reshape(faby, fabx, 1)
 
-  # step 2 (local_nzrows): symmetric with step 1's local_nzcols, but over
-  # CSR (distinct (col_b, row) combinations per block, i.e. exactly once
-  # per distinct (row_b, col_b, row) triple, row_b determined by row).
-  row_per_nz_csr = np.repeat(np.arange(nrows, dtype=np.int64), np.diff(csrRowPtr))
-  col_per_nz_csr = csrColInd.astype(np.int64)
-  colb_row_key = (col_per_nz_csr // bx) * np.int64(nrows) + row_per_nz_csr
-  unique_cr_key = np.unique(colb_row_key)
-  u2_col_b = unique_cr_key // nrows
-  u2_row = unique_cr_key % nrows
-  u2_row_b = u2_row // by
-  u2_block_id = u2_row_b * fabx + u2_col_b
-  local_nzrows = np.bincount(u2_block_id, minlength=faby * fabx).reshape(faby, fabx, 1)
+  # step 2 (formerly local_nzrows: distinct local rows touched per block)
+  # -- REMOVED entirely (docs/ERRORS.md #26 follow-up), not just cheapened.
+  # This used to be computed via a SEPARATE full-nnz sort over a
+  # CSR-ordered representation of the matrix, fed by a whole second scipy
+  # sparse representation the caller had to build just for this. Tracing
+  # every live caller (run_bfs.py, run_bfs.appliance.py -- the only two
+  # actually exercised paths; run_graph500.py is a separate, already-
+  # broken caller predating the #21 bottom-up swap, explicitly out of
+  # scope per #21/#24's own precedent) shows NEITHER ever reads
+  # `matrix_info["local_nnz_rows"]`/`["max_local_nnz_rows"]` -- both only
+  # ever consume `["local_nnz_cols"]`/`["max_local_nnz_cols"]` (renamed
+  # locally to "*_rows" post-#21's argument swap; see each caller's own
+  # comment on this). The whole computation -- CSR-sort version or a
+  # cheaper CSC-derived version alike -- was provably dead code for every
+  # live path, so it's deleted outright rather than merely made cheaper:
+  # zero cost beats any cost. If a future caller genuinely needs a
+  # distinct-local-row count per block again, see this entry's own git
+  # history for how to derive it cheaply from `block_id_per_nz`/
+  # `row_l_per_nz` (one more np.unique() call, no second sort or second
+  # scipy representation needed) -- don't resurrect the old CSR-ordered
+  # version.
 
   # step 3: compute maximum dimension of Aij
   max_local_nnz = int(local_nnz.max())
   max_local_nnz_cols = int(local_nzcols.max())
-  max_local_nnz_rows = int(local_nzrows.max())
 
   assert (max_local_nnz < np.iinfo(
       np.uint16).max), "LOCAL NUMBER OF NONZEROS WILL OVERFLOW, TRY USING A LARGER FABRIC"
   assert (max_local_nnz_cols < np.iinfo(
       np.uint16).max), "LOCAL NUMBER OF NZCOLS WILL OVERFLOW, TRY USING A LARGER FABRIC"
-  assert (max_local_nnz_rows < np.iinfo(
-      np.uint16).max), "LOCAL NUMBER OF NZROWS WILL OVERFLOW, TRY USING A LARGER FABRIC"
-  # mat_rows_buf now stores direct dense row-block indices (row_l, see step
-  # 5 below) instead of a compact position, so the real bound on its values
-  # is `by` (the per-PE dense row-block size, i.e. the kernel's `blk`), not
-  # max_local_nnz_rows -- assert that explicitly (previously implicitly
-  # covered, since compact indices were always <= max_local_nnz_rows <= by).
-  assert (by < np.iinfo(
-      np.uint16).max), "PER-PE ROW BLOCK SIZE (by) WILL OVERFLOW, TRY USING A LARGER FABRIC"
+  # mat_rows_buf stores direct dense row-block indices (row_l, see step 4
+  # below) instead of a compact position, so the real bound on its values
+  # is `by` (the per-PE dense row-block size, i.e. the kernel's `blk`),
+  # already asserted up front, next to where `by` is computed -- see
+  # there for why.
   # no data overflows u16, we can convert the data to u16
   local_nnz = local_nnz.astype(np.uint16)
-  local_nzrows = local_nzrows.astype(np.uint16)
   local_nzcols = local_nzcols.astype(np.uint16)
 
   #     spmv kernel                      actual storage in preprocess
@@ -204,12 +280,16 @@ def preprocess(
   same_group_as_prev[0] = False
   same_group_as_prev[1:] = unique_rc_inverse[1:] == unique_rc_inverse[:-1]
   group_run_start_idx = np.where(~same_group_as_prev)[0]
+  del same_group_as_prev  # last use just above
   group_run_len = np.diff(np.append(group_run_start_idx, nnz))
   pos_rel_rowidx = np.arange(nnz) - np.repeat(group_run_start_idx, group_run_len)
 
   pos_start_per_nz = A_colloc[(u_row_b, u_col_b, pos_in_block)][unique_rc_inverse]
+  del unique_rc_inverse  # last use just above
   pos_rowidx_per_nz = pos_start_per_nz.astype(np.int64) + pos_rel_rowidx
-  A_rows[(row_b_per_nz, col_b_per_nz, pos_rowidx_per_nz)] = row_l_per_nz.astype(np.uint16)
+  # row_l_per_nz is already uint16 (downcast right after creation, above) --
+  # no more .astype() needed here, unlike before.
+  A_rows[(row_b_per_nz, col_b_per_nz, pos_rowidx_per_nz)] = row_l_per_nz
 
   matrix_info = {}
   matrix_info["nrows"] = nrows  # number of rows of the matrix
@@ -217,13 +297,14 @@ def preprocess(
   matrix_info["nnz"] = nnz  # number of nonzeros of the matrix
   matrix_info["max_local_nnz"] = max_local_nnz
   matrix_info["max_local_nnz_cols"] = max_local_nnz_cols
-  matrix_info["max_local_nnz_rows"] = max_local_nnz_rows
+  # No "max_local_nnz_rows"/"local_nnz_rows" keys any more -- see step 2's
+  # own comment above (docs/ERRORS.md #26 follow-up): provably unread by
+  # every live caller, removed entirely rather than kept as dead weight.
   matrix_info["mat_rows_buf"] = A_rows
   matrix_info["mat_col_loc_buf"] = A_colloc
   matrix_info["mat_col_len_buf"] = A_collen
   matrix_info["mat_col_idx_buf"] = A_colidx
   matrix_info["local_nnz"] = local_nnz
   matrix_info["local_nnz_cols"] = local_nzcols
-  matrix_info["local_nnz_rows"] = local_nzrows
 
   return matrix_info

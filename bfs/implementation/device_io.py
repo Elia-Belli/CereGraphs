@@ -148,33 +148,63 @@ def single_source_seed_pe(source, blk, P):
   return p, p, local_x
 
 
-# Must match bool_pe.csl's PARENT_NONE exactly. Phase A of the on-device
-# parent resolution plan: parent_local_buf now stores the FULL global
-# vertex id (widened u16 local-index -> u32 global-id), so this sentinel is
-# now a global-vertex-index one (u32::MAX), not a local-column-index one --
-# keep this numerically in sync with bool_pe.csl's own PARENT_NONE constant
-# by hand; there is no single shared source of truth for the two languages.
-PARENT_NONE_GLOBAL = 4294967295
+# Must match bool_pe.csl's PARENT_NONE exactly -- #26 moved parent_values
+# from storing the FULL global vertex id (u32) to just the LOCAL column
+# offset within the producing PE's own column range (u16), since #24 had
+# already made the global-id reconstruction (pcol_id*blk + local column) a
+# host-side-only need -- no reason left to spend on-device compute or wire
+# bytes on it. Local-column values span [0, blk), which
+# preprocess_bool.py's own `by < u16::max` assert already guarantees fits,
+# so u16::max is always a safe, unambiguous sentinel. Keep this numerically
+# in sync with bool_pe.csl's own PARENT_NONE constant by hand; there is no
+# single shared source of truth for the two languages.
+PARENT_NONE_LOCAL = 65535
 
 
-def extract_parent_result(n, blk, P, parent_hwl):
-  """Assemble the length-n parent vector from parent_local_buf's PE-column-MID
-  slice. parent_hwl has shape (height=P, width=1, blk): Phase B of the
-  on-device parent resolution plan resolves each row's P per-PE candidates
-  down to a single winner ON-DEVICE (bool_pe.csl's term_col_bcast_done()
-  calls mpi_x.reduce_select_any(root=MID, ...) exactly once, at the very end
-  of the BFS, right before host readback -- see its own comment), landing
-  the result at a FIXED PE-column (MID, not 0 -- moved to halve the relay's
-  serial critical path, see reduce_select_any's own comment) for every row
-  so the host can read back a plain narrow rectangle instead of the full
-  P-wide grid this used to require (the fix for the real d2h gRPC ~2GiB
-  message-size ceiling -- see project memory / docs/GRAPH500_BENCHMARK.md).
-  No per-row combine needed here any more -- just decode this column's
-  global ids and map the sentinel to -1. `P` is accepted but unused (kept
-  for call-site stability across this repo's four callers)."""
-  del P  # unused in Phase B -- see docstring
-  global_c = parent_hwl[:, 0, :].astype(np.int64)
-  parent = np.where(global_c == PARENT_NONE_GLOBAL, -1, global_c).reshape(-1)[0:n]
+def extract_parent_result(n, blk, mat_row_idx_buf_hwl, local_nnz_rows_hwl, parent_values_hwl):
+  """Host-side per-row combine, replacing the on-device parent-resolution
+  relay removed in docs/ERRORS.md #24. Each PE keeps its own sparse,
+  position-aligned candidates -- parent_values_hwl[py,px,i] is the LOCAL
+  column (see #26; PARENT_NONE_LOCAL's own comment) that produced a
+  candidate for GLOBAL row py*blk + mat_row_idx_buf_hwl[py,px,i], for
+  i in [0, local_nnz_rows_hwl[py,px,0]) -- instead of every row's P
+  per-PE candidates being resolved down to a single winner ON-DEVICE
+  (the old `reduce_select_any_indexed_precompacted()` relay, #19-#22).
+  That relay needed blk-sized wire buffers on every PE regardless of how
+  sparse any single PE's own data was (the relay's cross-PE union, not
+  local storage, was the actual dominant cost -- see #24's own writeup),
+  so this combine moved back to the host instead, at the cost of a much
+  larger d2h transfer (every PE's own array, not one post-relay column).
+  #26 then shrank that transfer back down (u16 local column instead of u32
+  global id) by pushing the GLOBAL id reconstruction (pcol_id*blk + local
+  column) into this function too -- the PE's own column index (px) is
+  already known here the same way its row index (py) already was.
+
+  Multiple (py,px) can legally claim the same row (different PEs' column
+  ranges can each have a real structural edge into it) -- any one valid
+  candidate winning is correct; there's no on-device tie-break requirement
+  either (see bool_pe.csl's own module docstring), so a plain vectorized
+  scatter-assign (last-duplicate-wins, in whatever order numpy processes
+  it) is fine, same as every other tie-break convention in this kernel.
+
+  mat_row_idx_buf_hwl/local_nnz_rows_hwl are the SAME host-side arrays
+  preprocess() already produced for the h2d upload -- no need to read them
+  back from the device, only parent_values_hwl is a new d2h read."""
+  height, width, max_local_nnz_rows = parent_values_hwl.shape
+  py_idx = np.arange(height, dtype=np.int64).reshape(height, 1, 1)
+  px_idx = np.arange(width, dtype=np.int64).reshape(1, width, 1)
+  global_rows = py_idx * blk + mat_row_idx_buf_hwl.astype(np.int64)
+  slot_idx = np.arange(max_local_nnz_rows).reshape(1, 1, max_local_nnz_rows)
+  valid_slot = slot_idx < local_nnz_rows_hwl  # broadcasts (1,1,K) vs (height,width,1)
+  has_parent = parent_values_hwl != PARENT_NONE_LOCAL
+  mask = valid_slot & has_parent
+  # Reconstruct the global vertex id from each candidate's own PE column
+  # (px) and its LOCAL column offset (#26) -- same reconstruction
+  # global_c = pcol_id*blk + local_column used to do on-device, before #26
+  # moved it here.
+  global_parent = px_idx * blk + parent_values_hwl.astype(np.int64)
+  parent = np.full(n, -1, dtype=np.int64)
+  parent[global_rows[mask]] = global_parent[mask]
   return parent
 
 
@@ -187,8 +217,8 @@ def derive_visited_from_parent(n, parent, source):
   visited_bitmap's bit v nonzero (the visited_bitmap bit-test gate in
   compute() -- see its own comment -- means every PE that contributes a hit
   to v's row-reduce in v's true discovery round also attempts to record a
-  parent candidate that round), so parent_local_buf's row-min is non-
-  PARENT_NONE exactly when v was ever discovered. The source is seeded
+  parent candidate that round), so v's combined parent_values entry is
+  non-PARENT_NONE exactly when v was ever discovered. The source is seeded
   directly into visited_bitmap in start_spmv(), never through compute(), so
   it never gets a parent recorded there -- callers already patch
   parent[source] = source after extract_parent_result(), which this

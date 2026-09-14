@@ -7,11 +7,19 @@
 #
 # Usage: ./bfs/scripts/run_snap_sweep.sh
 #
-# Order below is smallest-predicted-d2h-transfer first: d2h size for this
-# kernel's parent_local_buf readback is ~ grid_width * n * 4 bytes,
-# independent of nnz, so vertex count n predicts whether the ~2.15GB gRPC
-# message-size ceiling gets hit -- berkstan (n=685231, ~2.06GB) fits just
-# under it; pokec/topcats/orkut/livejournal (n 1.6M-4.8M) are predicted over.
+# Order below is smallest-predicted-d2h-transfer first -- NOTE (2026-09):
+# docs/ERRORS.md #24 removed the on-device parent-resolution relay and
+# moved the per-row combine host-side, changing this kernel's own d2h
+# readback shape (parent_values, every PE's own compact array) from what
+# this comment originally estimated. New formula: ~ grid_width * grid_width
+# * max_local_nnz_rows * 4 bytes (P^2, not P*n) -- smaller than a naive
+# fully-dense per-PE-column readback (~grid_width * n * 4, what this
+# comment used to describe) by roughly blk/max_local_nnz_rows (graph-
+# dependent, ~10-20x in this session's own measurements), but larger than
+# the on-device-relay era's single-column ~n*4. The specific per-graph
+# predictions below (berkstan/pokec/etc.) predate this change and haven't
+# been re-derived against the new formula -- treat them as stale until
+# re-measured, not as current fact.
 
 set -uo pipefail
 

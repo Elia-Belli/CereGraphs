@@ -68,6 +68,10 @@ BFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BFS_ROOT, "implementation"))
 sys.path.insert(0, os.path.join(BFS_ROOT, "plots"))
 
+# See run_bfs.py's own matching constant for the full derivation --
+# docs/ERRORS.md #28.
+_SCIPY_CHECK_AUTO_DISABLE_N = 1_100_000
+
 from graph_loader import load_graph
 from preprocess_bool import preprocess
 from scipy.sparse.csgraph import breadth_first_order
@@ -171,6 +175,12 @@ def parse_args():
                             "instrumentation itself, saving the real transfer time it costs)")
   parser.add_argument("--nocorrectness", action="store_true",
                        help="skip printing the scipy cross-check numbers")
+  parser.add_argument("--force-scipy", action="store_true",
+                       help=f"run the scipy cross-check (and/or tree plot) even above "
+                            f"{_SCIPY_CHECK_AUTO_DISABLE_N} vertices, where it's auto-disabled by "
+                            f"default (real OOM risk under this host's 100GiB per-user cgroup "
+                            f"limit -- confirmed at RMAT s24 @ 750x750, see docs/ERRORS.md #28). "
+                            f"Only pass this if you've checked host memory headroom yourself.")
 
   parser.add_argument("--max-rounds", type=int, default=10,
                        help="on-device cap on rounds actually profiled (bool_pe.csl's ts_buf)")
@@ -218,6 +228,13 @@ def main():
 
   A_coo = load_graph(infile_mtx)
   A_csr = A_coo.tocsr(copy=True)
+  # A_coo's only other use was building A_csr just above -- free it now
+  # rather than hold both full live copies of the whole matrix at once
+  # (see docs/ERRORS.md #26, and graph_loader.py's own load_graph() for
+  # the matching .data-dtype-shrink half of this fix). A_csc used to
+  # exist here too (a third live copy) -- removed entirely, see the
+  # preprocess() call site below.
+  del A_coo
   A_csr = A_csr.sorted_indices()
   assert A_csr.has_sorted_indices == 1, "Error: A is not sorted"
 
@@ -229,6 +246,16 @@ def main():
 
   print(f"Load matrix A, {nrows}-by-{ncols} with {nnz} nonzeros (structural, boolean)")
 
+  # Only auto-disable when the tree plot wasn't requested either -- see
+  # run_bfs.py's own matching comment for why.
+  if need_scipy and args.notree and n > _SCIPY_CHECK_AUTO_DISABLE_N and not args.force_scipy:
+    print(f"[[ NOTE: scipy cross-check auto-disabled -- n={n} exceeds the RMAT-s20-scale "
+          f"threshold ({_SCIPY_CHECK_AUTO_DISABLE_N}) where scipy's own breadth_first_order() "
+          f"plus rebuilding a transposed CSR copy of A risks OOMing under this host's 100GiB "
+          f"per-user cgroup limit (real, dmesg-confirmed at RMAT s24 @ 750x750, see "
+          f"docs/ERRORS.md #28) -- pass --force-scipy to run it anyway. ]]")
+    need_scipy = False
+
   is_symmetric = None
   if need_timing:
     is_symmetric = (A_csr != A_csr.T).nnz == 0
@@ -237,18 +264,18 @@ def main():
             "instead of Graph500's own undirected dedup rule. See docs/GRAPH500_BENCHMARK.md "
             "section 4. ]]")
 
-  A_csc = A_csr.tocsc(copy=True)
-  A_csc = A_csc.sorted_indices()
-  assert A_csc.has_sorted_indices == 1, "Error: A is not sorted"
-
   # Bottom-up is the only traversal strategy this kernel runs (see
   # docs/ERRORS.md #21) -- the host uploads the matrix ALREADY in
-  # CSR-by-destination form, so preprocess()'s csr/csc argument PAIRS are
-  # swapped here relative to their parameter names -- see run_bfs.py's own
-  # comment on this same call for the full derivation.
+  # CSR-by-destination form, so preprocess() is fed A_csr's arrays into
+  # its cscColPtr/cscRowInd parameter slot -- see run_bfs.py's own comment
+  # on this same call for the full derivation. A separate CSC
+  # representation of A used to be built here too (feeding preprocess()'s
+  # now-removed csrRowPtr/csrColInd parameter pair, whose only output
+  # turned out unread by any live caller) -- removed entirely, see
+  # docs/ERRORS.md #26 follow-up and run_bfs.py's own matching comment.
   matrix_info = preprocess(
       nrows, ncols, nnz, np_cols, np_rows,
-      A_csc.indptr, A_csc.indices, A_csr.indptr, A_csr.indices,
+      A_csr.indptr, A_csr.indices,
   )
 
   max_local_nnz = matrix_info["max_local_nnz"]
@@ -331,7 +358,7 @@ def main():
   # on both Compiler and Runtime -- see csl_compile_core_appliance.
   with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
     sym_x_bitmap = runner.get_id("x_bitmap")
-    sym_parent_local_buf = runner.get_id("parent_local_buf")
+    sym_parent_values = runner.get_id("parent_values")
     sym_rounds_completed = runner.get_id("rounds_completed")
     sym_mat_rows_buf = runner.get_id("mat_rows_buf")
     sym_mat_row_idx_buf = runner.get_id("mat_row_idx_buf")
@@ -418,20 +445,29 @@ def main():
     runner.launch("f_spmv_iter", nonblock=False)
 
     if need_timing:
-      print("timing d2h readback (parent_local_buf -- the real BFS output)...")
+      print("timing d2h readback (parent_values -- the real BFS output)...")
 
-    # bool_pe.csl already resolved each row's P per-PE candidates down to a
-    # single winner at PE-column MID, so only that one narrow column needs
-    # to leave the device -- keeps d2h well under the gRPC message-size
-    # ceiling. width=1 here, not width -- do not widen this back out. Root
-    # is at MID rather than column 0 to halve reduce_select_any's serial
-    # relay critical path (see bool_pe.csl/pe.csl).
-    parent_mid_col = width // 2
-    parent_local_buf_1d = np.zeros(height * 1 * blk, np.uint32)
+    # #24 removed the on-device relay that used to resolve each row's P
+    # per-PE candidates to a single winner at PE-column MID -- the host now
+    # reads EVERY PE's own compact parent_values array and combines per-row
+    # itself (see extract_parent_result()'s own comment). Real cost: this
+    # transfer is now width*height*max_local_nnz_rows elements instead of
+    # one column's height*blk -- ~P times more data, still far under the
+    # d2h gRPC ~2GiB message-size ceiling at any scale this kernel targets.
+    # #26 halved that again: parent_values is now u16 (a local column
+    # offset, not a u32 global vertex id), so this is a 16-bit transfer,
+    # not 32-bit -- data_type=MEMCPY_16BIT below reflects the DEVICE-side
+    # symbol's width. The HOST-side numpy buffer still has to be uint32
+    # regardless (same SDK requirement every other u16 device buffer in
+    # this file already works around); passing uint16 here instead throws
+    # "Internal data type of any memcpy_d2h()/memcpy_h2d() operation should
+    # be 32 bit" at runtime.
+    parent_values_1d = np.zeros(height * width * max_local_nnz_rows, np.uint32)
 
     def _read_d2h_parent():
-      runner.memcpy_d2h(parent_local_buf_1d, sym_parent_local_buf, parent_mid_col, 0, 1, height,
-                         blk, streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+      runner.memcpy_d2h(parent_values_1d, sym_parent_values, 0, 0, width, height,
+                         max_local_nnz_rows, streaming=False,
+                         data_type=MemcpyDataType.MEMCPY_16BIT,
                          order=MemcpyOrder.COL_MAJOR, nonblock=False)
 
     d2h_span_cycles = timed_transfer(
@@ -498,8 +534,22 @@ def main():
   end = time.time()
   print(f"*** Run done in {end-start}s")
 
+  parent_values_hwl = np.reshape(parent_values_1d, (height, width, max_local_nnz_rows), order="F")
+  # #24 moved the real per-row parent combine off-device entirely -- the
+  # on-device "parent_resolve" TSC bracket (parent_resolve_tic/toc_buffer)
+  # now only brackets a trivial occupancy-count scan, NOT this. Without a
+  # host-side timer, this cost was invisible to every measurement (it runs
+  # after `end = time.time()` above, i.e. after search_time_cycles/GTEPS are
+  # already computed from device+transfer cycles alone) -- time it
+  # explicitly here instead.
+  host_parent_combine_start = time.time()
   device_parent = extract_parent_result(
-      n, blk, P, np.reshape(parent_local_buf_1d, (height, 1, blk), order="F"))
+      n, blk, mat_row_idx_buf, local_nnz_rows, parent_values_hwl)
+  host_parent_combine_seconds = time.time() - host_parent_combine_start
+  print(f"[[ host_parent_combine_seconds: {host_parent_combine_seconds:.6f}s (host-side "
+        f"per-row combine over parent_values_hwl, replacing the on-device relay removed in "
+        f"docs/ERRORS.md #24 -- wall-clock, NOT device cycles; not included in "
+        f"search_time_cycles/gteps, which stay device+transfer-only) ]]")
   device_parent[source] = source
   device_visited = derive_visited_from_parent(n, device_parent, source)
 
@@ -674,6 +724,12 @@ def main():
     print(f"[[ GTEPS w/o h2d_seed/d2h/parent_resolve = {m} edges ({m_convention}) / "
           f"{search_time_seconds_excl_resolve * 1e6:.2f} us (@{CLOCK_FREQ_HZ/1e6:.0f} MHz) = "
           f"{gteps_excl_resolve:.6f} GTEPS ]]")
+
+    # Host wall-clock seconds, NOT device cycles -- deliberately a separate
+    # unit/column from every *_cycles field above, and NOT folded into
+    # search_time_cycles/gteps (those stay device+transfer-only, comparable
+    # across runs the same way they always were). See docs/ERRORS.md #25.
+    row["host_parent_combine_seconds"] = host_parent_combine_seconds
 
     # Consistency check (see check_round_vs_total_communication's own
     # docstring): sum(round_time - round_compute) across rounds should be

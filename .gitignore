@@ -18,6 +18,7 @@ run_meta.json
 latest/
 
 .claude/
+.claude_scratch/
 
 *.o
 spmv-hypersparse/util/analyze

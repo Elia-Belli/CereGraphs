@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Plot a single bfs_timing.csv row (one run_bfs.py run) as a stacked bar
 chart: one bar per BFS round, bracketed by two standalone "h2d" bars
-(h2d_matrix, h2d_seed -- see H2D_PARTS) before round 0, and "resolve"
-(mpi_x.reduce_select_any()'s one-time end-of-run parent resolution) then
-"d2h" (parent_local_buf readback) after the last round.
+(h2d_matrix, h2d_seed -- see H2D_PARTS) before round 0, and "resolve" (the
+one-time end-of-run parent-occupancy count -- see docs/ERRORS.md #24,
+which moved the actual per-row combine host-side), "d2h" (parent_values
+readback, now every PE's own array, not one post-relay column), then
+"combine" (host_parent_combine_seconds -- the real per-row combine itself,
+now measured host-side wall-clock and converted to an equivalent cycle
+count purely to share this panel's y-scale; see docs/ERRORS.md #25) after
+the last round. "combine" is only drawn for CSV rows recorded after #25
+added the column -- older rows just show resolve/d2h, not a false zero.
 
 Round bar height = round_duration_cycles (that round's straggler-PE
 span), decomposed only into what's reliably, locally measurable per PE
@@ -44,7 +50,7 @@ from matplotlib.lines import Line2D
 # standalone or imported by run_bfs.py.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                  "implementation"))
-from bfs_timing import H2D_PARTS  # pylint: disable=wrong-import-position
+from bfs_timing import CLOCK_FREQ_HZ, H2D_PARTS  # pylint: disable=wrong-import-position
 
 # Categorical palette (light-mode hexes): three round segments plus h2d/d2h's
 # own two hues.
@@ -72,6 +78,13 @@ D2H_COLOR = "#eb6834"  # orange
 # drawn in the same ax_d2h panel as d2h, sharing its y-scale, immediately
 # to d2h's left (matching their actual chronological order).
 PARENT_RESOLVE_COLOR = "#2a78d6"  # blue
+
+# The real per-row combine (#24 moved it host-side; see docs/ERRORS.md #25
+# for the host_parent_combine_seconds column this reads). Host wall-clock,
+# not a device TSC span like its neighbors -- converted to an equivalent
+# cycle count (seconds * CLOCK_FREQ_HZ) purely so it shares ax_d2h's cycle
+# y-scale; it is NOT a device measurement.
+HOST_COMBINE_COLOR = "#1f9e6e"  # green
 
 
 def _hex_to_rgb(h):
@@ -186,6 +199,13 @@ def plot_timing_row(row, out_path):
   # parent_resolve is on-device only, so it keeps the per-PE min/max/avg.
   parent_resolve_min = int(row["parent_resolve_min_cycles"])
   parent_resolve_max = int(row["parent_resolve_max_cycles"])
+  # host_parent_combine_seconds (docs/ERRORS.md #25) is absent from CSV
+  # rows recorded before this column existed -- draw its bar only when
+  # present, rather than implying a measured-zero cost for old data.
+  host_combine_seconds_raw = row.get("host_parent_combine_seconds")
+  has_host_combine = host_combine_seconds_raw not in (None, "")
+  host_combine_cycles_equiv = (
+      float(host_combine_seconds_raw) * CLOCK_FREQ_HZ if has_host_combine else 0.0)
 
   rounds = np.arange(profiled_rounds)
 
@@ -201,7 +221,8 @@ def plot_timing_row(row, out_path):
   # fit-check purely from round count.
   per_bar_w_in = 1.3
   h2d_w_in = per_bar_w_in * len(H2D_PARTS)
-  d2h_w_in = per_bar_w_in * 2 + 0.3
+  n_d2h_bars = 3 if has_host_combine else 2
+  d2h_w_in = per_bar_w_in * n_d2h_bars + 0.3
   round_w_in = max(0.95 * profiled_rounds, 3.0)
   fig, (ax_h2d, ax_rounds, ax_d2h) = plt.subplots(
       1, 3, figsize=(h2d_w_in + round_w_in + d2h_w_in, 6.5),
@@ -212,34 +233,42 @@ def plot_timing_row(row, out_path):
   # (ax, text_obj, xpos, segment_bottom, segment_top, bar_w) -- fit-checked below.
   candidate_labels = []
 
-  def add_solo_bar(ax, xpos, height, tick_y, color, label):
+  def add_solo_bar(ax, xpos, height, tick_y, color, label, text=None):
     ax.bar([xpos], [height], width=bar_width, color=color, edgecolor=SURFACE,
            linewidth=2, label=label, zorder=2)
     if tick_y is not None:
       ax.plot([xpos - bar_width / 2 * 0.7, xpos + bar_width / 2 * 0.7], [tick_y, tick_y],
               color=TEXT_PRIMARY, linewidth=1.4, solid_capstyle="butt", zorder=3)
-    txt = ax.text(xpos, height / 2, f"{int(height)}", ha="center", va="center",
+    txt = ax.text(xpos, height / 2, text if text is not None else f"{int(height)}",
+                  ha="center", va="center",
                   fontsize=7, color="white", fontweight="bold", zorder=4)
     candidate_labels.append((ax, txt, xpos, 0.0, height, bar_width))
 
   for i, part in enumerate(H2D_PARTS):
     add_solo_bar(ax_h2d, i, h2d_span[part], None, H2D_COLORS[part], part)
-  # parent_resolve first (xpos=0), d2h second: matches their actual
-  # chronological order, same left-to-right convention as h2d's matrix->seed.
+  # parent_resolve first (xpos=0), d2h second, host_combine third (when
+  # present): matches their actual chronological order, same left-to-right
+  # convention as h2d's matrix->seed.
   add_solo_bar(ax_d2h, 0, parent_resolve_max, parent_resolve_min, PARENT_RESOLVE_COLOR,
                "parent_resolve")
   add_solo_bar(ax_d2h, 1, d2h_span, None, D2H_COLOR, "d2h")
-  transfer_ylim = 1.15 * max(*h2d_span.values(), d2h_span, parent_resolve_max)
+  if has_host_combine:
+    add_solo_bar(ax_d2h, 2, host_combine_cycles_equiv, None, HOST_COMBINE_COLOR,
+                 "host_parent_combine (wall-clock, not device cycles)",
+                 text=f"{float(host_combine_seconds_raw):.3f}s")
+  transfer_ylim = 1.15 * max(*h2d_span.values(), d2h_span, parent_resolve_max,
+                              host_combine_cycles_equiv)
   ax_h2d.set_ylim(0, transfer_ylim)
   ax_d2h.set_ylim(0, transfer_ylim)
   ax_h2d.set_xlim(-0.8, len(H2D_PARTS) - 0.2)
-  ax_d2h.set_xlim(-0.8, 1.8)
+  ax_d2h.set_xlim(-0.8, n_d2h_bars - 0.2)
   ax_h2d.set_xticks(range(len(H2D_PARTS)))
   ax_h2d.set_xticklabels(["matrix", "seed"])
-  ax_d2h.set_xticks([0, 1])
+  ax_d2h.set_xticks(range(n_d2h_bars))
   # Short tick labels ("parent_resolve" would collide with "d2h" at this
   # panel width) -- the legend still carries the full name.
-  ax_d2h.set_xticklabels(["resolve", "d2h"])
+  d2h_xticklabels = ["resolve", "d2h"] + (["combine"] if has_host_combine else [])
+  ax_d2h.set_xticklabels(d2h_xticklabels)
 
   bottom = np.zeros(profiled_rounds)
   segment_values = {
